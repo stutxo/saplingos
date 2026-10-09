@@ -336,6 +336,8 @@ fn wallet_create_request_to_create_opts(req: CreateWalletRequest) -> anyhow::Res
 		bitcoind_pass: None,
 		socks5_proxy: None,
 		gap_limit: req.gap_limit,
+		sapio_config: None,
+		sapio_witnesses: None,
 	};
 
 	if let Some(chain_source) = req.chain_source {

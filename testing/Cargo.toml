@@ -38,6 +38,8 @@ path = "tests/upgrade/mod.rs"
 
 [features]
 slow_test = []
+# Requires explicitly supplied, real local Sapio service and evaluator artifacts.
+sapio-integration = []
 
 [dependencies]
 ark-lib = { path = "../lib", features = ["test-util"] }

@@ -6,16 +6,18 @@
 
 use std::str::FromStr;
 
-use bitcoin::bip32::Fingerprint;
+use bitcoin::bip32::{Fingerprint, Xpriv, Xpub};
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
-use bitcoin::{Amount, Network, ScriptBuf, Transaction};
+use bitcoin::{Amount, Network, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Witness};
 use bitcoin::hashes::Hash;
 
 use bitcoin_ext::{BlockHeight, BlockRef};
 use lightning_invoice::Bolt11Invoice;
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
+use ark::encode::ProtocolEncoding;
 use ark::test_util::VTXO_VECTORS;
+use ark::sapio::program::{Program, ProgramKey};
 use ark::VtxoId;
 
 use super::BarkPersister;
@@ -28,11 +30,16 @@ use crate::movement::{
 	Movement, MovementDestination, MovementId, MovementStatus, MovementSubsystem, PaymentMethod,
 };
 use crate::movement::update::MovementUpdate;
-use crate::persist::models::{SerdeRoundState, StoredExit, StoredRoundState, Unlocked};
+use crate::persist::models::{
+	ProgramRecoveryDisclosure, ProgramRecoveryRecord, ProgramRecoveryTemplate, ProgramRecoveryUnlock,
+	SerdeProgramKey, SerdeRoundState,
+	recovery_action_key, recovery_round_key, recovery_vtxo_key,
+	StoredExit, StoredRoundState, Unlocked,
+};
 use crate::lock_manager::LockManager;
 use crate::lock_manager::memory::MemoryLockManager;
 use crate::round::{RoundFlowState, RoundParticipation, RoundState};
-use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 use crate::WalletProperties;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +74,20 @@ macro_rules! bark_persister_tests {
 			test_vtxo_keys_empty,
 			test_vtxo_key_roundtrip,
 			test_vtxo_key_last_index_advances,
+			test_program_key_roundtrip,
+			test_program_key_conflicts,
+			test_program_recovery_roundtrip,
+			test_program_recovery_conflicts,
+			test_program_recovery_batch_rollback,
+			test_program_recovery_ancestor_merge,
+			test_recovery_reservation_stale_action_lock,
+			test_recovery_reservation_stale_movement_holder,
+			test_recovery_reservation_future_output_race,
+			test_recovery_reservation_takeover,
+			test_recovery_reservation_blocks_new_locks_and_imports,
+			test_recovery_reservation_blocks_successor_import,
+			test_recovery_reservation_allows_spent_history_import,
+			test_recovery_reservation_adopts_absent_exited_successor,
 
 			test_store_and_get_vtxo,
 			test_get_vtxos_by_state,
@@ -96,6 +117,10 @@ macro_rules! bark_persister_tests {
 			test_wallet_action_checkpoint_get_all,
 			test_wallet_action_checkpoint_remove,
 			test_wallet_action_checkpoint_remove_missing_is_noop,
+			test_finish_wallet_action_preserves_unrelated_state,
+			test_finish_wallet_action_retry,
+			test_finish_wallet_action_without_locks,
+			test_finish_wallet_action_rejects_orphan_locks,
 			test_paid_invoice_record_and_get,
 			test_paid_invoice_record_is_idempotent,
 			test_paid_invoice_get_missing,
@@ -165,6 +190,77 @@ fn test_pubkey() -> bitcoin::secp256k1::PublicKey {
 	Keypair::from_secret_key(&secp, &sk).public_key()
 }
 
+pub(crate) fn program_key_fixture() -> SerdeProgramKey {
+	let secp = Secp256k1::new();
+	let root = Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap();
+	SerdeProgramKey {
+		index: 42,
+		program: ProgramKey {
+			program: Program::new(bitcoin::hashes::sha256::Hash::from_byte_array([0; 32]),
+				vec![], vec![]).unwrap(),
+			root: Xpub::from_priv(&secp, &root),
+			user_pubkey: test_pubkey(),
+		},
+		endpoint: "https://program.example.test".into(),
+		recovery: ProgramRecoveryTemplate {
+			outputs: vec![TxOut {
+				value: Amount::from_sat(10_000),
+				script_pubkey: ScriptBuf::new(),
+			}],
+			remainder_output: Some(0),
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			witness: vec![1, 2, 3],
+		},
+	}
+}
+
+/// Persistence-only fixture. Signature validation belongs to the wallet, not
+/// to these backend tests.
+pub(crate) fn program_recovery_fixture() -> ProgramRecoveryRecord {
+	let prevout = TxOut { value: Amount::from_sat(10_000), script_pubkey: ScriptBuf::new() };
+	let ancestor = Transaction {
+		version: bitcoin::transaction::Version::TWO,
+		lock_time: bitcoin::absolute::LockTime::ZERO,
+		input: vec![TxIn {
+			previous_output: OutPoint::null(),
+			script_sig: ScriptBuf::new(),
+			sequence: bitcoin::Sequence::MAX,
+			witness: Witness::new(),
+		}],
+		output: vec![prevout.clone()],
+	};
+	let controlled_outpoint = OutPoint { txid: ancestor.compute_txid(), vout: 0 };
+	ProgramRecoveryRecord {
+		controlled_outpoint,
+		chain_anchor: OutPoint::null(),
+		chain_anchor_prevout: prevout.clone(),
+		program_key: program_key_fixture().program.public_key().unwrap(),
+		claim: Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: controlled_outpoint,
+				script_sig: ScriptBuf::new(),
+				sequence: bitcoin::Sequence::MAX,
+				witness: Witness::from_slice(&[vec![1; 64]]),
+			}],
+			output: vec![TxOut { value: Amount::from_sat(9_000), ..prevout.clone() }],
+		},
+		prevout,
+		ancestors: vec![ancestor],
+		unlocks: vec![ProgramRecoveryUnlock {
+			ancestor: controlled_outpoint.txid,
+			hash: bitcoin::hashes::sha256::Hash::hash(&[42; 32]),
+			witness: Witness::from_slice(&[vec![2; 64], vec![3], vec![4; 33]]),
+			disclosures: vec![ProgramRecoveryDisclosure {
+				outpoint: OutPoint::null(),
+				prevout: TxOut { value: Amount::from_sat(10_000), script_pubkey: ScriptBuf::new() },
+				hashlock: Witness::from_slice(&[vec![5], vec![6; 33]]),
+			}],
+		}],
+	}
+}
+
 /// Returns `now` truncated to millisecond precision.
 ///
 /// SQLite stores timestamps as `%Y-%m-%d %H:%M:%f` (millisecond precision).
@@ -188,11 +284,12 @@ fn empty_round_state() -> RoundState {
 		flow: RoundFlowState::InteractivePending,
 		new_vtxos: vec![],
 		sent_forfeit_sigs: false,
+		forfeit_bundles: Some(Vec::new()),
 		movement_id: None,
 	}
 }
 
-fn send_at_start() -> LightningSend {
+pub(crate) fn send_at_start() -> LightningSend {
 	LightningSend {
 		invoice: test_invoice(),
 		original_payment_method: PaymentMethod::Custom("test".into()),
@@ -213,9 +310,13 @@ fn send_at_start() -> LightningSend {
 fn send_at_htlc_received() -> LightningSend {
 	LightningSend {
 		progress: Progress::HtlcReceived(Htlcs {
-			vtxo_ids: vec![],
+			vtxo_ids: vec![VTXO_VECTORS.arkoor_htlc_out_vtxo.id()],
 			mailbox_id: ark::mailbox::MailboxIdentifier::from(test_pubkey()),
 			movement_id: MovementId::new(1),
+			vtxos: vec![
+				VTXO_VECTORS.arkoor_htlc_out_vtxo.clone(),
+				VTXO_VECTORS.arkoor3_vtxo.clone(),
+			],
 		}),
 		..send_at_start()
 	}
@@ -237,7 +338,10 @@ fn send_at_revocable_htlcs() -> LightningSend {
 	LightningSend {
 		progress: Progress::RevocableHtlcs {
 			htlcs,
-			revocation: Revocation { key: test_pubkey() },
+			revocation: Revocation {
+				key: test_pubkey(),
+				vtxos: vec![VTXO_VECTORS.arkoor3_vtxo.clone()],
+			},
 		},
 		..send_at_start()
 	}
@@ -362,6 +466,149 @@ pub async fn test_vtxo_key_last_index_advances(db: &impl BarkPersister) {
 
 	let last = db.get_last_vtxo_key_index().await.expect("get_last_vtxo_key_index");
 	assert_eq!(last, Some(2), "last index after storing indices 0..=2");
+}
+
+pub async fn test_program_key_roundtrip(db: &impl BarkPersister) {
+	let record = program_key_fixture();
+	let public_key = record.program.public_key().unwrap();
+	assert!(db.get_program_key(&public_key).await.unwrap().is_none());
+	assert!(db.list_program_keys().await.unwrap().is_empty());
+	db.store_vtxo_key(0, test_pubkey()).await.unwrap();
+	db.store_program_key(&record).await.unwrap();
+	db.store_program_key(&record).await.unwrap();
+	assert_eq!(db.get_program_key(&public_key).await.unwrap(), Some(record.clone()));
+	assert_eq!(db.list_program_keys().await.unwrap(), vec![record]);
+	assert_eq!(db.get_public_key_idx(&public_key).await.unwrap(), Some(42));
+	assert_eq!(db.get_last_vtxo_key_index().await.unwrap(), Some(42));
+	assert_eq!(db.get_public_key_idx(&test_pubkey()).await.unwrap(), Some(0));
+	assert!(db.store_vtxo_key(42, test_pubkey()).await.is_err());
+	assert!(db.store_vtxo_key(43, public_key).await.is_err());
+}
+
+pub async fn test_program_key_conflicts(db: &impl BarkPersister) {
+	let record = program_key_fixture();
+	let public_key = record.program.public_key().unwrap();
+	db.store_vtxo_key(record.index, test_pubkey()).await.unwrap();
+	assert!(db.store_program_key(&record).await.is_err());
+	assert!(db.get_program_key(&public_key).await.unwrap().is_none());
+	assert!(db.get_public_key_idx(&public_key).await.unwrap().is_none());
+
+	let record = SerdeProgramKey { index: 43, ..record };
+	db.store_program_key(&record).await.unwrap();
+	let mut changed = record.clone();
+	changed.endpoint.push_str("/different");
+	assert!(db.store_program_key(&changed).await.is_err());
+	changed = record.clone();
+	changed.recovery.witness.push(4);
+	assert!(db.store_program_key(&changed).await.is_err());
+	changed = record.clone();
+	changed.recovery.outputs[0].value = Amount::from_sat(1);
+	assert!(db.store_program_key(&changed).await.is_err());
+	changed = record.clone();
+	changed.index = 44;
+	assert!(db.store_program_key(&changed).await.is_err());
+	changed = record.clone();
+	changed.program.user_pubkey = Keypair::from_secret_key(
+		&Secp256k1::new(), &SecretKey::from_slice(&[2; 32]).unwrap(),
+	).public_key();
+	assert!(db.store_program_key(&changed).await.is_err());
+	assert!(db.get_program_key(&changed.program.public_key().unwrap()).await.unwrap().is_none());
+	assert_eq!(db.get_program_key(&public_key).await.unwrap(), Some(record.clone()));
+	assert_eq!(db.list_program_keys().await.unwrap(), vec![record]);
+	assert_eq!(db.get_last_vtxo_key_index().await.unwrap(), Some(43));
+}
+
+pub async fn test_program_recovery_roundtrip(db: &impl BarkPersister) {
+	let record = program_recovery_fixture();
+	assert!(db.get_program_recovery(record.controlled_outpoint).await.unwrap().is_none());
+	assert!(db.list_program_recoveries().await.unwrap().is_empty());
+	db.store_program_recoveries(&[record.clone()]).await.unwrap();
+	db.store_program_recoveries(&[record.clone(), record.clone()]).await.unwrap();
+	assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(record.clone()));
+	assert_eq!(db.list_program_recoveries().await.unwrap(), vec![record.clone()]);
+	let encoded = serde_json::to_value(&record).unwrap();
+	assert_eq!(encoded["claim"], bitcoin::consensus::encode::serialize_hex(&record.claim));
+	assert_eq!(encoded["ancestors"][0], bitcoin::consensus::encode::serialize_hex(&record.ancestors[0]));
+}
+
+pub async fn test_program_recovery_conflicts(db: &impl BarkPersister) {
+	let record = program_recovery_fixture();
+	db.store_program_recoveries(&[record.clone()]).await.unwrap();
+	let mut changed = record.clone();
+	changed.claim.output[0].value = Amount::from_sat(1);
+	assert!(db.store_program_recoveries(&[changed]).await.is_err());
+	changed = record.clone();
+	changed.claim.input[0].witness = Witness::from_slice(&[vec![2; 64]]);
+	assert!(db.store_program_recoveries(&[changed]).await.is_err());
+	changed = record.clone();
+	changed.prevout.value = Amount::from_sat(11_000);
+	assert!(db.store_program_recoveries(&[changed]).await.is_err());
+	changed = record.clone();
+	changed.program_key = test_pubkey();
+	assert!(db.store_program_recoveries(&[changed]).await.is_err());
+	changed = record.clone();
+	changed.unlocks[0].witness = Witness::from_slice(&[vec![9; 64]]);
+	assert!(db.store_program_recoveries(&[changed]).await.is_err());
+	changed = record.clone();
+	changed.unlocks[0].disclosures[0].prevout.value += Amount::ONE_SAT;
+	assert!(db.store_program_recoveries(&[changed]).await.is_err());
+	changed = record.clone();
+	changed.unlocks.clear();
+	db.store_program_recoveries(&[changed]).await.unwrap();
+	assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(record));
+}
+
+pub async fn test_program_recovery_batch_rollback(db: &impl BarkPersister) {
+	let record = program_recovery_fixture();
+	db.store_program_recoveries(&[record.clone()]).await.unwrap();
+	let mut second = record.clone();
+	second.controlled_outpoint.vout = 1;
+	second.claim.input[0].previous_output = second.controlled_outpoint;
+	let mut conflict = record.clone();
+	conflict.prevout.value = Amount::from_sat(1);
+	assert!(db.store_program_recoveries(&[second.clone(), conflict]).await.is_err());
+	assert!(db.get_program_recovery(second.controlled_outpoint).await.unwrap().is_none());
+	assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(record.clone()));
+
+	let mut duplicate_conflict = second.clone();
+	duplicate_conflict.claim.output[0].value = Amount::from_sat(1);
+	assert!(db.store_program_recoveries(&[second.clone(), duplicate_conflict]).await.is_err());
+	assert!(db.get_program_recovery(second.controlled_outpoint).await.unwrap().is_none());
+	assert_eq!(db.list_program_recoveries().await.unwrap(), vec![record]);
+}
+
+pub async fn test_program_recovery_ancestor_merge(db: &impl BarkPersister) {
+	let record = program_recovery_fixture();
+	db.store_program_recoveries(&[record.clone()]).await.unwrap();
+	let mut witnessed = record.clone();
+	witnessed.ancestors[0].input[0].witness = Witness::from_slice(&[vec![3; 64]]);
+	db.store_program_recoveries(&[witnessed.clone()]).await.unwrap();
+	db.store_program_recoveries(&[record.clone()]).await.unwrap();
+	assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(witnessed.clone()));
+
+	let mut conflict = witnessed.clone();
+	conflict.ancestors[0].input[0].witness = Witness::from_slice(&[vec![4; 64]]);
+	let mut second = record.clone();
+	second.controlled_outpoint.vout = 1;
+	second.claim.input[0].previous_output = second.controlled_outpoint;
+	assert!(db.store_program_recoveries(&[second.clone(), conflict]).await.is_err());
+	assert!(db.get_program_recovery(second.controlled_outpoint).await.unwrap().is_none());
+	assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(witnessed.clone()));
+
+	// New ancestors augment rather than replace previously stored witnesses.
+	let mut more = record.clone();
+	more.ancestors[0].input[0].previous_output.vout = 2;
+	db.store_program_recoveries(&[more.clone()]).await.unwrap();
+	witnessed.ancestors.extend(more.ancestors);
+	assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(witnessed));
+
+	// A first write must also reject conflicting duplicate ancestor witnesses.
+	let mut duplicate = second.ancestors[0].clone();
+	duplicate.input[0].witness = Witness::from_slice(&[vec![5; 64]]);
+	second.ancestors[0].input[0].witness = Witness::from_slice(&[vec![6; 64]]);
+	second.ancestors.push(duplicate);
+	assert!(db.store_program_recoveries(&[second.clone()]).await.is_err());
+	assert!(db.get_program_recovery(second.controlled_outpoint).await.unwrap().is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +1024,26 @@ fn legacy_checkpoint_missing_optional_fields_default_to_none() {
 	assert_eq!(send.change_pieces, None);
 }
 
+/// Older in-flight payments have no signed-output snapshots. Loading one must
+/// retain the HTLC IDs and revocation key needed to resume its native flow.
+#[test]
+fn legacy_lightning_checkpoint_without_signed_outputs_remains_resumable() {
+	let send = send_at_revocable_htlcs();
+	let mut json = serde_json::to_value(&send).expect("serialize lightning send");
+	let progress = &mut json["progress"]["RevocableHtlcs"];
+	progress["htlcs"].as_object_mut().unwrap().remove("vtxos").unwrap();
+	progress["revocation"].as_object_mut().unwrap().remove("vtxos").unwrap();
+
+	let restored: LightningSend = serde_json::from_value(json).expect("load legacy payment");
+	let Progress::RevocableHtlcs { htlcs, revocation } = restored.progress else {
+		panic!("legacy payment lost its revocation phase");
+	};
+	assert_eq!(htlcs.vtxo_ids, vec![VTXO_VECTORS.arkoor_htlc_out_vtxo.id()]);
+	assert_eq!(revocation.key, test_pubkey());
+	assert!(htlcs.vtxos.is_empty());
+	assert!(revocation.vtxos.is_empty());
+}
+
 pub async fn test_wallet_action_checkpoint_upsert_and_get(db: &impl BarkPersister) {
 	let checkpoint: WalletActionCheckpoint = send_at_start().into();
 	let id = checkpoint.id();
@@ -831,6 +1098,290 @@ pub async fn test_wallet_action_checkpoint_remove_missing_is_noop(db: &impl Bark
 	let id = "never-existed".to_string();
 	db.remove_wallet_action_checkpoint(&id).await
 		.expect("remove of missing id should not error");
+}
+
+/// Completion releases only current reservations, never signed VTXO data or
+/// the keys and signed recovery transactions needed after the action is gone.
+pub async fn test_finish_wallet_action_preserves_unrelated_state(db: &impl BarkPersister) {
+	let checkpoint: WalletActionCheckpoint = send_at_start().into();
+	let id = checkpoint.id();
+	let owned = VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+	};
+	let other = VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: "other-action".into() }),
+	};
+	let movement = VtxoState::Locked { holder: Some(MovementId::new(42).into()) };
+	let unowned = VtxoState::Locked { holder: None };
+	let states = [
+		(&VTXO_VECTORS.board_vtxo, VtxoState::Spendable),
+		(&VTXO_VECTORS.round1_vtxo, other),
+		(&VTXO_VECTORS.round2_vtxo, movement),
+		(&VTXO_VECTORS.arkoor3_vtxo, unowned),
+		(&VTXO_VECTORS.arkoor_htlc_out_vtxo, VtxoState::Spent),
+		(&VTXO_VECTORS.arkoor2_vtxo, VtxoState::Exited),
+	];
+	db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+	for (vtxo, state) in &states {
+		db.store_vtxos(&[(vtxo, &owned)]).await.unwrap();
+		if *state != VtxoState::Spendable {
+			// Old same-action locks in the history must not be released.
+			db.update_vtxo_state_checked(vtxo.id(), state.clone(), &[VtxoStateKind::Locked])
+				.await.unwrap();
+		}
+	}
+	let key = program_key_fixture();
+	let mut recovery = program_recovery_fixture();
+	recovery.ancestors[0].input[0].witness = Witness::from_slice(&[vec![3; 64]]);
+	db.store_program_key(&key).await.unwrap();
+	db.store_program_recoveries(&[recovery.clone()]).await.unwrap();
+
+	// Retry models a successful durable completion whose acknowledgement was lost.
+	for _ in 0..2 {
+		db.finish_wallet_action(&id).await.unwrap();
+		assert!(db.get_wallet_action_checkpoint(&id).await.unwrap().is_none());
+		for (vtxo, state) in &states {
+			assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, *state);
+			assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(*vtxo));
+		}
+		assert_eq!(db.list_program_keys().await.unwrap(), vec![key.clone()]);
+		assert_eq!(db.get_public_key_idx(&key.program.public_key().unwrap()).await.unwrap(),
+			Some(key.index));
+		assert_eq!(db.list_program_recoveries().await.unwrap(), vec![recovery.clone()]);
+	}
+}
+
+pub async fn test_finish_wallet_action_retry(db: &impl BarkPersister) {
+	let checkpoint: WalletActionCheckpoint = send_at_start().into();
+	let id = checkpoint.id();
+	let owned = VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+	};
+	let vtxos = [&VTXO_VECTORS.board_vtxo, &VTXO_VECTORS.round1_vtxo];
+	db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+	for vtxo in vtxos {
+		db.store_vtxos(&[(vtxo, &owned)]).await.unwrap();
+	}
+
+	for _ in 0..2 {
+		db.finish_wallet_action(&id).await.unwrap();
+		assert!(db.get_wallet_action_checkpoint(&id).await.unwrap().is_none());
+		for vtxo in vtxos {
+			assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state,
+				VtxoState::Spendable);
+		}
+	}
+}
+
+pub async fn test_finish_wallet_action_without_locks(db: &impl BarkPersister) {
+	let checkpoint: WalletActionCheckpoint = send_at_start().into();
+	let id = checkpoint.id();
+	db.finish_wallet_action(&id).await.unwrap();
+	db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+	db.finish_wallet_action(&id).await.unwrap();
+	assert!(db.get_wallet_action_checkpoint(&id).await.unwrap().is_none());
+	db.finish_wallet_action(&id).await.unwrap();
+}
+
+pub async fn test_finish_wallet_action_rejects_orphan_locks(db: &impl BarkPersister) {
+	let checkpoint: WalletActionCheckpoint = send_at_start().into();
+	let id = checkpoint.id();
+	let owned = VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+	};
+	let vtxos = [&VTXO_VECTORS.board_vtxo, &VTXO_VECTORS.round1_vtxo];
+	for vtxo in vtxos {
+		db.store_vtxos(&[(vtxo, &owned)]).await.unwrap();
+	}
+	for _ in 0..2 {
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert!(db.get_wallet_action_checkpoint(&id).await.unwrap().is_none());
+		for vtxo in vtxos {
+			assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, owned);
+			assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(vtxo));
+		}
+	}
+}
+
+async fn assert_recovery_reservation_conflict(
+	db: &impl BarkPersister, expected: Option<VtxoState>, current: VtxoState,
+) {
+	let first = &VTXO_VECTORS.board_vtxo;
+	let raced = &VTXO_VECTORS.round1_vtxo;
+	db.store_vtxos(&[(first, &VtxoState::Spendable), (raced, &current)]).await.unwrap();
+	let actor = recovery_action_key("stale-recovery");
+	assert!(db.reserve_program_recovery(&[
+		(first.id(), Some(VtxoState::Spendable)), (raced.id(), expected),
+	], &[actor.clone()]).await.is_err());
+	assert_eq!(db.get_wallet_vtxo(first.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert_eq!(db.get_wallet_vtxo(raced.id()).await.unwrap().unwrap().state, current);
+	for key in [actor, recovery_vtxo_key(first.id()), recovery_vtxo_key(raced.id())] {
+		assert!(!db.has_program_recovery_reservation(&key).await.unwrap());
+	}
+}
+
+pub async fn test_recovery_reservation_stale_action_lock(db: &impl BarkPersister) {
+	assert_recovery_reservation_conflict(db, Some(VtxoState::Spendable), VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: "racing-action".into() }),
+	}).await;
+}
+
+pub async fn test_recovery_reservation_stale_movement_holder(db: &impl BarkPersister) {
+	assert_recovery_reservation_conflict(db,
+		Some(VtxoState::Locked { holder: Some(MovementId::new(41).into()) }),
+		VtxoState::Locked { holder: Some(MovementId::new(42).into()) },
+	).await;
+}
+
+pub async fn test_recovery_reservation_future_output_race(db: &impl BarkPersister) {
+	assert_recovery_reservation_conflict(db, None, VtxoState::Spendable).await;
+}
+
+pub async fn test_recovery_reservation_takeover(db: &impl BarkPersister) {
+	let checkpoint: WalletActionCheckpoint = send_at_htlc_received().into();
+	let id = checkpoint.id();
+	let owned = VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: id.clone() }) };
+	let selected = &VTXO_VECTORS.board_vtxo;
+	let other = &VTXO_VECTORS.round1_vtxo;
+	let spent = &VTXO_VECTORS.round2_vtxo;
+	let exited = &VTXO_VECTORS.arkoor3_vtxo;
+	let spendable = &VTXO_VECTORS.arkoor2_vtxo;
+	let future = VTXO_VECTORS.arkoor_htlc_out_vtxo.id();
+	db.store_vtxos(&[
+		(selected, &owned), (other, &owned), (spent, &VtxoState::Spent),
+		(exited, &VtxoState::Exited), (spendable, &VtxoState::Spendable),
+	]).await.unwrap();
+	db.mark_vtxos_registered(&[selected.id()]).await.unwrap();
+	db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+	let round = db.store_round_state(&empty_round_state()).await.unwrap();
+	let stored = db.get_round_state_by_id(round).await.unwrap().unwrap();
+	let mgr = MemoryLockManager::new();
+	let mut locked = stored.lock(mgr.try_lock("test.recovery.round").await.unwrap());
+	locked.state_mut().done = true;
+	let key = program_key_fixture();
+	let recovery = program_recovery_fixture();
+	db.store_program_key(&key).await.unwrap();
+	db.store_program_recoveries(&[recovery.clone()]).await.unwrap();
+	db.record_paid_invoice(paid_invoice_hash(), test_preimage()).await.unwrap();
+	let actors = [recovery_action_key(&id), recovery_round_key(round)];
+	db.reserve_program_recovery(&[
+		(selected.id(), Some(owned.clone())), (future, None),
+		(spent.id(), Some(VtxoState::Spent)), (exited.id(), Some(VtxoState::Exited)),
+		(spendable.id(), Some(VtxoState::Spendable)),
+	], &actors).await.unwrap();
+	for _ in 0..2 {
+		db.reserve_program_recovery(&[
+			(selected.id(), Some(VtxoState::Exited)), (future, None),
+			(spent.id(), Some(VtxoState::Spent)), (exited.id(), Some(VtxoState::Exited)),
+			(spendable.id(), Some(VtxoState::Exited)),
+		], &actors).await.unwrap();
+		assert!(db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.is_err());
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert!(db.update_round_state(&locked).await.is_err());
+		assert_eq!(db.get_wallet_action_checkpoint(&id).await.unwrap(), Some(checkpoint.clone()));
+		assert!(round_states_match(&db.get_round_state_by_id(round).await.unwrap().unwrap(),
+			&empty_round_state()));
+		for (vtxo, state) in [
+			(selected, VtxoState::Exited), (other, owned.clone()), (spent, VtxoState::Spent),
+			(exited, VtxoState::Exited), (spendable, VtxoState::Exited),
+		] {
+			assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, state);
+			assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(vtxo));
+		}
+		assert!(db.get_wallet_vtxo(future).await.unwrap().is_none());
+		for actor in &actors {
+			assert!(db.has_program_recovery_reservation(actor).await.unwrap());
+		}
+		for vtxo in [selected.id(), future, spent.id(), exited.id(), spendable.id()] {
+			assert!(db.has_program_recovery_reservation(&recovery_vtxo_key(vtxo)).await.unwrap());
+		}
+		assert!(!db.has_program_recovery_reservation(&recovery_vtxo_key(other.id())).await.unwrap());
+		assert_eq!(db.list_program_keys().await.unwrap(), vec![key.clone()]);
+		assert_eq!(db.list_program_recoveries().await.unwrap(), vec![recovery.clone()]);
+		assert_eq!(db.get_paid_invoice(paid_invoice_hash()).await.unwrap().unwrap().preimage,
+			test_preimage());
+	}
+	// Tombstoned actors retain their signed outputs and unlock preimages.
+	assert!(db.remove_wallet_action_checkpoint(&id).await.is_err());
+	assert!(db.remove_round_state(&locked).await.is_err());
+	assert_eq!(db.get_wallet_action_checkpoint(&id).await.unwrap(), Some(checkpoint.clone()));
+	assert!(round_states_match(&db.get_round_state_by_id(round).await.unwrap().unwrap(),
+		&empty_round_state()));
+	assert!(db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.is_err());
+	assert!(db.finish_wallet_action(&id).await.is_err());
+	assert_eq!(db.get_wallet_vtxo(other.id()).await.unwrap().unwrap().state, owned);
+}
+
+pub async fn test_recovery_reservation_blocks_new_locks_and_imports(db: &impl BarkPersister) {
+	let selected = &VTXO_VECTORS.board_vtxo;
+	let spent = &VTXO_VECTORS.round1_vtxo;
+	let future = &VTXO_VECTORS.round2_vtxo;
+	let native = &VTXO_VECTORS.arkoor3_vtxo;
+	db.store_vtxos(&[
+		(selected, &VtxoState::Spendable), (spent, &VtxoState::Spent),
+		(native, &VtxoState::Spendable),
+	]).await.unwrap();
+	db.reserve_program_recovery(&[
+		(selected.id(), Some(VtxoState::Spendable)), (spent.id(), Some(VtxoState::Spent)),
+		(future.id(), None),
+	], &[]).await.unwrap();
+	for target in [VtxoState::Spendable, VtxoState::Locked { holder: None }] {
+		for vtxo in [selected, spent] {
+			assert!(db.update_vtxo_state_checked(vtxo.id(), target.clone(),
+				&[VtxoStateKind::Exited, VtxoStateKind::Spent]).await.is_err());
+			assert!(db.store_vtxos(&[(vtxo, &target)]).await.is_err());
+		}
+		assert!(db.store_vtxos(&[(future, &target)]).await.is_err());
+		assert!(db.update_vtxo_states_checked(&[native.id(), selected.id()], target,
+			&[VtxoStateKind::Spendable, VtxoStateKind::Exited]).await.is_err());
+	}
+	db.release_vtxo_lock(selected.id(), None).await.unwrap();
+	db.store_vtxos(&[(selected, &VtxoState::Exited)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(selected.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+	assert_eq!(db.get_wallet_vtxo(spent.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+	assert_eq!(db.get_wallet_vtxo(native.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert!(db.get_wallet_vtxo(future.id()).await.unwrap().is_none());
+	db.update_vtxo_state_checked(native.id(), VtxoState::Locked { holder: None },
+		&[VtxoStateKind::Spendable]).await.unwrap();
+}
+
+pub async fn test_recovery_reservation_blocks_successor_import(db: &impl BarkPersister) {
+	let successor = &VTXO_VECTORS.round1_vtxo;
+	let ancestor = VtxoId::from(successor.transactions().next().unwrap().tx.input[0].previous_output);
+	db.reserve_program_recovery(&[(ancestor, None)], &[]).await.unwrap();
+	assert!(db.store_vtxos(&[(successor, &VtxoState::Spendable)]).await.is_err());
+	assert!(db.get_wallet_vtxo(successor.id()).await.unwrap().is_none());
+}
+
+pub async fn test_recovery_reservation_allows_spent_history_import(db: &impl BarkPersister) {
+	let candidates = [
+		&VTXO_VECTORS.board_vtxo, &VTXO_VECTORS.round1_vtxo, &VTXO_VECTORS.round2_vtxo,
+		&VTXO_VECTORS.arkoor2_vtxo, &VTXO_VECTORS.arkoor3_vtxo,
+		&VTXO_VECTORS.arkoor_htlc_out_vtxo,
+	];
+	let (ancestor, successor) = candidates.iter().find_map(|successor| {
+		candidates.iter().find(|ancestor| successor.transactions().any(|item|
+			item.tx.input.iter().any(|input| input.previous_output == ancestor.point())
+		)).map(|ancestor| (*ancestor, *successor))
+	}).expect("native test vectors contain related VTXOs");
+	db.store_vtxos(&[(ancestor, &VtxoState::Spent)]).await.unwrap();
+	db.reserve_program_recovery(&[(ancestor.id(), Some(VtxoState::Spent))], &[]).await.unwrap();
+	db.store_vtxos(&[(successor, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+	assert_eq!(db.get_wallet_vtxo(ancestor.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+}
+
+pub async fn test_recovery_reservation_adopts_absent_exited_successor(db: &impl BarkPersister) {
+	let successor = &VTXO_VECTORS.round1_vtxo;
+	let ancestor = VtxoId::from(successor.transactions().next().unwrap().tx.input[0].previous_output);
+	db.reserve_program_recovery(&[(ancestor, None), (successor.id(), None)], &[]).await.unwrap();
+	db.store_vtxos(&[(successor, &VtxoState::Exited)]).await.unwrap();
+	let saved = db.get_full_vtxo(successor.id()).await.unwrap().unwrap().serialize();
+	db.store_vtxos(&[(successor, &VtxoState::Exited)]).await.unwrap();
+	assert_eq!(db.get_full_vtxo(successor.id()).await.unwrap().unwrap().serialize(), saved);
+	assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+	assert!(db.store_vtxos(&[(successor, &VtxoState::Spendable)]).await.is_err());
+	assert!(db.has_program_recovery_reservation(&recovery_vtxo_key(successor.id())).await.unwrap());
 }
 
 pub async fn test_paid_invoice_record_and_get(db: &impl BarkPersister) {

@@ -6,10 +6,9 @@
 //! enum that names the four phases of the state machine and only carries
 //! the fields the phase actually has.
 //!
-//! Transition functions take `&LightningSend` and return the new phase
-//! output. The [`WalletAction`] impl
-//! pattern-matches on progress and dispatches; persistence is the
-//! executor's job.
+//! Transition functions return the next phase for the executor. Signed output
+//! snapshots are durably checkpointed before recovery finalization or export,
+//! and replayed verbatim when a producing step is re-driven.
 
 use std::time::Duration;
 
@@ -24,7 +23,8 @@ use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::{Invoice, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
 use ark::util::IteratorExt;
-use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
+use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy};
+use ark::vtxo::Full;
 use bitcoin_ext::BlockHeight;
 use server_rpc::protos::{self, lightning_payment_status};
 
@@ -168,18 +168,25 @@ impl WalletAction for LightningSend {
 					},
 				}
 			},
-			Progress::RevocableHtlcs { htlcs, revocation } |
-			Progress::RevocationStuck { htlcs, revocation } => {
-				handle_lightning_send_htlcs_revocation(wallet, &self, &htlcs, &revocation).await?;
-				return Ok(Advance::Done);
+			Progress::RevocableHtlcs { htlcs, mut revocation } |
+			Progress::RevocationStuck { htlcs, mut revocation } => {
+				if revocation.vtxos.is_empty() {
+					revocation.vtxos = handle_lightning_send_htlcs_revocation(
+						wallet, &self, &htlcs, &revocation,
+					).await?;
+					Progress::RevocableHtlcs { htlcs, revocation }
+				} else {
+					finish_lightning_send_revocation(wallet, &self, &htlcs, &revocation.vtxos).await?;
+					return Ok(Advance::Done);
+				}
 			},
 		};
 
 		Ok(Advance::Next(LightningSend { progress: new_progress, ..self }))
 	}
 
-	/// The inputs until the server has cosigned the HTLCs, the HTLCs after
-	/// that. A send that learns the preimage settles and holds nothing.
+	/// Inventory moves from inputs to HTLCs after the signed-output checkpoint
+	/// is durable. Report both sets; balance consumers count only locked inventory.
 	fn pending_balance_vtxo_ids(&self) -> Vec<VtxoId> {
 		match &self.progress {
 			Progress::Start => self.input_vtxo_ids.clone(),
@@ -187,7 +194,7 @@ impl WalletAction for LightningSend {
 				| Progress::PaymentInitiated(h)
 				| Progress::RevocableHtlcs { htlcs: h, .. }
 				| Progress::RevocationStuck { htlcs: h, .. }
-			=> h.vtxo_ids.clone(),
+			=> self.input_vtxo_ids.iter().chain(&h.vtxo_ids).copied().collect(),
 		}
 	}
 
@@ -234,16 +241,11 @@ impl WalletAction for LightningSend {
 
 	async fn on_rejection(self, wallet: &Wallet, error: AdvanceError) -> anyhow::Result<Advance<Self>> {
 		match self.progress.clone() {
-			// Nothing committed server-side: drop the locks and the row
-			// ourselves, then bail. We can't rely on the executor's
-			// `Advance::Done` path because we want the original error
-			// surfaced to the caller.
+			// The executor releases reservations under its existing action lock
+			// and surfaces the original error through `Advance::Failed`.
 			Progress::Start => {
 				let id = self.id();
 				error!("Could not start lightning send {}: {:?}", id, error);
-				if let Err(cancel_err) = wallet.stop_wallet_action(&id).await {
-					warn!("could not cancel start-phase lightning send {}: {:#}", id, cancel_err);
-				}
 				Ok(Advance::Failed(error.into()))
 			},
 			Progress::HtlcReceived(htlcs) |
@@ -305,14 +307,18 @@ pub struct Htlcs {
 	#[serde(with = "ark::encode::serde")]
 	pub mailbox_id: MailboxIdentifier,
 	pub movement_id: MovementId,
+	/// Exact signed HTLC and change outputs, retained for registration retries.
+	#[serde(default, with = "ark::encode::serde::vec")]
+	pub vtxos: Vec<Vtxo<Full>>,
 }
 
-/// Revocation keypair derived when a payment is determined to have
-/// failed; the public key is used to ask the server to cosign a claim
-/// back to us.
+/// Revocation signing key and, after cosigning, the exact outputs awaiting
+/// registration. Completed signatures are checkpointed before they leave the wallet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revocation {
 	pub key: PublicKey,
+	#[serde(default, with = "ark::encode::serde::vec")]
+	pub vtxos: Vec<Vtxo<Full>>,
 }
 
 /// How long to sleep between poll attempts when the server reports `Pending`.
@@ -355,14 +361,14 @@ pub(crate) async fn start_lightning_send(
 	let change = input_total.checked_sub(payment_amount + fee)
 		.context("selected inputs don't cover payment and fee")?;
 
+	let (change_key, _) = wallet.derive_store_next_signing_key().await?;
+	let (revocation_key, _) = wallet.derive_store_next_signing_key().await?;
+
 	let action_id = ln_pay_action_id(invoice.payment_hash());
 	wallet.lock_vtxos(
 		&inputs,
 		Some(crate::vtxo::VtxoLockHolder::Action { id: action_id }),
 	).await?;
-
-	let (change_keypair, _) = wallet.derive_store_next_keypair().await?;
-	let (revocation_keypair, _) = wallet.derive_store_next_keypair().await?;
 
 	let htlc_expiry = tip + ark_info.htlc_send_expiry_delta;
 
@@ -386,10 +392,10 @@ pub(crate) async fn start_lightning_send(
 		change_pieces: Some(split_change_amount(
 			change, payment_amount + fee, wallet.config().change_vtxo_split_factor,
 		)),
-		htlc_key: change_keypair.public_key(),
+		htlc_key: change_key.public_key(),
 		htlc_expiry,
 		movement_id: Some(movement_id),
-		revocation_key: Some(revocation_keypair.public_key()),
+		revocation_key: Some(revocation_key.public_key()),
 		retry_for,
 		allow_exit_of_htlcs: false,
 		progress: Progress::Start,
@@ -400,26 +406,28 @@ pub(crate) async fn start_lightning_send(
 /// records the resulting vtxos and movement.
 ///
 /// Server-side contract: `request_lightning_pay_htlc_cosign` is
-/// idempotent on payment_hash and returns a fresh partial signature for
-/// each set of user nonces. Re-driving generates new nonces, which the
-/// server combines into a new valid response.
+/// idempotent on payment_hash. Once a complete response is signed, retain the
+/// resulting checkpoint and replay its exact bytes instead of signing again.
 pub(crate) async fn request_lightning_send_htlcs(
 	wallet: &Wallet,
 	send: &LightningSend,
 ) -> Result<Htlcs, AdvanceError> {
+	if let Some(checkpoint) = wallet.inner.db.get_wallet_action_checkpoint(&send.id()).await?
+		.and_then(|cp| cp.into_lightning_send())
+	{
+		if let Progress::HtlcReceived(htlcs) = checkpoint.progress {
+			return Ok(htlcs);
+		}
+	}
 	let (mut srv, _) = wallet.require_server().await?;
 
 	let full_inputs = wallet.inner.db.get_full_vtxos(&send.input_vtxo_ids).await
 		.context("failed to hydrate lightning-send input vtxos")?;
 
+	wallet.ensure_program_recoveries(&full_inputs).await?;
 	// Ensure inputs are fully registered server-side before the cosign.
 	wallet.register_vtxo_transactions_with_server(&full_inputs).await
 		.context("failed to register lightning-send input vtxo transactions with server")?;
-
-	let mut input_keypairs = Vec::with_capacity(full_inputs.len());
-	for input in full_inputs.iter() {
-		input_keypairs.push(wallet.get_vtxo_key(input).await?);
-	}
 
 	let policy = VtxoPolicy::new_server_htlc_send(
 		send.htlc_key, send.invoice.payment_hash(), send.htlc_expiry,
@@ -438,33 +446,39 @@ pub(crate) async fn request_lightning_send_htlcs(
 	}
 
 	let builder = ArkoorPackageBuilder::new_with_checkpoints(
-		full_inputs.clone(),
+		full_inputs,
 		outputs,
 	)
-		.context("Failed to construct arkoor package")?
-		.generate_user_nonces(&input_keypairs)
-		.context("invalid nb of keypairs")?;
+		.context("Failed to construct arkoor package")?;
+	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+	wallet.prepare_program_recoveries(&candidates).await?;
+	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+		part.iter().map(|signature| signature.public_nonce()).collect()
+	}).collect()).context("failed to install lightning payment nonces")?;
 
 	let cosign_request = protos::LightningPayHtlcCosignRequest {
-		parts: protos::ArkoorPackageCosignRequest::from(builder.cosign_request()).parts,
+		parts: protos::ArkoorPackageCosignRequest::from(
+			builder.cosign_request_with_attestations(attestations)
+				.context("invalid lightning payment attestations")?,
+		).parts,
 	};
 	let response = srv.client.request_lightning_pay_htlc_cosign(cosign_request).await
 		.map_err(AdvanceError::Server)?.into_inner();
 	let cosign_responses = ArkoorPackageCosignResponse::try_from(response)
 		.context("Failed to parse cosign response from server")?;
 
-	let vtxos = builder
-		.user_cosign(&input_keypairs, cosign_responses)
-		.context("Failed to cosign vtxos")?
-		.build_signed_vtxos();
+	builder.verify_cosign_response(&cosign_responses)
+		.context("invalid lightning payment cosign response")?;
+	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_responses).await?;
+	let vtxos = builder.finish_external(signatures)
+		.context("Failed to cosign vtxos")?.build_signed_vtxos();
 
-	let (htlc_vtxos, change_vtxos) = vtxos.clone().into_iter()
+	let (htlc_vtxos, change_vtxos) = vtxos.iter()
 		.partition::<Vec<_>, _>(|v| matches!(v.policy(), VtxoPolicy::ServerHtlcSend(_)));
 
-	let mut effective_balance = Amount::ZERO;
 	for vtxo in &htlc_vtxos {
 		wallet.validate_vtxo(vtxo).await.map_err(AdvanceError::Vtxo)?;
-		effective_balance += vtxo.amount();
 	}
 	// Change pieces can descend from different inputs, so validate each
 	// against its own chain anchor.
@@ -475,10 +489,6 @@ pub(crate) async fn request_lightning_send_htlcs(
 			"chain anchor not found for lightning change vtxo: {}", anchor_txid,
 		))?;
 		change.validate(&tx).context("invalid lightning change vtxo")?;
-	}
-
-	if let Err(e) = wallet.register_vtxo_transactions_with_server(&vtxos).await {
-		warn!("failed to register lightning-send output vtxo transactions with server: {:#}", e);
 	}
 
 	// The movement was created up front in `start_lightning_send` and its id
@@ -495,33 +505,65 @@ pub(crate) async fn request_lightning_send_htlcs(
 			MovementUpdate::new()
 				.intended_balance(-send.payment_amount.to_signed().context("payment amount out of range")?)
 				.fee(send.fee)
-				.consumed_vtxos(&full_inputs)
+				.consumed_vtxos(&send.input_vtxo_ids)
 				.sent_to([MovementDestination::new(send.original_payment_method.clone(), send.payment_amount)])
 		).await.context("failed to create lightning-send movement")?,
 	};
-	wallet.store_locked_vtxos(
-		&htlc_vtxos,
-		Some(VtxoLockHolder::Action { id: send.id() })
-	).await?;
-	wallet.mark_vtxos_as_spent(&send.input_vtxo_ids).await?;
-	wallet.store_spendable_vtxos(&change_vtxos).await?;
-	wallet.inner.movements.update_movement(
-		movement_id,
-		MovementUpdate::new()
-			.effective_balance(-effective_balance.to_signed().context("effective balance out of range")?)
-			.produced_vtxos(change_vtxos)
-			.metadata(LightningMovement::metadata(send.invoice.payment_hash(), &htlc_vtxos, None))
-	).await.context("failed to update lightning-send movement")?;
 
 	// Sort for a deterministic checkpoint across re-drives.
 	let mut vtxo_ids = htlc_vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
 	vtxo_ids.sort_unstable();
 
-	Ok(Htlcs {
+	let htlcs = Htlcs {
 		vtxo_ids,
 		mailbox_id: wallet.mailbox_identifier(),
 		movement_id,
-	})
+		vtxos,
+	};
+	let checkpoint = LightningSend {
+		progress: Progress::HtlcReceived(htlcs.clone()),
+		..send.clone()
+	};
+	wallet.inner.db.upsert_wallet_action_checkpoint(&send.id(), &checkpoint.into()).await?;
+	Ok(htlcs)
+}
+
+fn is_send_htlc(vtxo: &&Vtxo<Full>) -> bool {
+	matches!(vtxo.policy(), VtxoPolicy::ServerHtlcSend(_))
+}
+
+fn is_send_change(vtxo: &&Vtxo<Full>) -> bool {
+	!is_send_htlc(vtxo)
+}
+
+/// Make checkpointed outputs available locally without re-signing their inputs.
+async fn record_lightning_send_outputs(
+	wallet: &Wallet,
+	send: &LightningSend,
+	htlcs: &Htlcs,
+) -> anyhow::Result<()> {
+	if htlcs.vtxos.is_empty() {
+		return Ok(());
+	}
+	wallet.ensure_program_recoveries(&htlcs.vtxos).await?;
+	wallet.mark_vtxos_as_spent(&send.input_vtxo_ids).await?;
+	wallet.store_locked_vtxos(
+		htlcs.vtxos.iter().filter(is_send_htlc as for<'a, 'b> fn(&'a &'b Vtxo<Full>) -> bool),
+		Some(VtxoLockHolder::Action { id: send.id() }),
+	).await?;
+	let change_vtxos = htlcs.vtxos.iter()
+		.filter(is_send_change as for<'a, 'b> fn(&'a &'b Vtxo<Full>) -> bool);
+	wallet.store_spendable_vtxos(change_vtxos.clone()).await?;
+	wallet.inner.movements.update_movement(
+		htlcs.movement_id,
+		MovementUpdate::new()
+			.effective_balance(-send.total_amount().to_signed()?)
+			.produced_vtxos(change_vtxos)
+			.metadata(LightningMovement::metadata(
+				send.invoice.payment_hash(), &htlcs.vtxo_ids, None,
+			)),
+	).await.context("failed to update lightning-send movement")?;
+	Ok(())
 }
 
 /// HtlcReceived -> PaymentInitiated. Tells the server to actually pay
@@ -533,6 +575,16 @@ pub(crate) async fn initiate_lightning_send_payment(
 	htlcs: &Htlcs,
 ) -> Result<(), AdvanceError> {
 	let (mut srv, _) = wallet.require_server().await?;
+	record_lightning_send_outputs(wallet, send, htlcs).await?;
+	// This phase is checkpointed before registration or payment acceptance.
+	// Legacy checkpoints have only the HTLC IDs.
+	if htlcs.vtxos.is_empty() {
+		let outputs = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await?;
+		wallet.ensure_program_recoveries(&outputs).await?;
+		wallet.register_vtxo_transactions_with_server(&outputs).await?;
+	} else {
+		wallet.register_vtxo_transactions_with_server(&htlcs.vtxos).await?;
+	}
 
 	let req = protos::InitiateLightningPaymentRequest {
 		invoice: send.invoice.to_string(),
@@ -640,7 +692,7 @@ pub(crate) async fn settle_lightning_send_payment(
 	Ok(())
 }
 
-/// PaymentInitiated -> RevocableHtlcs. Derives a revocation keypair;
+/// PaymentInitiated -> RevocableHtlcs. Selects the revocation signing key;
 /// the actual server-side cosign happens in
 /// [`revoke_lightning_send_htlcs`].
 pub(crate) async fn fail_lightning_send_payment(
@@ -654,59 +706,102 @@ pub(crate) async fn fail_lightning_send_payment(
 	// after v0.2.6 ships, once no pre-v0.2.6 checkpoints can remain in flight.
 	let key = match send.revocation_key {
 		Some(key) => key,
-		None => wallet.derive_store_next_keypair().await?.0.public_key(),
+		None => wallet.derive_store_next_signing_key().await?.0.public_key(),
 	};
-	Ok(Revocation { key })
+	Ok(Revocation { key, vtxos: Vec::new() })
 }
 
-/// Cosign the revocation with the server, mark the HTLC vtxos spent
-/// and the revocation outputs spendable, and finish the movement as
-/// failed.
+/// Cosign revocation outputs without exporting them. The action checkpoints
+/// these exact bytes before registration, so retries never create new signatures.
 pub(crate) async fn revoke_lightning_send_htlcs(
 	wallet: &Wallet,
 	send: &LightningSend,
 	htlcs: &Htlcs,
 	revocation: &Revocation,
-) -> Result<(), AdvanceError> {
+) -> Result<Vec<Vtxo<Full>>, AdvanceError> {
+	if let Some(checkpoint) = wallet.inner.db.get_wallet_action_checkpoint(&send.id()).await?
+		.and_then(|cp| cp.into_lightning_send())
+	{
+		if let Progress::RevocableHtlcs { revocation, .. } |
+			Progress::RevocationStuck { revocation, .. } = checkpoint.progress
+		{
+			if !revocation.vtxos.is_empty() {
+				return Ok(revocation.vtxos);
+			}
+		}
+	}
 	let (mut srv, _) = wallet.require_server().await?;
+	record_lightning_send_outputs(wallet, send, htlcs).await?;
 
 	debug!("Revoking {} HTLC vtxos for payment {}",
 		htlcs.vtxo_ids.len(), send.invoice.payment_hash());
 
-	let mut htlc_keypairs = Vec::with_capacity(htlcs.vtxo_ids.len());
 	let mut htlc_vtxos = Vec::with_capacity(htlcs.vtxo_ids.len());
 	for id in htlcs.vtxo_ids.iter() {
 		let vtxo = wallet.inner.db.get_full_vtxo(*id).await?
 			.with_context(|| format!("htlc vtxo with id {} not found", id))?;
-		htlc_keypairs.push(wallet.get_vtxo_key(&vtxo).await?);
 		htlc_vtxos.push(vtxo);
 	}
+	wallet.ensure_program_recoveries(&htlc_vtxos).await?;
 
 	let revocation_claim_policy = VtxoPolicy::new_pubkey(revocation.key);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
-		htlc_vtxos.iter().cloned(),
+		htlc_vtxos,
 		revocation_claim_policy,
 	)
-		.context("Failed to construct arkoor package")?
-		.generate_user_nonces(&htlc_keypairs)
-		.context("failed to generate user nonces")?;
+		.context("Failed to construct arkoor package")?;
+	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+	wallet.prepare_program_recoveries(&candidates).await?;
+	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+		part.iter().map(|signature| signature.public_nonce()).collect()
+	}).collect()).context("failed to install lightning revocation nonces")?;
 
-	let cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let cosign_request = protos::ArkoorPackageCosignRequest::from(
+		builder.cosign_request_with_attestations(attestations)
+			.context("invalid lightning revocation attestations")?,
+	);
 	let response = srv.client
 		.request_lightning_pay_htlc_revocation(cosign_request).await
 		.map_err(AdvanceError::Server)?.into_inner();
 	let cosign_resp = ArkoorPackageCosignResponse::try_from(response)
 		.context("Failed to parse cosign response from server")?;
 
-	let vtxos = builder
-		.user_cosign(&htlc_keypairs, cosign_resp)
-		.context("Failed to cosign vtxos")?
-		.build_signed_vtxos();
+	builder.verify_cosign_response(&cosign_resp)
+		.context("invalid lightning revocation cosign response")?;
+	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_resp).await?;
+	let vtxos = builder.finish_external(signatures)
+		.context("Failed to cosign vtxos")?.build_signed_vtxos();
+	let checkpoint = LightningSend {
+		progress: Progress::RevocableHtlcs {
+			htlcs: htlcs.clone(),
+			revocation: Revocation { key: revocation.key, vtxos: vtxos.clone() },
+		},
+		..send.clone()
+	};
+	wallet.inner.db.upsert_wallet_action_checkpoint(&send.id(), &checkpoint.into()).await?;
+	Ok(vtxos)
+}
 
-	// Ensure revocation vtxos are fully registered server-side before the cosign.
-	if let Err(e) = wallet.register_vtxo_transactions_with_server(&vtxos).await {
-		warn!("failed to register lightning-send revocation vtxo transactions with server: {:#}", e);
+/// Register and settle the durably checkpointed revocation outputs.
+async fn finish_lightning_send_revocation(
+	wallet: &Wallet,
+	send: &LightningSend,
+	htlcs: &Htlcs,
+	vtxos: &[Vtxo<Full>],
+) -> Result<(), AdvanceError> {
+	// An exit attempt can crash after adopting a signed successor but before
+	// its tracker is written. Resume that exact branch, never registration.
+	for vtxo in vtxos {
+		if wallet.inner.db.get_wallet_vtxo(vtxo.id()).await?
+			.is_some_and(|v| v.state.kind() == crate::vtxo::VtxoStateKind::Exited)
+		{
+			exit_lightning_send_htlcs(wallet, send, htlcs).await?;
+			return Ok(());
+		}
 	}
+	wallet.ensure_program_recoveries(vtxos).await?;
+	wallet.register_vtxo_transactions_with_server(vtxos).await?;
 
 	let revoked = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
 	let effective = -send.total_amount().to_signed().context("total amount out of range")? +
@@ -723,17 +818,16 @@ pub(crate) async fn revoke_lightning_send_htlcs(
 		MovementUpdate::new()
 			.effective_balance(effective)
 			.fee(effective.unsigned_abs())
-			.produced_vtxos(&vtxos),
+			.produced_vtxos(vtxos),
 	).await.context("failed to update movement")?;
-	wallet.store_spendable_vtxos(&vtxos).await?;
-	wallet.mark_vtxos_as_spent(&htlc_vtxos).await?;
+	wallet.store_spendable_vtxos(vtxos).await?;
+	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await?;
 
 	Ok(())
 }
 
-/// Escalation: when revocation has failed and the HTLC vtxos are about
-/// to expire, mark them for unilateral exit and finish the movement
-/// as failed.
+/// Escalation after revocation failure. Signed refund successors supersede the
+/// HTLC branch and must be adopted verbatim, even if registration never succeeded.
 pub(crate) async fn exit_lightning_send_htlcs(
 	wallet: &Wallet,
 	send: &LightningSend,
@@ -742,12 +836,22 @@ pub(crate) async fn exit_lightning_send_htlcs(
 	let payment_hash = send.invoice.payment_hash();
 	warn!("HTLC VTXOs for payment {} are near expiry, marking to exit", payment_hash);
 
-	let mut vtxos = Vec::with_capacity(htlcs.vtxo_ids.len());
-	for id in htlcs.vtxo_ids.iter() {
-		vtxos.push(wallet.get_vtxo_by_id(*id).await?.vtxo);
-	}
-
-	wallet.inner.exit.start_exit_for_vtxos(&vtxos).await?;
+	let saved = match &send.progress {
+		Progress::RevocableHtlcs { revocation, .. } |
+		Progress::RevocationStuck { revocation, .. } => &revocation.vtxos[..],
+		_ => &[],
+	};
+	let inputs;
+	let vtxos = if saved.is_empty() {
+		record_lightning_send_outputs(wallet, send, htlcs).await?;
+		inputs = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await
+			.context("failed to hydrate lightning send exit inputs")?;
+		&inputs[..]
+	} else {
+		wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await?;
+		saved
+	};
+	wallet.exit_lightning_vtxos(vtxos, &send.id()).await?;
 
 	let exited = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
 	let effective = -send.total_amount().to_signed()? + exited.to_signed()?;
@@ -763,22 +867,20 @@ pub(crate) async fn exit_lightning_send_htlcs(
 		MovementUpdate::new()
 			.effective_balance(effective)
 			.fee(effective.unsigned_abs())
-			.exited_vtxos(&vtxos),
+			.exited_vtxos(vtxos),
 	).await?;
 
 	Ok(())
 }
 
-/// Drives revocation forward: tries to revoke, escalates to exit if
-/// the vtxos are close to expiry. Returns `Ok(())` if either path
-/// finished cleanly, otherwise propagates the revocation error so the
-/// executor can retry later.
+/// Prepare signed revocation outputs for the next durable checkpoint. Failures
+/// leave the old HTLC recovery position intact.
 pub(crate) async fn handle_lightning_send_htlcs_revocation(
 	wallet: &Wallet,
 	send: &LightningSend,
 	htlcs: &Htlcs,
 	revocation: &Revocation,
-) -> Result<(), AdvanceError> {
+) -> Result<Vec<Vtxo<Full>>, AdvanceError> {
 	let payment_hash = send.invoice.payment_hash();
 	let tip = wallet.inner.chain.tip().await?;
 

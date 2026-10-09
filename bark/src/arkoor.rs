@@ -1,18 +1,22 @@
 use anyhow::Context;
 use bitcoin::{Amount, NetworkKind};
 use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::Keypair;
+use bitcoin::secp256k1::{schnorr, PublicKey};
 use log::{error, info, warn};
 
 use ark::{ProtocolEncoding, VtxoPolicy};
-use ark::arkoor::ArkoorDestination;
+use ark::arkoor::{state, ArkoorDestination};
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::vtxo::{Full, Vtxo, VtxoId};
+use ark::attestations::ArkoorCosignAttestation;
+use ark::sapio::protocol::{OwnershipProof, OwnershipRequest};
 use server_rpc::{protos, ServerConnection};
 
 use crate::{VtxoDelivery, Wallet, WalletVtxo};
 use crate::actions::DriveMode;
 use crate::actions::arkoor_send::{ArkoorSend, start_arkoor_send};
+use crate::sapio::{PreparedSignature, VtxoSigningKey};
+use crate::sapio::receive::is_coordinated_address;
 
 /// The result of creating an arkoor transaction
 pub struct ArkoorCreateResult {
@@ -27,7 +31,8 @@ pub struct ArkoorCreateResult {
 /// than flattened into `anyhow`, so a caller driving this as a wallet
 /// action can route a genuine server rejection to its `on_rejection`
 /// path (via `AdvanceError::is_server_rejection`) instead of retrying a
-/// doomed request forever. Every other failure is opaque `Other`.
+/// doomed request forever. Program guards remain typed so callers can surface a
+/// blocked operation without holding the foreground call in a retry loop.
 #[derive(Debug, thiserror::Error)]
 pub enum ArkoorCreateError {
 	/// The `request_arkoor_cosign` RPC failed. May be a rejection
@@ -35,6 +40,10 @@ pub enum ArkoorCreateError {
 	/// classifies it via the status code.
 	#[error("server failed to cosign arkoor: {0}")]
 	Cosign(#[source] tonic::Status),
+	/// Authorization, saved recovery or coordinated delivery could not complete.
+	/// Keep the checkpoint and report the barrier; a later drive may resume it.
+	#[error("program guard could not complete: {0:#}")]
+	ProgramGuard(#[source] anyhow::Error),
 	#[error(transparent)]
 	Other(#[from] anyhow::Error),
 }
@@ -202,24 +211,61 @@ impl Wallet {
 			}
 		}
 
-		check_delivery(address.delivery())?;
+		if !is_coordinated_address(address)
+			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?
+		{
+			check_delivery(address.delivery())?;
+		}
 
 		Ok(())
 	}
 
 	/// Build, cosign and split an arkoor package using a caller-provided
-	/// change keypair.
+	/// change public key.
 	///
-	/// Reusing the same change keypair on a retry keeps the implied
+	/// Reusing the same change key on a retry keeps the implied
 	/// `spending_txid` stable, so the server's `check_spendable_for_oor`
 	/// idempotency check accepts the retry rather than rejecting it as a
 	/// conflicting double-spend.
+	/// Completed outputs are returned locally, not exported. The caller MUST
+	/// durably checkpoint them before `ensure_program_recoveries` stores their
+	/// immutable signed ancestors, then ensure readiness before any handoff.
 	pub(crate) async fn create_checkpointed_arkoor_with_vtxos(
 		&self,
 		arkoor_dest: ArkoorDestination,
 		inputs: impl IntoIterator<Item = WalletVtxo>,
-		change_keypair: Keypair,
+		change_pubkey: PublicKey,
 		change_pieces: Option<Vec<Amount>>,
+	) -> Result<ArkoorCreateResult, ArkoorCreateError> {
+		self.create_checkpointed_arkoor(
+			arkoor_dest, inputs, change_pubkey, change_pieces, None,
+		).await
+	}
+
+	/// Address-aware send path. Recipient recovery preparation is mandatory before
+	/// the input signatures complete; committing the recipient is the action's job
+	/// after it has durably checkpointed the completed package.
+	pub(crate) async fn create_checkpointed_arkoor_for_address(
+		&self,
+		address: &ark::Address,
+		amount: Amount,
+		inputs: impl IntoIterator<Item = WalletVtxo>,
+		change_pubkey: PublicKey,
+		change_pieces: Option<Vec<Amount>>,
+	) -> Result<ArkoorCreateResult, ArkoorCreateError> {
+		self.create_checkpointed_arkoor(
+			ArkoorDestination { total_amount: amount, policy: address.policy().clone() },
+			inputs, change_pubkey, change_pieces, Some(address),
+		).await
+	}
+
+	async fn create_checkpointed_arkoor(
+		&self,
+		arkoor_dest: ArkoorDestination,
+		inputs: impl IntoIterator<Item = WalletVtxo>,
+		change_pubkey: PublicKey,
+		change_pieces: Option<Vec<Amount>>,
+		recipient: Option<&ark::Address>,
 	) -> Result<ArkoorCreateResult, ArkoorCreateError> {
 		let (mut srv, _) = self.require_server().await?;
 		let input_ids = inputs.into_iter().map(|v| v.id()).collect::<Vec<_>>();
@@ -230,6 +276,7 @@ impl Wallet {
 		let inputs = self.inner.db.get_full_vtxos(&input_ids).await
 			.context("failed to hydrate arkoor input vtxos")?;
 
+		self.ensure_program_recoveries(&inputs).await?;
 		// Pre-register the input chains so the post-cosign register call
 		// for the outputs finds a signed chain anchor:
 		// register_vtxo_transactions validates a vtxo against its anchor's
@@ -239,14 +286,8 @@ impl Wallet {
 		self.register_vtxo_transactions_with_server(&inputs).await
 			.context("failed to register arkoor input vtxo transactions with server")?;
 
-		let change_pubkey = change_keypair.public_key();
 		if arkoor_dest.policy.user_pubkey() == change_pubkey {
 			return Err(anyhow!("Cannot create arkoor to same address as change").into());
-		}
-
-		let mut user_keypairs = vec![];
-		for vtxo in &inputs {
-			user_keypairs.push(self.get_vtxo_key(vtxo).await?);
 		}
 
 		let total_input = inputs.iter().map(|v| v.amount()).sum::<Amount>();
@@ -265,12 +306,26 @@ impl Wallet {
 		}
 
 		let builder = ArkoorPackageBuilder::new_with_checkpoints(inputs, outputs)
-			.context("Failed to construct arkoor package")?
-			.generate_user_nonces(&user_keypairs)
-			.context("invalid nb of keypairs")?;
-
+			.context("Failed to construct arkoor package")?;
+		let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+		self.prepare_program_recoveries(&candidates).await.map_err(ArkoorCreateError::ProgramGuard)?;
+		if let Some(address) = recipient {
+			let destination_candidates = candidates.iter()
+				.filter(|v| *v.policy() == arkoor_dest.policy)
+				.cloned().collect::<Vec<_>>();
+			self.prepare_program_receives(address, &destination_candidates).await
+				.map_err(ArkoorCreateError::ProgramGuard)?;
+		}
+		let (keys, prepared, attestations) = self.prepare_arkoor_signatures(&builder).await
+			.map_err(ArkoorCreateError::ProgramGuard)?;
+		let nonces = prepared.iter()
+			.map(|group| group.iter().map(PreparedSignature::public_nonce).collect())
+			.collect();
+		let builder = builder.with_external_nonces(nonces)
+			.context("invalid arkoor signing nonces")?;
 		let cosign_request = protos::ArkoorPackageCosignRequest::from(
-			builder.cosign_request(),
+			builder.cosign_request_with_attestations(attestations)
+				.context("invalid arkoor ownership attestations")?,
 		);
 
 		let response = srv.client.request_arkoor_cosign(cosign_request).await
@@ -280,10 +335,12 @@ impl Wallet {
 		let cosign_responses = ArkoorPackageCosignResponse::try_from(response)
 			.context("Failed to parse cosign response from server")?;
 
-		let vtxos = builder
-			.user_cosign(&user_keypairs, cosign_responses)
-			.context("Failed to cosign vtxos")?
-			.build_signed_vtxos();
+		builder.verify_cosign_response(&cosign_responses)
+			.context("invalid arkoor cosign response")?;
+		let signatures = self.finish_arkoor_signatures(&keys, prepared, cosign_responses).await
+			.map_err(ArkoorCreateError::ProgramGuard)?;
+		let vtxos = builder.finish_external(signatures)
+			.context("Failed to finalize arkoor vtxos")?.build_signed_vtxos();
 
 		// divide between change and destination
 		let (dest, change) = vtxos.into_iter()
@@ -294,6 +351,81 @@ impl Wallet {
 			created: dest,
 			change,
 		})
+	}
+
+	/// Prepare the native ownership proof and each actual transaction context.
+	/// Checkpoint and isolation spends are independently evaluated, not exempted
+	/// from the program that owns their input key.
+	pub(crate) async fn prepare_arkoor_signatures(
+		&self,
+		builder: &ArkoorPackageBuilder<state::Initial>,
+	) -> anyhow::Result<(
+		Vec<VtxoSigningKey>, Vec<Vec<PreparedSignature>>, Vec<ArkoorCosignAttestation>,
+	)> {
+		let mut keys = Vec::with_capacity(builder.builders.len());
+		let mut prepared = Vec::with_capacity(builder.builders.len());
+		let mut attestations = Vec::with_capacity(builder.builders.len());
+		for input_builder in &builder.builders {
+			let key = self.vtxo_signing_key(input_builder.input()).await?;
+			let outputs = input_builder.all_outputs().collect::<Vec<_>>();
+			let ownership = OwnershipRequest {
+				input: input_builder.input().clone(),
+				proof: OwnershipProof::Arkoor {
+					outputs: outputs.iter().map(|output| (*output).clone()).collect(),
+				},
+			};
+			let signature = self.sign_vtxo_ownership(&key, ownership).await?;
+			attestations.push(ArkoorCosignAttestation::from_signature(
+				input_builder.input(), &outputs, signature,
+			)?);
+			let contexts = input_builder.signing_inputs()?;
+			let mut group = Vec::with_capacity(contexts.len());
+			for context in contexts {
+				group.push(self.prepare_vtxo_signature(&key, context).await?);
+			}
+			keys.push(key);
+			prepared.push(group);
+		}
+		Ok((keys, prepared, attestations))
+	}
+
+	/// Finish every child path before completing any original-input spend.
+	/// Checkpoints have no user exit, including the isolation/fanout checkpoint,
+	/// so completing only the input signature is not a recoverable package.
+	pub(crate) async fn finish_arkoor_signatures(
+		&self,
+		keys: &[VtxoSigningKey],
+		prepared: Vec<Vec<PreparedSignature>>,
+		response: ArkoorPackageCosignResponse,
+	) -> anyhow::Result<Vec<Vec<schnorr::Signature>>> {
+		ensure!(prepared.len() == keys.len() && response.responses.len() == keys.len(),
+			"arkoor signing package count mismatch");
+		let mut roots = Vec::with_capacity(keys.len());
+		let mut signatures = Vec::with_capacity(keys.len());
+		for ((key, group), response) in keys.iter().zip(prepared).zip(response.responses) {
+			ensure!(!group.is_empty()
+				&& group.len() == response.server_pub_nonces.len()
+				&& group.len() == response.server_partial_sigs.len(),
+				"arkoor signing context count mismatch");
+			let mut group = group.into_iter()
+				.zip(response.server_pub_nonces)
+				.zip(response.server_partial_sigs);
+			roots.push(group.next().context("missing arkoor input context")?);
+			let mut children = Vec::with_capacity(group.len() + 1);
+			for ((prepared, nonce), partial) in group {
+				children.push(prepared.finish(key, Some(nonce), Some(partial)).await?
+					.signature.context("incomplete arkoor child signature")?);
+			}
+			signatures.push(children);
+		}
+		for ((key, ((prepared, nonce), partial)), children) in keys.iter().zip(roots)
+			.zip(signatures.iter_mut())
+		{
+			let signature = prepared.finish(key, Some(nonce), Some(partial)).await?
+				.signature.context("incomplete arkoor input signature")?;
+			children.insert(0, signature);
+		}
+		Ok(signatures)
 	}
 
 	/// Makes an out-of-round payment to the given [ark::Address]. This does not require waiting for
@@ -312,10 +444,8 @@ impl Wallet {
 	) -> anyhow::Result<()> {
 		let action = start_arkoor_send(self, destination.clone(), amount).await?;
 
-		// Persist the action together with the input locks so the executor has
-		// something to drive on restart; otherwise a crash between this point and
-		// `drive_action` leaves vtxos locked under an action id that has no
-		// checkpoint row.
+		// Persist before taking input locks. Cosigning acquires them idempotently,
+		// so every lock has a resumable action even if the first drive is interrupted.
 		self.inner.db.upsert_wallet_action_checkpoint(&action.id, &action.clone().into()).await?;
 
 		self.drive_action(action, DriveMode::UntilDone).await

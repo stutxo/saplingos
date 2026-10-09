@@ -64,3 +64,38 @@ possibly hundreds of public keys. When using the Unified Mailbox, the server can
 notify you when anything enters the mailbox without you having to query.
 
 More on the Unified Mailbox in [docs/mailbox.md].
+
+## Coordinated program delivery
+
+Sapio-backed addresses retain the ordinary `Pubkey` policy. Its public key is
+`C = sorted KeyAgg(U, S)`, not the user key `U` or the program key `S` alone.
+No Ark server policy extension is required.
+
+These addresses advertise one delivery method, type `0x53`. Its payload is
+`sapio-receive\0`, the version byte `1`, and the UTF-8 coordinator URL. The
+address must not include another delivery method. Unknown versions and mixed
+delivery methods fail closed. Remote URLs require HTTPS; plain HTTP is accepted
+only for literal loopback addresses.
+
+Delivery has two stages:
+
+1. Before signing, the sender submits the exact candidate VTXOs to `prepare`.
+   The receiving wallet evaluates its actual recovery through the configured
+   program, verifies the claim, and stores it durably. Its receipt includes the
+   descriptor, claims, and a user-key signature over this address and candidates.
+   The sender verifies the descriptor's aggregate key and the recovery evidence.
+2. The sender submits the complete signed VTXOs to `commit`. The recipient
+   verifies their saved recovery before accepting them as spendable. The commit
+   acknowledgement binds the final signed bytes. Retries retain the same saved
+   recovery and do not create another payment.
+
+This is not an ordinary mailbox delivery. An unsolicited raw deposit cannot
+establish that preparation occurred before the sender committed. Bark retains
+rejected wire bytes as quarantine metadata, without inserting a canonical VTXO
+row. A forged genesis for an outpoint cannot replace a later valid, prepared
+payment at that outpoint.
+
+Legacy clients do not implement this handshake. Do not remove the delivery
+metadata or claim that a legacy client provides the same recovery guarantee.
+See [Sapio-backed VTXOs](../bark/README.md#sapio-backed-vtxos) for configuration
+and emergency recovery.

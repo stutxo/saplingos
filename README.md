@@ -1,3 +1,27 @@
+# SaplingOS
+
+SaplingOS is a fork of [Bark](https://gitlab.com/ark-bitcoin/bark) with
+program-controlled Ark wallets. It retains Bark's wallet, server and protocol
+libraries. The server protocol and native VTXO policies remain unchanged.
+
+- **This repository:** the Bark wallet, CLI, REST API and integration tests.
+- **[sapio_tee](https://github.com/stutxo/sapio_tee):** program evaluation and the
+  enclave's share of the nested MuSig signature.
+- **[Sapio](https://github.com/sapio-lang/sapio):** the unchanged upstream program
+  identities and bounded WASM runtime.
+
+See [the wallet guide](bark/README.md#sapio-backed-vtxos) for
+configuration, coordinated receive and recovery commands. Recovery pays the
+output scripts approved by the program before the wallet commits. A saved claim
+cannot be redirected later. A separate fee wallet pays the mining fees.
+
+This integration is experimental. Local verification does not establish a
+production Nitro attestation or replace an independent cryptographic review.
+Report fork-specific issues in [SaplingOS](https://github.com/stutxo/saplingos/issues).
+The Bark information and project links below describe the upstream project.
+
+## Upstream Bark
+
 ![bark: Ark on bitcoin](assets/bark-header-white.jpg)
 
 <div align="center">

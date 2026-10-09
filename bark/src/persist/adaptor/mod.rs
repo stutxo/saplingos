@@ -46,10 +46,11 @@ pub use self::sort::{SortKey, SortKeyBuilder};
 #[cfg(feature = "indexed-db")]
 pub mod indexed_db;
 
+use std::collections::BTreeMap;
 use std::ops::RangeBounds;
 
 use anyhow::Context;
-use bitcoin::{Amount, Transaction, Txid};
+use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::hashes::Hash;
 #[cfg(feature = "onchain-bdk")]
@@ -72,7 +73,9 @@ use crate::movement::{
 use crate::movement::update::MovementUpdate;
 use crate::persist::BarkPersister;
 use crate::persist::models::{
-	PaidInvoice, RoundStateId, SerdeExitChildTx, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
+	merge_program_recovery, PaidInvoice, ProgramRecoveryRecord, RoundStateId, SerdeExitChildTx,
+	recovery_action_key, recovery_round_key, recovery_vtxo_key,
+	SerdeProgramKey, SerdeRoundState, SerdeVtxo, SerdeVtxoKey,
 	SettledLightningReceive, StoredExit, StoredRoundState, Unlocked, wallet_vtxo_from_full,
 };
 use crate::round::RoundState;
@@ -117,6 +120,14 @@ pub mod partition {
 	/// An index from [WalletActionId] to the movement that action owns, so a
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
+	/// Immutable program descriptors keyed by their aggregate public key.
+	pub const PROGRAM_KEY: u8 = 18;
+	/// Raw, wallet-verified recovery records keyed by controlled outpoint.
+	pub const PROGRAM_RECOVERY: u8 = 19;
+	/// Uniquely reserves a derivation index, including ordinary VTXO keys.
+	pub const PUBLIC_KEY_INDEX: u8 = 20;
+	/// Permanent recovery ownership tombstones, keyed by actor or VTXO key.
+	pub const PROGRAM_RECOVERY_RESERVATION: u8 = 21;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -166,6 +177,39 @@ impl Record {
 			data: serde_json::to_vec(data)?,
 		})
 	}
+}
+
+/// One compare-and-swap in an atomic batch.
+///
+/// `previous` is the exact record read by the caller, or `None` for an absent
+/// key. `updated` is the replacement, or `None` to delete the previous record.
+/// At least one record must be present. When both are present, their partition
+/// and primary key must agree. Duplicate keys in a batch are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordUpdate {
+	pub previous: Option<Record>,
+	pub updated: Option<Record>,
+}
+
+impl RecordUpdate {
+	fn record(&self) -> anyhow::Result<&Record> {
+		self.updated.as_ref().or(self.previous.as_ref())
+			.context("atomic update has neither a previous nor an updated record")
+	}
+}
+
+fn validate_record_updates(updates: &[RecordUpdate]) -> anyhow::Result<()> {
+	let mut keys = std::collections::HashSet::with_capacity(updates.len());
+	for update in updates {
+		let record = update.record()?;
+		anyhow::ensure!(keys.insert((record.partition, &record.pk)),
+			"duplicate record in atomic batch");
+		if let Some(previous) = &update.previous {
+			anyhow::ensure!(previous.partition == record.partition && previous.pk == record.pk,
+				"atomic update changes its record key");
+		}
+	}
+	Ok(())
 }
 
 /// A range of sort keys.
@@ -314,6 +358,22 @@ pub trait StorageAdaptor: Send + Sync + 'static {
 	/// Stores a record, inserting or updating by primary key.
 	async fn put(&mut self, record: Record) -> anyhow::Result<()>;
 
+	/// Atomically compare every previous record, then commit all replacements
+	/// and deletions.
+	///
+	/// Validate every previous record before any mutation. Conflicts or write
+	/// failures must never commit only part of the batch. Persistent
+	/// implementations must complete a durable write transaction or flush before
+	/// success. There is deliberately no sequential-write default.
+	async fn put_batch(&mut self, updates: Vec<RecordUpdate>) -> anyhow::Result<()> {
+		self.put_batch_checked(updates, &[]).await
+	}
+
+	/// Assert absent keys inside the same transaction without creating them.
+	async fn put_batch_checked(
+		&mut self, updates: Vec<RecordUpdate>, absent: &[(u8, Vec<u8>)],
+	) -> anyhow::Result<()>;
+
 	/// Retrieves a record by primary key.
 	///
 	/// Returns `None` if the record doesn't exist.
@@ -381,9 +441,10 @@ async fn get_check_vtxo_state<S: StorageAdaptor>(
 	vtxo_id: VtxoId,
 	new_state: &VtxoState,
 	allowed_states: &[VtxoStateKind],
-) -> anyhow::Result<(SerdeVtxo, StateTransition)> {
-	let vtxo = get_vtxo(adaptor, vtxo_id).await?
+) -> anyhow::Result<(Record, SerdeVtxo, StateTransition)> {
+	let previous = adaptor.get(partition::VTXO, &vtxo_id.to_bytes()).await?
 		.context("vtxo not found")?;
+	let vtxo = previous.to_data::<SerdeVtxo>()?;
 
 	let current_state = vtxo.current_state().context("vtxo has no state")?;
 	let transition = if current_state == new_state {
@@ -396,7 +457,7 @@ async fn get_check_vtxo_state<S: StorageAdaptor>(
 		);
 	};
 
-	Ok((vtxo, transition))
+	Ok((previous, vtxo, transition))
 }
 
 async fn update_vtxo_state_checked<S: StorageAdaptor>(
@@ -405,8 +466,13 @@ async fn update_vtxo_state_checked<S: StorageAdaptor>(
 	new_state: VtxoState,
 	allowed_old_states: &[VtxoStateKind],
 ) -> anyhow::Result<WalletVtxo> {
-	let (mut serde_vtxo, transition) =
+	let (previous, mut serde_vtxo, transition) =
 		get_check_vtxo_state(adaptor, vtxo_id, &new_state, allowed_old_states).await?;
+	let absent = if matches!(new_state, VtxoState::Spendable | VtxoState::Locked { .. }) {
+		vec![(partition::PROGRAM_RECOVERY_RESERVATION, recovery_vtxo_key(vtxo_id).into_bytes())]
+	} else {
+		Vec::new()
+	};
 
 	if let StateTransition::Apply = transition {
 		let sk = sort::vtxo_sort_key(
@@ -421,10 +487,52 @@ async fn update_vtxo_state_checked<S: StorageAdaptor>(
 			&serde_vtxo,
 		)?;
 
-		adaptor.put(updated_record).await?;
+		// The tombstone and exact previous VTXO are checked by one transaction.
+		adaptor.put_batch_checked(vec![
+			RecordUpdate { previous: Some(previous), updated: Some(updated_record) },
+		], &absent).await?;
+	} else if !absent.is_empty() {
+		adaptor.put_batch_checked(Vec::new(), &absent).await?;
 	}
 
 	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state, serde_vtxo.registered))
+}
+
+/// Check legacy mappings as well as the index reservation introduced for
+/// atomic program descriptor writes. Existing stores need no eager rewrite.
+async fn vtxo_key_updates<S: StorageAdaptor>(
+	adaptor: &S,
+	index: u32,
+	public_key: PublicKey,
+) -> anyhow::Result<Vec<RecordUpdate>> {
+	let sort_key = SortKey::u64_desc(index as u64);
+	let query = Query::new(partition::PUBLIC_KEY, sort_key.clone()..=sort_key.clone());
+	for record in adaptor.query_sorted(query).await? {
+		let existing = record.to_data::<SerdeVtxoKey>()?;
+		anyhow::ensure!(existing.index == index && existing.public_key == public_key,
+			"vtxo key index {index} already stored under a different public key");
+	}
+	let previous = adaptor.get(partition::PUBLIC_KEY, &public_key.serialize()).await?;
+	if let Some(record) = &previous {
+		anyhow::ensure!(record.to_data::<SerdeVtxoKey>()?.index == index,
+			"vtxo public key already stored under a different index");
+	}
+	let updated = Record::from_data(
+		partition::PUBLIC_KEY, &public_key.serialize(), Some(sort_key),
+		&SerdeVtxoKey { index, public_key },
+	)?;
+	let index_previous = adaptor.get(partition::PUBLIC_KEY_INDEX, &index.to_be_bytes()).await?;
+	if let Some(record) = &index_previous {
+		anyhow::ensure!(record.to_data::<PublicKey>()? == public_key,
+			"vtxo key index {index} already reserved under a different public key");
+	}
+	let index_updated = Record::from_data(
+		partition::PUBLIC_KEY_INDEX, &index.to_be_bytes(), None, &public_key,
+	)?;
+	Ok(vec![
+		RecordUpdate { previous, updated: Some(updated) },
+		RecordUpdate { previous: index_previous, updated: Some(index_updated) },
+	])
 }
 
 pub struct StorageAdaptorWrapper<S: StorageAdaptor> {
@@ -645,13 +753,26 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			Some(sort::SortKey::u32_asc(round_state.id().0)),
 			&serde_state,
 		)?;
-		self.inner.write().await.put(record).await
+		let mut lock = self.inner.write().await;
+		anyhow::ensure!(lock.get(
+			partition::PROGRAM_RECOVERY_RESERVATION,
+			recovery_round_key(round_state.id()).as_bytes(),
+		).await?.is_none(), "round reserved for program recovery");
+		let previous = lock.get(partition::ROUND_STATE, &record.pk).await?;
+		lock.put_batch_checked(vec![RecordUpdate { previous, updated: Some(record) }], &[
+			(partition::PROGRAM_RECOVERY_RESERVATION, recovery_round_key(round_state.id()).into_bytes()),
+		]).await
 	}
 
 	async fn remove_round_state(&self, round_state: &StoredRoundState) -> anyhow::Result<()> {
-		self.inner.write().await
-			.delete(partition::ROUND_STATE, &round_state.id().to_bytes()).await?;
-		Ok(())
+		let mut lock = self.inner.write().await;
+		let previous = lock.get(partition::ROUND_STATE, &round_state.id().to_bytes()).await?;
+		let updates = previous.into_iter().map(|record| RecordUpdate {
+			previous: Some(record), updated: None,
+		}).collect();
+		lock.put_batch_checked(updates, &[
+			(partition::PROGRAM_RECOVERY_RESERVATION, recovery_round_key(round_state.id()).into_bytes()),
+		]).await
 	}
 
 	async fn get_round_state_by_id(&self, _id: RoundStateId) -> anyhow::Result<Option<StoredRoundState<Unlocked>>> {
@@ -681,8 +802,39 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 
 	async fn store_vtxos(&self, vtxos: &[(&Vtxo<Full>, &VtxoState)]) -> anyhow::Result<()> {
 		let mut lock = self.inner.write().await;
+		let mut updates = BTreeMap::new();
+		let mut absent = std::collections::BTreeSet::new();
 
 		for (vtxo, state) in vtxos {
+			let previous = lock.get(partition::VTXO, &vtxo.id().to_bytes()).await?;
+			if let Some(record) = &previous {
+				let existing = record.to_data::<SerdeVtxo>()?;
+				if matches!(existing.current_state(), Some(VtxoState::Spent | VtxoState::Exited)) {
+					anyhow::ensure!(matches!(state, VtxoState::Spent | VtxoState::Exited),
+						"cannot restore a terminal VTXO to a live state");
+					// Replay never replaces the signed bytes or terminal state.
+					continue;
+				}
+			}
+			if !matches!(state, VtxoState::Spent | VtxoState::Exited) {
+				absent.insert((partition::PROGRAM_RECOVERY_RESERVATION,
+					recovery_vtxo_key(vtxo.id()).into_bytes()));
+				for item in vtxo.transactions() {
+					for input in &item.tx.input {
+						let ancestor = VtxoId::from(input.previous_output);
+						if let Some(record) = lock.get(partition::VTXO, &ancestor.to_bytes()).await? {
+							if record.to_data::<SerdeVtxo>()?.current_state() == Some(&VtxoState::Spent) {
+								updates.entry(ancestor).or_insert_with(|| RecordUpdate {
+									previous: Some(record.clone()), updated: Some(record),
+								});
+								continue;
+							}
+						}
+						absent.insert((partition::PROGRAM_RECOVERY_RESERVATION,
+							recovery_vtxo_key(ancestor).into_bytes()));
+					}
+				}
+			}
 			let serde_vtxo = SerdeVtxo {
 				vtxo: (*vtxo).clone(),
 				states: vec![(*state).clone()],
@@ -698,9 +850,9 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 				Some(sk),
 				&serde_vtxo,
 			)?;
-			lock.put(record).await?;
+			updates.insert(vtxo.id(), RecordUpdate { previous, updated: Some(record) });
 		}
-		Ok(())
+		lock.put_batch_checked(updates.into_values().collect(), &absent.into_iter().collect::<Vec<_>>()).await
 	}
 
 	async fn get_wallet_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<WalletVtxo>> {
@@ -836,9 +988,10 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		holder: Option<&VtxoLockHolder>,
 	) -> anyhow::Result<()> {
 		let mut lock = self.inner.write().await;
-		let Some(mut serde_vtxo) = get_vtxo(&*lock, vtxo_id).await? else {
+		let Some(previous) = lock.get(partition::VTXO, &vtxo_id.to_bytes()).await? else {
 			return Ok(());
 		};
+		let mut serde_vtxo = previous.to_data::<SerdeVtxo>()?;
 		let expected = VtxoState::Locked { holder: holder.cloned() };
 		let current_state = serde_vtxo.current_state()
 			.context("vtxo has no state")?;
@@ -856,7 +1009,9 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			Some(sk),
 			&serde_vtxo,
 		)?;
-		lock.put(updated_record).await?;
+		lock.put_batch_checked(vec![
+			RecordUpdate { previous: Some(previous), updated: Some(updated_record) },
+		], &[(partition::PROGRAM_RECOVERY_RESERVATION, recovery_vtxo_key(vtxo_id).into_bytes())]).await?;
 		Ok(())
 	}
 
@@ -867,25 +1022,36 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<()> {
 		let mut lock = self.inner.write().await;
-		// Validate every vtxo before mutating anything, so a state-kind
-		// mismatch can't leave the batch half-applied. Concurrent batches
-		// are serialized by the write lock above. Storage errors during
-		// the put loop cannot be rolled back from here — that is a
-		// fundamental limitation of the adaptor.
+		let mut updates = Vec::new();
+		let mut absent = Vec::new();
+		let mut seen = std::collections::HashSet::new();
 		for id in vtxo_ids {
-			get_check_vtxo_state(&*lock, *id, &new_state, allowed_old_states).await?;
+			if !seen.insert(*id) {
+				continue;
+			}
+			let (previous, mut vtxo, transition) =
+				get_check_vtxo_state(&*lock, *id, &new_state, allowed_old_states).await?;
+			if matches!(new_state, VtxoState::Spendable | VtxoState::Locked { .. }) {
+				absent.push((partition::PROGRAM_RECOVERY_RESERVATION, recovery_vtxo_key(*id).into_bytes()));
+			}
+			if let StateTransition::Apply = transition {
+				vtxo.states.push(new_state.clone());
+				let sk = sort::vtxo_sort_key(
+					new_state.kind(), vtxo.vtxo.expiry_height().to_u32(), vtxo.vtxo.amount(),
+				);
+				let updated = Record::from_data(partition::VTXO, &id.to_bytes(), Some(sk), &vtxo)?;
+				updates.push(RecordUpdate { previous: Some(previous), updated: Some(updated) });
+			}
 		}
-		for id in vtxo_ids {
-			update_vtxo_state_checked(&mut *lock, *id, new_state.clone(), allowed_old_states).await?;
-		}
-		Ok(())
+		lock.put_batch_checked(updates, &absent).await
 	}
 
 	async fn mark_vtxos_registered(&self, vtxo_ids: &[VtxoId]) -> anyhow::Result<()> {
 		let mut lock = self.inner.write().await;
 		for id in vtxo_ids {
-			let mut serde_vtxo = get_vtxo(&*lock, *id).await?
+			let previous = lock.get(partition::VTXO, &id.to_bytes()).await?
 				.with_context(|| format!("vtxo {id} not found"))?;
+			let mut serde_vtxo = previous.to_data::<SerdeVtxo>()?;
 			if serde_vtxo.registered {
 				continue;
 			}
@@ -903,7 +1069,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 				Some(sk),
 				&serde_vtxo,
 			)?;
-			lock.put(record).await?;
+			lock.put_batch(vec![RecordUpdate { previous: Some(previous), updated: Some(record) }]).await?;
 		}
 		Ok(())
 	}
@@ -928,14 +1094,151 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	}
 
 	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()> {
-		let vtxo_key = SerdeVtxoKey { index, public_key };
-		let record = Record::from_data(
-			partition::PUBLIC_KEY,
-			&public_key.serialize()[..],
-			Some(sort::SortKey::u64_desc(index as u64)),
-			&vtxo_key,
-		)?;
-		self.inner.write().await.put(record).await
+		let mut lock = self.inner.write().await;
+		let updates = vtxo_key_updates(&*lock, index, public_key).await?;
+		lock.put_batch(updates).await
+	}
+
+	async fn store_program_key(&self, record: &SerdeProgramKey) -> anyhow::Result<()> {
+		let public_key = record.program.public_key()?;
+		let mut lock = self.inner.write().await;
+		let previous = lock.get(partition::PROGRAM_KEY, &public_key.serialize()).await?;
+		if let Some(existing) = &previous {
+			anyhow::ensure!(existing.to_data::<SerdeProgramKey>()? == *record,
+				"conflicting program descriptor for {public_key}");
+		}
+		let mut updates = vtxo_key_updates(&*lock, record.index, public_key).await?;
+		updates.push(RecordUpdate {
+			previous,
+			updated: Some(Record::from_data(
+				partition::PROGRAM_KEY, &public_key.serialize(), None, record,
+			)?),
+		});
+		lock.put_batch(updates).await
+	}
+
+	async fn get_program_key(&self, public_key: &PublicKey)
+		-> anyhow::Result<Option<SerdeProgramKey>>
+	{
+		self.inner.read().await.get(partition::PROGRAM_KEY, &public_key.serialize()).await?
+			.map(|record| record.to_data()).transpose()
+	}
+
+	async fn get_program_key_by_index(&self, index: u32)
+		-> anyhow::Result<Option<SerdeProgramKey>>
+	{
+		let lock = self.inner.read().await;
+		let Some(record) = lock.get(partition::PUBLIC_KEY_INDEX, &index.to_be_bytes()).await? else {
+			return Ok(None);
+		};
+		let public_key = record.to_data::<PublicKey>()?;
+		lock.get(partition::PROGRAM_KEY, &public_key.serialize()).await?
+			.map(|record| record.to_data()).transpose()
+	}
+
+	async fn list_program_keys(&self) -> anyhow::Result<Vec<SerdeProgramKey>> {
+		self.inner.read().await.get_all(partition::PROGRAM_KEY).await?
+			.into_iter().map(|record| record.to_data()).collect()
+	}
+
+	async fn store_program_recoveries(&self, records: &[ProgramRecoveryRecord])
+		-> anyhow::Result<()>
+	{
+		let mut lock = self.inner.write().await;
+		let mut staged = BTreeMap::<OutPoint, (Option<Record>, ProgramRecoveryRecord)>::new();
+		for record in records {
+			let outpoint = record.controlled_outpoint;
+			let (previous, existing) = match staged.remove(&outpoint) {
+				Some((previous, existing)) => (previous, Some(existing)),
+				None => {
+					let previous = lock.get(
+						partition::PROGRAM_RECOVERY, &bitcoin::consensus::serialize(&outpoint),
+					).await?;
+					let existing = previous.as_ref().map(|row| row.to_data()).transpose()?;
+					(previous, existing)
+				},
+			};
+			staged.insert(outpoint, (previous, merge_program_recovery(existing, record)?));
+		}
+		let updates = staged.into_iter().map(|(outpoint, (previous, record))| {
+			Ok(RecordUpdate {
+				previous,
+				updated: Some(Record::from_data(
+					partition::PROGRAM_RECOVERY, &bitcoin::consensus::serialize(&outpoint),
+					None, &record,
+				)?),
+			})
+		}).collect::<anyhow::Result<Vec<_>>>()?;
+		lock.put_batch(updates).await
+	}
+
+	async fn get_program_recovery(&self, outpoint: OutPoint)
+		-> anyhow::Result<Option<ProgramRecoveryRecord>>
+	{
+		self.inner.read().await.get(
+			partition::PROGRAM_RECOVERY, &bitcoin::consensus::serialize(&outpoint),
+		).await?.map(|record| record.to_data()).transpose()
+	}
+
+	async fn list_program_recoveries(&self) -> anyhow::Result<Vec<ProgramRecoveryRecord>> {
+		self.inner.read().await.get_all(partition::PROGRAM_RECOVERY).await?
+			.into_iter().map(|record| record.to_data()).collect()
+	}
+
+	async fn reserve_program_recovery(
+		&self,
+		inputs: &[(VtxoId, Option<VtxoState>)],
+		actors: &[String],
+	) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		let mut updates = Vec::new();
+		let mut absent = Vec::new();
+		let mut keys = std::collections::BTreeSet::new();
+		let mut seen = std::collections::HashSet::new();
+		for (id, expected) in inputs {
+			let previous = lock.get(partition::VTXO, &id.to_bytes()).await?;
+			let mut vtxo = previous.as_ref().map(|r| r.to_data::<SerdeVtxo>()).transpose()?;
+			let current = vtxo.as_ref().map(|v| v.current_state().context("vtxo has no state"))
+				.transpose()?;
+			anyhow::ensure!(current == expected.as_ref(),
+				"vtxo {id} changed before program recovery reservation");
+			keys.insert(recovery_vtxo_key(*id));
+			if !seen.insert(*id) {
+				continue;
+			}
+			if previous.is_none() {
+				absent.push((partition::VTXO, id.to_bytes().to_vec()));
+			}
+			if let Some(vtxo) = vtxo.as_mut() {
+				let updated = if matches!(vtxo.current_state(),
+					Some(VtxoState::Spendable | VtxoState::Locked { .. }))
+				{
+					vtxo.states.push(VtxoState::Exited);
+					let sk = sort::vtxo_sort_key(
+						VtxoStateKind::Exited, vtxo.vtxo.expiry_height().to_u32(), vtxo.vtxo.amount(),
+					);
+					Some(Record::from_data(partition::VTXO, &id.to_bytes(), Some(sk), vtxo)?)
+				} else {
+					previous.clone()
+				};
+				updates.push(RecordUpdate { previous, updated });
+			}
+		}
+		keys.extend(actors.iter().cloned());
+		for key in keys {
+			let previous = lock.get(partition::PROGRAM_RECOVERY_RESERVATION, key.as_bytes()).await?;
+			let updated = Record::from_data(
+				partition::PROGRAM_RECOVERY_RESERVATION, key.as_bytes(), None, &true,
+			)?;
+			updates.push(RecordUpdate { previous, updated: Some(updated) });
+		}
+		lock.put_batch_checked(updates, &absent).await
+	}
+
+	async fn has_program_recovery_reservation(&self, key: &str) -> anyhow::Result<bool> {
+		Ok(self.inner.read().await.get(
+			partition::PROGRAM_RECOVERY_RESERVATION, key.as_bytes(),
+		).await?.is_some())
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
@@ -996,7 +1299,14 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None,
 			checkpoint,
 		)?;
-		self.inner.write().await.put(record).await
+		let mut lock = self.inner.write().await;
+		anyhow::ensure!(lock.get(
+			partition::PROGRAM_RECOVERY_RESERVATION, recovery_action_key(id).as_bytes(),
+		).await?.is_none(), "wallet action reserved for program recovery");
+		let previous = lock.get(partition::WALLET_ACTION_CHECKPOINT, id.as_bytes()).await?;
+		lock.put_batch_checked(vec![RecordUpdate { previous, updated: Some(record) }], &[
+			(partition::PROGRAM_RECOVERY_RESERVATION, recovery_action_key(id).into_bytes()),
+		]).await
 	}
 
 	async fn get_wallet_action_checkpoint(
@@ -1023,8 +1333,60 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		&self,
 		id: &WalletActionId,
 	) -> anyhow::Result<()> {
-		self.inner.write().await
-			.delete(partition::WALLET_ACTION_CHECKPOINT, id.as_bytes()).await?;
+		let mut lock = self.inner.write().await;
+		let previous = lock.get(partition::WALLET_ACTION_CHECKPOINT, id.as_bytes()).await?;
+		let updates = previous.into_iter().map(|record| RecordUpdate {
+			previous: Some(record), updated: None,
+		}).collect();
+		lock.put_batch_checked(updates, &[
+			(partition::PROGRAM_RECOVERY_RESERVATION, recovery_action_key(id).into_bytes()),
+		]).await
+	}
+
+	async fn finish_wallet_action(&self, id: &WalletActionId) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		anyhow::ensure!(lock.get(
+			partition::PROGRAM_RECOVERY_RESERVATION, recovery_action_key(id).as_bytes(),
+		).await?.is_none(), "wallet action reserved for program recovery");
+		let checkpoint = lock.get(partition::WALLET_ACTION_CHECKPOINT, id.as_bytes()).await?;
+		let mut updates = Vec::new();
+		// Amounts sort in descending order. Include both boundary heights
+		// without loading signed VTXOs whose current state is not locked.
+		let start = sort::vtxo_sort_key(
+			VtxoStateKind::Locked, u32::MIN, Amount::from_sat(u64::MAX),
+		);
+		let end = sort::vtxo_sort_key(VtxoStateKind::Locked, u32::MAX, Amount::ZERO);
+		for previous in lock.query_sorted(Query::new(partition::VTXO, start..=end)).await? {
+			let mut vtxo = previous.to_data::<SerdeVtxo>()?;
+			if !matches!(
+				vtxo.current_state().context("vtxo has no state")?,
+				VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: holder }) }
+					if holder == id
+			) {
+				continue;
+			}
+			anyhow::ensure!(checkpoint.is_some(),
+				"wallet action {id} has locked vtxos but no checkpoint");
+
+			// Retain the signed VTXO, registration flag, and complete state
+			// history. Only the current lock and its sort key change.
+			vtxo.states.push(VtxoState::Spendable);
+			let sk = sort::vtxo_sort_key(
+				VtxoStateKind::Spendable, vtxo.vtxo.expiry_height().to_u32(), vtxo.vtxo.amount(),
+			);
+			let updated = Record::from_data(
+				partition::VTXO, &previous.pk, Some(sk), &vtxo,
+			)?;
+			updates.push(RecordUpdate { previous: Some(previous), updated: Some(updated) });
+		}
+		if let Some(checkpoint) = checkpoint {
+			// The checkpoint and every owned lock share one conditional commit.
+			// A retry after a lost acknowledgement has no records left to change.
+			updates.push(RecordUpdate { previous: Some(checkpoint), updated: None });
+			lock.put_batch_checked(updates, &[
+				(partition::PROGRAM_RECOVERY_RESERVATION, recovery_action_key(id).into_bytes()),
+			]).await?;
+		}
 		Ok(())
 	}
 
@@ -1174,9 +1536,15 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashMap;
+
+	use ark::test_util::VTXO_VECTORS;
+
 	use super::*;
 	use crate::persist::adaptor::memory::MemoryStorageAdaptor;
-	use crate::persist::test_suite::bark_persister_tests;
+	use crate::persist::test_suite::{
+		bark_persister_tests, program_key_fixture, program_recovery_fixture, send_at_start,
+	};
 
 	#[test]
 	fn storage_query_builder() {
@@ -1192,6 +1560,218 @@ mod tests {
 	}
 
 	bark_persister_tests!(setup);
+
+	#[derive(Clone, Copy)]
+	enum BatchFailure {
+		BeforeCommit,
+		LostAcknowledgement,
+	}
+
+	/// Only the atomic batch may mutate storage once a failure is armed.
+	/// This also detects a sequential-write fallback in action completion.
+	#[derive(Default)]
+	struct FailingBatchAdaptor {
+		storage: MemoryStorageAdaptor,
+		failure: Option<BatchFailure>,
+		batch_calls: usize,
+	}
+
+	#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+	#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+	impl StorageAdaptor for FailingBatchAdaptor {
+		async fn put(&mut self, record: Record) -> anyhow::Result<()> {
+			assert!(self.failure.is_none(), "action completion must use an atomic batch");
+			self.storage.put(record).await
+		}
+
+		async fn put_batch_checked(
+			&mut self, updates: Vec<RecordUpdate>, absent: &[(u8, Vec<u8>)],
+		) -> anyhow::Result<()> {
+			self.batch_calls += 1;
+			let failure = self.failure.take();
+			if matches!(failure, Some(BatchFailure::BeforeCommit)) {
+				bail!("injected batch commit failure");
+			}
+			self.storage.put_batch_checked(updates, absent).await?;
+			if matches!(failure, Some(BatchFailure::LostAcknowledgement)) {
+				bail!("injected lost batch acknowledgement");
+			}
+			Ok(())
+		}
+
+		async fn get(&self, partition: u8, pk: &[u8]) -> anyhow::Result<Option<Record>> {
+			self.storage.get(partition, pk).await
+		}
+
+		async fn delete(&mut self, partition: u8, pk: &[u8]) -> anyhow::Result<Option<Record>> {
+			assert!(self.failure.is_none(), "action completion must use an atomic batch");
+			self.storage.delete(partition, pk).await
+		}
+
+		async fn query_sorted<R: QueryRange>(&self, query: Query<R>) -> anyhow::Result<Vec<Record>> {
+			self.storage.query_sorted(query).await
+		}
+
+		async fn get_all(&self, partition: u8) -> anyhow::Result<Vec<Record>> {
+			self.storage.get_all(partition).await
+		}
+	}
+
+	async fn action_failure_fixture() -> (StorageAdaptorWrapper<FailingBatchAdaptor>, WalletActionId) {
+		let db = StorageAdaptorWrapper::new(FailingBatchAdaptor::default());
+		let checkpoint: WalletActionCheckpoint = send_at_start().into();
+		let id = checkpoint.id();
+		let state = VtxoState::Locked {
+			holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+		};
+		db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+		db.store_vtxos(&[
+			(&VTXO_VECTORS.board_vtxo, &state),
+			(&VTXO_VECTORS.round1_vtxo, &state),
+			(&VTXO_VECTORS.arkoor3_vtxo, &state),
+		]).await.unwrap();
+		db.update_vtxo_state_checked(
+			VTXO_VECTORS.arkoor3_vtxo.id(), VtxoState::Spent, &[VtxoStateKind::Locked],
+		).await.unwrap();
+		db.mark_vtxos_registered(&[VTXO_VECTORS.board_vtxo.id()]).await.unwrap();
+		db.store_program_key(&program_key_fixture()).await.unwrap();
+		db.store_program_recoveries(&[program_recovery_fixture()]).await.unwrap();
+		(db, id)
+	}
+
+	async fn assert_finished_records(
+		db: &StorageAdaptorWrapper<FailingBatchAdaptor>,
+		id: &WalletActionId,
+		before: &HashMap<u8, BTreeMap<Vec<u8>, Record>>,
+	) {
+		let guard = db.inner.read().await;
+		let after = guard.storage.partitions();
+		assert!(after[&partition::WALLET_ACTION_CHECKPOINT].get(id.as_bytes()).is_none());
+		assert_eq!(
+			after.values().map(|p| p.len()).sum::<usize>() + 1,
+			before.values().map(|p| p.len()).sum::<usize>(),
+		);
+		let mut unlocked = 0;
+		for (partition, records) in before {
+			for (pk, record) in records {
+				if *partition == partition::WALLET_ACTION_CHECKPOINT && pk.as_slice() == id.as_bytes() {
+					continue;
+				}
+				let current = &after[partition][pk];
+				if *partition == partition::VTXO {
+					let mut original = record.to_data::<SerdeVtxo>().unwrap();
+					if matches!(original.current_state(),
+						Some(VtxoState::Locked {
+							holder: Some(VtxoLockHolder::Action { id: holder }),
+						}) if holder == id
+					) {
+						let finished = current.to_data::<SerdeVtxo>().unwrap();
+						original.states.push(VtxoState::Spendable);
+						assert_eq!(finished.states, original.states);
+						assert_eq!(finished.vtxo, original.vtxo, "signed VTXO changed");
+						assert_eq!(finished.registered, original.registered);
+						assert_eq!(current.sort_key, Some(sort::vtxo_sort_key(
+							VtxoStateKind::Spendable, original.vtxo.expiry_height().to_u32(),
+							original.vtxo.amount(),
+						)));
+						unlocked += 1;
+						continue;
+					}
+				}
+				assert_eq!(current, record, "unrelated or recovery record changed");
+			}
+		}
+		assert_eq!(unlocked, 2);
+	}
+
+	#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+	#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+	async fn recovery_reservation_batch_failure_and_retry_preserve_records() {
+		let (db, id) = action_failure_fixture().await;
+		let selected = VTXO_VECTORS.board_vtxo.id();
+		let future = VTXO_VECTORS.round2_vtxo.id();
+		let owned = VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: id.clone() }) };
+		let actors = [recovery_action_key(&id)];
+		let before = {
+			let mut guard = db.inner.write().await;
+			guard.failure = Some(BatchFailure::BeforeCommit);
+			guard.storage.partitions().clone()
+		};
+		assert!(db.reserve_program_recovery(&[
+			(selected, Some(owned.clone())), (future, None),
+		], &actors).await.is_err());
+		assert_eq!(*db.inner.read().await.storage.partitions(), before);
+		db.inner.write().await.failure = Some(BatchFailure::LostAcknowledgement);
+		assert!(db.reserve_program_recovery(&[
+			(selected, Some(owned)), (future, None),
+		], &actors).await.is_err());
+		let committed = db.inner.read().await.storage.partitions().clone();
+		for (partition, records) in &before {
+			for (pk, original) in records {
+				let current = &committed[partition][pk];
+				if *partition == partition::VTXO && *pk == selected.to_bytes().to_vec() {
+					let mut expected = original.to_data::<SerdeVtxo>().unwrap();
+					expected.states.push(VtxoState::Exited);
+					let actual = current.to_data::<SerdeVtxo>().unwrap();
+					assert_eq!(actual.states, expected.states);
+					assert_eq!(actual.vtxo, expected.vtxo);
+					assert_eq!(actual.registered, expected.registered);
+					assert_eq!(current.sort_key, Some(sort::vtxo_sort_key(
+						VtxoStateKind::Exited, expected.vtxo.expiry_height().to_u32(),
+						expected.vtxo.amount(),
+					)));
+				} else {
+					assert_eq!(current, original, "recovery changed unrelated data");
+				}
+			}
+		}
+		db.reserve_program_recovery(&[
+			(selected, Some(VtxoState::Exited)), (future, None),
+		], &actors).await.unwrap();
+		assert_eq!(*db.inner.read().await.storage.partitions(), committed);
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert_eq!(*db.inner.read().await.storage.partitions(), committed);
+	}
+
+	#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+	#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+	async fn finish_wallet_action_batch_failure_preserves_checkpoint_and_locks() {
+		let (db, id) = action_failure_fixture().await;
+		let before = {
+			let mut guard = db.inner.write().await;
+			guard.failure = Some(BatchFailure::BeforeCommit);
+			guard.batch_calls = 0;
+			guard.storage.partitions().clone()
+		};
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert_eq!(*db.inner.read().await.storage.partitions(), before);
+		db.finish_wallet_action(&id).await.unwrap();
+		assert_finished_records(&db, &id, &before).await;
+		let finished = db.inner.read().await.storage.partitions().clone();
+		db.finish_wallet_action(&id).await.unwrap();
+		let guard = db.inner.read().await;
+		assert_eq!(*guard.storage.partitions(), finished, "retry appended VTXO state history");
+		assert_eq!(guard.batch_calls, 2, "retry of a completed action must not write");
+	}
+
+	#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+	#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+	async fn finish_wallet_action_lost_acknowledgement_is_idempotent() {
+		let (db, id) = action_failure_fixture().await;
+		let before = {
+			let mut guard = db.inner.write().await;
+			guard.failure = Some(BatchFailure::LostAcknowledgement);
+			guard.batch_calls = 0;
+			guard.storage.partitions().clone()
+		};
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert_finished_records(&db, &id, &before).await;
+		let finished = db.inner.read().await.storage.partitions().clone();
+		db.finish_wallet_action(&id).await.unwrap();
+		let guard = db.inner.read().await;
+		assert_eq!(*guard.storage.partitions(), finished, "retry appended VTXO state history");
+		assert_eq!(guard.batch_calls, 1, "retry must accept the committed batch");
+	}
 }
 
 /// This module provides comprehensive tests for all four methods of the
@@ -1224,6 +1804,140 @@ pub mod test_suite {
 		Ok(())
 	}
 
+	/// Absence assertions participate in the commit, but never create records.
+	pub async fn test_put_batch_absent_atomic<S: StorageAdaptor>(storage: &mut S) {
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+		let existing = Record { partition: 90, pk: vec![1], sort_key: None, data: vec![2] };
+		let inserted = Record { partition: 91, pk: vec![3], sort_key: None, data: vec![4] };
+		storage.put(existing.clone()).await.unwrap();
+		assert!(storage.put_batch_checked(vec![
+			RecordUpdate { previous: None, updated: Some(inserted.clone()) },
+		], &[(90, existing.pk.clone())]).await.is_err());
+		assert_eq!(storage.get(91, &inserted.pk).await.unwrap(), None);
+		assert_eq!(storage.get(90, &existing.pk).await.unwrap(), Some(existing));
+		storage.put_batch_checked(vec![
+			RecordUpdate { previous: None, updated: Some(inserted.clone()) },
+		], &[(90, vec![9])]).await.unwrap();
+		assert_eq!(storage.get(91, &inserted.pk).await.unwrap(), Some(inserted));
+		assert_eq!(storage.get(90, &[9]).await.unwrap(), None);
+	}
+
+	/// A late conflict must roll back earlier replacements and insertions.
+	pub async fn test_put_batch_atomic<S: StorageAdaptor>(storage: &mut S) {
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+		let existing = Record { partition: 90, pk: vec![1], sort_key: None, data: vec![2] };
+		storage.put(existing.clone()).await.unwrap();
+		let inserted = Record { partition: 91, pk: vec![3], sort_key: None, data: vec![4] };
+		let changed = Record { data: vec![5], ..existing.clone() };
+		let wrong = Record { data: vec![6], ..existing.clone() };
+		assert!(storage.put_batch(vec![
+			RecordUpdate { previous: None, updated: Some(inserted.clone()) },
+			RecordUpdate { previous: Some(wrong), updated: Some(changed.clone()) },
+		]).await.is_err());
+		assert!(storage.get(inserted.partition, &inserted.pk).await.unwrap().is_none());
+		assert_eq!(storage.get(existing.partition, &existing.pk).await.unwrap(), Some(existing.clone()));
+		storage.put_batch(vec![
+			RecordUpdate { previous: None, updated: Some(inserted.clone()) },
+			RecordUpdate { previous: Some(existing), updated: Some(changed.clone()) },
+		]).await.unwrap();
+		assert_eq!(storage.get(inserted.partition, &inserted.pk).await.unwrap(), Some(inserted));
+		assert_eq!(storage.get(changed.partition, &changed.pk).await.unwrap(), Some(changed));
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+	}
+
+	/// Deletes, replacements, and inserts must share one conditional commit.
+	pub async fn test_put_batch_delete_atomic<S: StorageAdaptor>(storage: &mut S) {
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+		let deleted = Record {
+			partition: 90, pk: vec![1], sort_key: Some(SortKey::u32_asc(1)), data: vec![2],
+		};
+		let existing = Record { partition: 91, pk: vec![3], sort_key: None, data: vec![4] };
+		let inserted = Record { partition: 90, pk: vec![5], sort_key: None, data: vec![6] };
+		let changed = Record {
+			sort_key: Some(SortKey::u32_asc(7)), data: vec![8], ..existing.clone()
+		};
+		storage.put(deleted.clone()).await.unwrap();
+		storage.put(existing.clone()).await.unwrap();
+
+		let stale = Record { data: vec![9], ..existing.clone() };
+		assert!(storage.put_batch(vec![
+			RecordUpdate { previous: Some(deleted.clone()), updated: None },
+			RecordUpdate { previous: None, updated: Some(inserted.clone()) },
+			RecordUpdate { previous: Some(stale), updated: Some(changed.clone()) },
+		]).await.is_err());
+		assert_eq!(storage.get(deleted.partition, &deleted.pk).await.unwrap(), Some(deleted.clone()));
+		assert_eq!(storage.get(existing.partition, &existing.pk).await.unwrap(), Some(existing.clone()));
+		assert!(storage.get(inserted.partition, &inserted.pk).await.unwrap().is_none());
+
+		// A delete must compare the sort key as well as the payload.
+		let stale = Record { sort_key: None, ..deleted.clone() };
+		assert!(storage.put_batch(vec![
+			RecordUpdate { previous: Some(existing.clone()), updated: Some(changed.clone()) },
+			RecordUpdate { previous: Some(stale), updated: None },
+		]).await.is_err());
+		assert_eq!(storage.get(deleted.partition, &deleted.pk).await.unwrap(), Some(deleted.clone()));
+		assert_eq!(storage.get(existing.partition, &existing.pk).await.unwrap(), Some(existing.clone()));
+
+		storage.put_batch(vec![
+			RecordUpdate { previous: Some(deleted.clone()), updated: None },
+			RecordUpdate { previous: Some(existing), updated: Some(changed.clone()) },
+			RecordUpdate { previous: None, updated: Some(inserted.clone()) },
+		]).await.unwrap();
+		assert!(storage.get(deleted.partition, &deleted.pk).await.unwrap().is_none());
+		assert_eq!(storage.get(changed.partition, &changed.pk).await.unwrap(), Some(changed.clone()));
+		assert_eq!(storage.get(inserted.partition, &inserted.pk).await.unwrap(), Some(inserted.clone()));
+
+		// A stale delete of an absent record must not apply earlier updates.
+		assert!(storage.put_batch(vec![
+			RecordUpdate {
+				previous: Some(inserted.clone()),
+				updated: Some(Record { data: vec![10], ..inserted.clone() }),
+			},
+			RecordUpdate { previous: Some(deleted), updated: None },
+		]).await.is_err());
+		assert_eq!(storage.get(inserted.partition, &inserted.pk).await.unwrap(), Some(inserted));
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+	}
+
+	/// Invalid identities and duplicate keys must not apply earlier updates.
+	pub async fn test_put_batch_invalid_updates<S: StorageAdaptor>(storage: &mut S) {
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+		let first = Record { partition: 90, pk: vec![1], sort_key: None, data: vec![2] };
+		let second = Record { partition: 91, pk: vec![3], sort_key: None, data: vec![4] };
+		storage.put(first.clone()).await.unwrap();
+		storage.put(second.clone()).await.unwrap();
+		for invalid in [
+			vec![RecordUpdate { previous: None, updated: None }],
+			vec![RecordUpdate {
+				previous: Some(second.clone()),
+				updated: Some(Record { pk: vec![5], ..second.clone() }),
+			}],
+			vec![RecordUpdate {
+				previous: Some(second.clone()),
+				updated: Some(Record { partition: 90, ..second.clone() }),
+			}],
+			vec![
+				RecordUpdate { previous: Some(second.clone()), updated: None },
+				RecordUpdate { previous: Some(second.clone()), updated: None },
+			],
+			vec![
+				RecordUpdate { previous: Some(second.clone()), updated: None },
+				RecordUpdate { previous: None, updated: Some(second.clone()) },
+			],
+		] {
+			let mut updates = vec![RecordUpdate {
+				previous: Some(first.clone()),
+				updated: Some(Record { data: vec![6], ..first.clone() }),
+			}];
+			updates.extend(invalid);
+			assert!(storage.put_batch(updates).await.is_err());
+			assert_eq!(storage.get(first.partition, &first.pk).await.unwrap(), Some(first.clone()));
+			assert_eq!(storage.get_all(second.partition).await.unwrap(), vec![second.clone()]);
+			assert_eq!(storage.get_all(first.partition).await.unwrap(), vec![first.clone()]);
+		}
+		clear_partitions(storage, &[90, 91]).await.unwrap();
+	}
+
 	/// Runs all test suites against the given storage adaptor.
 	pub async fn run_all<S: StorageAdaptor>(storage: &mut S) {
 		// put tests
@@ -1232,6 +1946,10 @@ pub mod test_suite {
 		test_put_with_sort_key(storage).await;
 		test_put_without_sort_key(storage).await;
 		test_put_multiple_partitions(storage).await;
+		test_put_batch_atomic(storage).await;
+		test_put_batch_delete_atomic(storage).await;
+		test_put_batch_invalid_updates(storage).await;
+		test_put_batch_absent_atomic(storage).await;
 
 		// get tests
 		test_get_existing(storage).await;

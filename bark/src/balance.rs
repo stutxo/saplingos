@@ -17,6 +17,7 @@ use ark::VtxoId;
 use crate::{Wallet, WalletVtxo};
 use crate::actions::{WalletAction, WalletActionCheckpoint};
 use crate::exit::ExitStateKind;
+use crate::persist::models::{recovery_action_key, recovery_round_key};
 use crate::vtxo::{VtxoState, VtxoStateKind};
 
 /// The different balances of a Bark wallet.
@@ -56,6 +57,9 @@ pub struct Balance {
 	/// [`crate::vtxo::VtxoStateKind::Exited`] and unusable in the Ark protocol.
 	/// An exit that can still be canceled isn't counted here.
 	pub pending_exit: Amount,
+	/// Sats in already-reserved program recovery branches, excluding mutually
+	/// exclusive old/forfeit/replacement alternatives and confirmed payouts.
+	pub pending_program_recovery: Amount,
 	/// Sats in board VTXOs that are waiting for enough on-chain confirmations
 	/// to be registered with the Ark server. A board whose funding transaction
 	/// has not reached the network is not counted anywhere yet.
@@ -86,6 +90,7 @@ impl Balance {
 			+ self.claimable_lightning_receive
 			+ self.pending_offboard
 			+ self.pending_exit
+			+ self.pending_program_recovery
 	}
 
 	/// Whether any sats are held by an operation in progress.
@@ -155,6 +160,7 @@ impl Wallet {
 			pending_lightning_send: Amount::ZERO,
 			claimable_lightning_receive: Amount::ZERO,
 			pending_exit: Amount::ZERO,
+			pending_program_recovery: self.pending_program_recovery_balance().await?,
 			pending_board: Amount::ZERO,
 			pending_arkoor_send: Amount::ZERO,
 			pending_offboard: Amount::ZERO,
@@ -172,6 +178,9 @@ impl Wallet {
 
 		let mut counted = HashSet::with_capacity(vtxos.len());
 		for round in self.pending_round_states().await? {
+			if self.inner.db.has_program_recovery_reservation(&recovery_round_key(round.id())).await? {
+				continue;
+			}
 			let holder = round.state().lock_holder();
 			for input in round.state().locked_pending_inputs() {
 				let Some(vtxo) = vtxos.get(&input.id()) else { continue };
@@ -183,6 +192,9 @@ impl Wallet {
 		}
 
 		for action in self.inner.db.get_all_wallet_action_checkpoints().await? {
+			if self.inner.db.has_program_recovery_reservation(&recovery_action_key(&action.id())).await? {
+				continue;
+			}
 			match &action {
 				WalletActionCheckpoint::LightningSend(a) => {
 					balance.pending_lightning_send += held_by(a, &vtxos, &mut counted);

@@ -17,9 +17,9 @@
 //!   [`register_arkoor_split`] registers with the server.
 //! - Both kinds converge in [`prepare_offboard`], which has the server
 //!   build the offboard tx and validates it
-//!   ([`Progress::OffboardTxPrepared`]), and [`finish_offboard`], which
-//!   signs our forfeits and trades them for the signed offboard tx
-//!   ([`Progress::ReadyForBroadcast`]).
+//!   ([`Progress::OffboardTxPrepared`]). [`prepare_offboard_forfeits`] signs
+//!   and checkpoints the exact forfeits before [`finish_offboard`] trades
+//!   those durable shares for the signed tx ([`Progress::ReadyForBroadcast`]).
 //! - [`broadcast_offboard`] publishes the signed tx
 //!   ([`Progress::AwaitingConfirmations`]).
 //! - [`settle_offboard`] marks the vtxos spent and finalises the movement
@@ -36,17 +36,20 @@ use bitcoin::{Amount, FeeRate, SignedAmount, Transaction, Txid};
 use bitcoin::hashes::Hash;
 use log::{error, info, trace, warn};
 
-use ark::{musig, ProtocolEncoding, VtxoPolicy, VtxoId, fees};
+use ark::{musig, ProtocolEncoding, Vtxo, VtxoPolicy, VtxoId, fees};
 use ark::arkoor::ArkoorDestination;
 use ark::attestations::OffboardRequestAttestation;
 use ark::fees::VtxoFeeInfo;
 use ark::offboard::{OffboardForfeitContext, OffboardForfeitError, OffboardRequest};
-use ark::vtxo::VtxoRef;
+use ark::sapio::protocol::{OwnershipProof, OwnershipRequest};
+use ark::vtxo::{Full, VtxoRef};
 use bitcoin_ext::{BlockDelta, TxStatus};
 use server_rpc::{protos, TryFromBytes};
 
 use crate::{Wallet, WalletVtxo};
-use crate::actions::{Advance, AdvanceError, WalletAction, WalletActionId, BASE_RETRY_BACKOFF};
+use crate::actions::{
+	Advance, AdvanceError, WalletAction, WalletActionCheckpoint, WalletActionId, BASE_RETRY_BACKOFF,
+};
 use crate::arkoor::split_change_amount;
 use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
@@ -143,6 +146,13 @@ pub enum Progress {
 	/// `SendOnchain` intermediate: We need to perform an arkoor to split the VTXOs so we can
 	/// offboard the exact amount requested.
 	SplitWithArkoor,
+	/// Signed split outputs are durable before recovery merging or registration.
+	ArkoorCreated {
+		#[serde(with = "ark::encode::serde::vec")]
+		created: Vec<Vtxo<Full>>,
+		#[serde(with = "ark::encode::serde::vec")]
+		change: Vec<Vtxo<Full>>,
+	},
 	/// `SendOnchain` intermediate: arkoor done, yet to be registered with the server.
 	/// Both the offboard vtxos and the change are held locked until registration
 	/// succeeds; only then is the change released as spendable.
@@ -155,19 +165,12 @@ pub enum Progress {
 		/// In the case of `SendOnchain` this is the arkoor VTXOs we just created, in the case
 		/// of `OffboardWhole` this is the VTXOs we selected to offboard.
 		offboard_vtxo_ids: Vec<VtxoId>,
-		/// Set when we fell back here from [Progress::OffboardTxPrepared]
-		/// because the server's session disappeared before we could finish
-		/// it, and its tx wasn't visible on chain. If the fresh prepare then
-		/// gets rejected because the inputs are spent, the prior tx probably
-		/// did make it out after all, so we keep looking for it on chain
-		/// instead of failing the action.
+		/// Legacy checkpoints can carry an earlier offboard transaction whose
+		/// forfeits may already have escaped. Such inputs must remain locked.
 		#[serde(default)]
 		prior_txid: Option<Txid>,
 	},
-	/// Offboard tx built by the server and validated by us; our forfeits
-	/// are not signed yet — that happens inside the finish step, with
-	/// fresh nonces on every attempt, so that this checkpoint stays
-	/// value-deterministic across re-drives.
+	/// Validated offboard transaction, before authorizing its exact forfeits.
 	OffboardTxPrepared {
 		offboard_vtxo_ids: Vec<VtxoId>,
 		#[serde(with = "bitcoin_ext::serde::encodable")]
@@ -175,6 +178,19 @@ pub enum Progress {
 		/// The server's forfeit cosign nonces from the prepare response;
 		/// stable across prepare replays.
 		forfeit_cosign_nonces: Vec<musig::PublicNonce>,
+		movement_id: MovementId,
+		/// False in legacy checkpoints, which did not record the signing boundary.
+		#[serde(default)]
+		forfeits_unsent: bool,
+	},
+	/// Exact public shares are durable before the server can receive them.
+	/// A lost response must replay these bytes and never release the inputs.
+	ForfeitsPrepared {
+		offboard_vtxo_ids: Vec<VtxoId>,
+		#[serde(with = "bitcoin_ext::serde::encodable")]
+		offboard_tx: Transaction,
+		user_nonces: Vec<musig::PublicNonce>,
+		partial_signatures: Vec<[u8; 32]>,
 		movement_id: MovementId,
 	},
 	ReadyForBroadcast {
@@ -232,17 +248,49 @@ impl WalletAction for Offboard {
 			Progress::SplitWithArkoor => {
 				arkoor_split_offboard(wallet, &self).await?
 			}
+			Progress::ArkoorCreated { created, change } => {
+				store_arkoor_split(wallet, &self, created, change).await?
+			},
 			Progress::ArkoorRegistrationRequired { offboard_vtxo_ids, change_vtxo_ids } => {
 				register_arkoor_split(wallet, &self, offboard_vtxo_ids, change_vtxo_ids).await?
 			},
-			Progress::ReadyForOffboard { offboard_vtxo_ids, .. } => {
+			Progress::ReadyForOffboard { offboard_vtxo_ids, prior_txid } => {
+				if prior_txid.is_some() {
+					for id in &offboard_vtxo_ids {
+						let input = wallet.get_vtxo_by_id(*id).await?;
+						if wallet.vtxo_signing_key(&input).await?.program().is_some() {
+							return Err(anyhow!(
+								"legacy program offboard may have forfeited its inputs; refusing a conflicting session",
+							).into());
+						}
+					}
+				}
 				prepare_offboard(wallet, &self, offboard_vtxo_ids).await?
 			},
 			Progress::OffboardTxPrepared {
-				offboard_vtxo_ids, offboard_tx, forfeit_cosign_nonces, movement_id
+				offboard_vtxo_ids, offboard_tx, forfeit_cosign_nonces, movement_id, forfeits_unsent,
+			} => {
+				if !forfeits_unsent {
+					for id in &offboard_vtxo_ids {
+						let input = wallet.get_vtxo_by_id(*id).await?;
+						if wallet.vtxo_signing_key(&input).await?.program().is_some() {
+							return Err(anyhow!(
+								"legacy program offboard lacks durable forfeit shares; inputs remain locked",
+							).into());
+						}
+					}
+				}
+				prepare_offboard_forfeits(
+					wallet, &self, offboard_vtxo_ids, offboard_tx,
+					forfeit_cosign_nonces, movement_id,
+				).await?
+			},
+			Progress::ForfeitsPrepared {
+				offboard_vtxo_ids, offboard_tx, user_nonces, partial_signatures, movement_id,
 			} => {
 				finish_offboard(
-					wallet, offboard_vtxo_ids, offboard_tx, forfeit_cosign_nonces, movement_id,
+					wallet, offboard_vtxo_ids, offboard_tx,
+					user_nonces, partial_signatures, movement_id,
 				).await?
 			},
 			Progress::ReadyForBroadcast { offboard_vtxo_ids, signed_offboard_tx, movement_id } => {
@@ -310,12 +358,15 @@ impl WalletAction for Offboard {
 	/// on-chain wallet's from then on.
 	fn pending_balance_vtxo_ids(&self) -> Vec<VtxoId> {
 		match &self.progress {
-			Progress::Start | Progress::SplitWithArkoor => self.kind.vtxo_ids().clone(),
+			Progress::Start | Progress::SplitWithArkoor | Progress::ArkoorCreated { .. } => {
+				self.kind.vtxo_ids().clone()
+			},
 			Progress::ArkoorRegistrationRequired { offboard_vtxo_ids, change_vtxo_ids } => {
 				offboard_vtxo_ids.iter().chain(change_vtxo_ids).copied().collect()
 			},
 			Progress::ReadyForOffboard { offboard_vtxo_ids, .. }
 				| Progress::OffboardTxPrepared { offboard_vtxo_ids, .. }
+				| Progress::ForfeitsPrepared { offboard_vtxo_ids, .. }
 				| Progress::ReadyForBroadcast { offboard_vtxo_ids, .. }
 			=> offboard_vtxo_ids.clone(),
 			Progress::AwaitingConfirmations { .. } => Vec::new(),
@@ -334,9 +385,11 @@ impl WalletAction for Offboard {
 				return Ok(Advance::Failed(error));
 			},
 			Progress::SplitWithArkoor |
+			Progress::ArkoorCreated { .. } |
 			Progress::ArkoorRegistrationRequired { .. } |
 			Progress::ReadyForOffboard { .. } |
 			Progress::OffboardTxPrepared { .. } |
+			Progress::ForfeitsPrepared { .. } |
 			Progress::ReadyForBroadcast { .. } |
 			Progress::AwaitingConfirmations { .. } => {},
 		}
@@ -364,11 +417,15 @@ impl WalletAction for Offboard {
 					error: Some(error.into())
 				})
 			},
-			Progress::SplitWithArkoor => {
-				// We can safely unlock our VTXOs.
-				fail_offboard_movement(wallet, &self).await?;
-				Ok(Advance::Failed(error.into()))
-			}
+			Progress::SplitWithArkoor | Progress::ArkoorCreated { .. } => {
+				// A preparatory arkoor may have completed before persistence failed.
+				// Keep its old position locked rather than risk a conflicting retry.
+				Ok(Advance::Park {
+					state: self.clone(),
+					wake_after: None,
+					error: Some(error),
+				})
+			},
 			Progress::ArkoorRegistrationRequired { offboard_vtxo_ids, .. } |
 			Progress::ReadyForBroadcast {  offboard_vtxo_ids, .. } => {
 				// TODO: should we auto-exit here ?
@@ -388,17 +445,6 @@ impl WalletAction for Offboard {
 				).await? {
 					return Ok(Advance::Next(Offboard { progress, ..self.clone() }));
 				}
-				if rejection_proves_inputs_spendable(&error) {
-					// The server rejected the request itself (e.g. the fee
-					// rate we committed to went stale), which it only does
-					// after checking the inputs spendable. That proves the
-					// prior session died unfinished and nothing of ours is
-					// forfeited, so retrying can never succeed and it is
-					// safe to cancel the offboard and release the vtxos.
-					warn!("Offboard prepare rejected after session loss, cancelling: {:#}", error);
-					fail_offboard_movement(wallet, &self).await?;
-					return Ok(Advance::Failed(error.into()));
-				}
 				// Any other rejection (typically: inputs already spent)
 				// makes it likeliest that the prior finish DID go through
 				// and our chain source simply lags the server's node. Keep
@@ -417,36 +463,23 @@ impl WalletAction for Offboard {
 				fail_offboard_movement(wallet, &self).await?;
 				Ok(Advance::Failed(error.into()))
 			},
-			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, .. } => {
-				// The server no longer holds a session for this offboard
-				// (finish sessions only survive the server's session
-				// timeout). Either our finish went through and we lost the
-				// response — then the tx is on chain and we adopt it — or
-				// the session expired unfinished, and it is safe to prepare
-				// a fresh one: the expired session's forfeits can never be
-				// completed since the server's secret nonces died with it.
+			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, .. } |
+			Progress::ForfeitsPrepared { offboard_vtxo_ids, offboard_tx, .. } => {
+				// A missing session is not proof that a server discarded a share.
+				// Legacy prepared checkpoints may already have sent forfeits.
 				let offboard_txid = offboard_tx.compute_txid();
 				if let Some(progress) = adopt_broadcast_offboard(
 					wallet, &self, offboard_vtxo_ids, offboard_txid,
 				).await? {
 					return Ok(Advance::Next(Offboard { progress, ..self.clone() }));
 				}
-				warn!("Offboard session for tx {} is gone and the tx is not on chain, \
-					going back to prepare a fresh session: {:#}", offboard_txid, error);
-				let state = Offboard {
-					progress: Progress::ReadyForOffboard {
-						offboard_vtxo_ids: offboard_vtxo_ids.clone(),
-						prior_txid: Some(offboard_txid),
-					},
-					..self.clone()
-				};
-				// Park instead of advancing directly so that a repeated
-				// rejection can't spin hot, burning a fresh server session
-				// (and its UTXO locks) every round trip.
+				warn!("Offboard session for tx {} is unavailable; retaining input locks: {:#}",
+					offboard_txid, error,
+				);
 				Ok(Advance::Park {
-					state,
+					state: self.clone(),
 					wake_after: Some(CONFIRMATION_POLL_INTERVAL),
-					error: None,
+					error: Some(error),
 				})
 			},
 		}
@@ -507,10 +540,10 @@ pub(crate) async fn start_offboard(
 				})
 				.select(wallet.spendable_vtxos().await?, amount)?;
 
-			let (_, arkoor_key_index) = wallet.derive_store_next_keypair().await
-				.context("failed to create new keypair")?;
-			let (_, change_key_index) = wallet.derive_store_next_keypair().await
-				.context("failed to create new change keypair")?;
+			let (_, arkoor_key_index) = wallet.derive_store_next_signing_key().await
+				.context("failed to create offboard signing key")?;
+			let (_, change_key_index) = wallet.derive_store_next_signing_key().await
+				.context("failed to create change signing key")?;
 
 			let input_total = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
 			let change = input_total.checked_sub(amount + fee)
@@ -574,6 +607,13 @@ async fn arkoor_split_offboard(
 	wallet: &Wallet,
 	action: &Offboard,
 ) -> Result<Progress, AdvanceError> {
+	if let Some(WalletActionCheckpoint::Offboard(stored)) =
+		wallet.inner.db.get_wallet_action_checkpoint(&action.id).await?
+	{
+		if matches!(stored.progress, Progress::ArkoorCreated { .. }) {
+			return Ok(stored.progress);
+		}
+	}
 	let OffboardKind::SendOnchain {
 		input_vtxo_ids, arkoor_key_index, change_key_index, change_pieces,
 	} = &action.kind
@@ -587,22 +627,41 @@ async fn arkoor_split_offboard(
 			.context("failed to load offboard input vtxo")?);
 	}
 
-	// VTXO creation is deterministic and idempotent due to the previously derived keypairs.
+	// The persistent ownership keys fix the offboard and change destinations.
 	let required_amount = action.onchain_output_amount + action.committed_fee;
-	let keypair = wallet.peek_keypair(*arkoor_key_index).await
-		.context("failed to load keypair for offboard action")?;
-	let change_keypair = wallet.peek_keypair(*change_key_index).await
-		.context("failed to load change keypair for offboard action")?;
+	let key = wallet.peek_signing_key(*arkoor_key_index).await
+		.context("failed to load signing key for offboard action")?;
+	let change_key = wallet.peek_signing_key(*change_key_index).await
+		.context("failed to load change signing key for offboard action")?;
 	let split_destination = ArkoorDestination {
 		total_amount: required_amount,
-		policy: VtxoPolicy::new_pubkey(keypair.public_key()),
+		policy: VtxoPolicy::new_pubkey(key.public_key()),
 	};
 	let arkoor = wallet
 		.create_checkpointed_arkoor_with_vtxos(
-			split_destination, inputs.into_iter(), change_keypair, change_pieces.clone(),
+			split_destination, inputs.into_iter(), change_key.public_key(), change_pieces.clone(),
 		)
 		.await
 		.context("error preparing offboard vtxos with arkoor")?;
+	let progress = Progress::ArkoorCreated { created: arkoor.created, change: arkoor.change };
+	let checkpoint = WalletActionCheckpoint::Offboard(Offboard {
+		progress: progress.clone(), ..action.clone()
+	});
+	wallet.inner.db.upsert_wallet_action_checkpoint(&action.id, &checkpoint).await?;
+	Ok(progress)
+}
+
+/// Merge recovery witnesses and store only the already-checkpointed split bytes.
+async fn store_arkoor_split(
+	wallet: &Wallet,
+	action: &Offboard,
+	created: Vec<Vtxo<Full>>,
+	change: Vec<Vtxo<Full>>,
+) -> Result<Progress, AdvanceError> {
+	wallet.ensure_program_recoveries(&created).await
+		.context("offboard output recovery is not ready")?;
+	wallet.ensure_program_recoveries(&change).await
+		.context("offboard change recovery is not ready")?;
 
 	// The server has marked our VTXOs as spent, so we must update accordingly.
 	// Both the offboard vtxo and the change are held under the action until
@@ -610,19 +669,19 @@ async fn arkoor_split_offboard(
 	// then is the change released as spendable (the offboard vtxo stays
 	// locked until it is forfeited).
 	wallet.store_locked_vtxos(
-		&arkoor.change,
+		&change,
 		Some(VtxoLockHolder::Action { id: action.id.clone() }),
 	).await.context("error storing change vtxos from preparatory arkoor")?;
 	wallet.store_locked_vtxos(
-		&arkoor.created,
+		&created,
 		Some(VtxoLockHolder::Action { id: action.id.clone() }),
 	).await.context("error storing offboard vtxos from preparatory arkoor")?;
-	wallet.mark_vtxos_as_spent(&arkoor.inputs).await
+	wallet.mark_vtxos_as_spent(action.kind.vtxo_ids()).await
 		.context("error marking offboard inputs as spent")?;
 
 	// Create the movement early since we just performed an operation.
-	let offboard_vtxo_ids = arkoor.created.iter().map(|v| v.id()).collect::<Vec<_>>();
-	let change_vtxo_ids = arkoor.change.iter().map(|v| v.id()).collect::<Vec<_>>();
+	let offboard_vtxo_ids = created.iter().map(|v| v.id()).collect::<Vec<_>>();
+	let change_vtxo_ids = change.iter().map(|v| v.id()).collect::<Vec<_>>();
 	get_or_create_movement(
 		wallet, action, &offboard_vtxo_ids, change_vtxo_ids.iter().copied(),
 	).await?;
@@ -643,6 +702,8 @@ async fn register_arkoor_split(
 	let full_vtxos = wallet.inner.db.get_full_vtxos(&to_register).await
 		.context("failed to hydrate arkoor split vtxos")?;
 
+	wallet.ensure_program_recoveries(&full_vtxos).await
+		.context("offboard split recovery is not ready")?;
 	wallet.register_vtxo_transactions_with_server(&full_vtxos).await
 		.context("failed to register arkoor split vtxo transactions with server")?;
 
@@ -675,11 +736,11 @@ async fn prepare_offboard(
 		offboard_vtxo_ids.windows(2).all(|w| w[0] != w[1]),
 		"offboard inputs must not contain duplicates",
 	);
-	let vtxos = wallet.inner.db.get_wallet_vtxos(&offboard_vtxo_ids).await
+	let vtxos = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await
 		.context("failed to load offboard input vtxos")?;
 	debug_assert!(
 		vtxos.iter().map(|v| v.id()).eq(offboard_vtxo_ids.iter().copied()),
-		"get_wallet_vtxos should return inputs in the exact same order",
+		"get_full_vtxos should return inputs in the exact same order",
 	);
 
 	// Build the request, we can skip recalculating fees because the user already committed to a
@@ -697,8 +758,16 @@ async fn prepare_offboard(
 	let attestation = {
 		let mut attestations = Vec::with_capacity(vtxos.len());
 		for v in &vtxos {
-			let key = wallet.get_vtxo_key(v).await?;
-			let att = OffboardRequestAttestation::new(&req, &offboard_vtxo_ids, &key).serialize();
+			let key = wallet.vtxo_signing_key(v).await?;
+			let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
+				input: v.clone(),
+				proof: OwnershipProof::Offboard {
+					request: req.clone(), inputs: offboard_vtxo_ids.clone(),
+				},
+			}).await?;
+			let att = OffboardRequestAttestation::from_signature(
+				&req, &offboard_vtxo_ids, v, signature,
+			).context("invalid offboard ownership signature")?.serialize();
 			attestations.push(att);
 		}
 		attestations
@@ -750,29 +819,26 @@ async fn prepare_offboard(
 		offboard_tx: unsigned_tx,
 		forfeit_cosign_nonces,
 		movement_id,
+		forfeits_unsent: true,
 	})
 }
 
-/// `OffboardTxPrepared -> ReadyForBroadcast`: sign our forfeits and trade
-/// them for the server-signed offboard tx, WITHOUT broadcasting it
-/// ([`broadcast_offboard`] does that).
-///
-/// The forfeits are signed here, with fresh nonces on every attempt:
-/// re-signing the same message with a new random nonce is safe, and
-/// keeping signatures out of the checkpoint keeps the prepared state
-/// value-deterministic across re-drives. A retry can thus carry different
-/// signatures than the attempt the server completed; the server replays
-/// its response by txid, so this is re-entrant while the session lives.
-/// Once the session is gone, the resulting rejection is recovered in
-/// `on_rejection`.
-async fn finish_offboard(
+/// Authorize exact forfeits locally and checkpoint their public shares before send.
+async fn prepare_offboard_forfeits(
 	wallet: &Wallet,
+	action: &Offboard,
 	offboard_vtxo_ids: Vec<VtxoId>,
 	offboard_tx: Transaction,
 	server_forfeit_cosign_nonces: Vec<musig::PublicNonce>,
 	movement_id: MovementId,
 ) -> Result<Progress, AdvanceError> {
-	let (mut srv, _) = wallet.require_server().await?;
+	if let Some(WalletActionCheckpoint::Offboard(stored)) =
+		wallet.inner.db.get_wallet_action_checkpoint(&action.id).await?
+	{
+		if matches!(stored.progress, Progress::ForfeitsPrepared { .. }) {
+			return Ok(stored.progress);
+		}
+	}
 
 	let full_inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await
 		.context("failed to hydrate offboard input vtxos")?;
@@ -780,28 +846,68 @@ async fn finish_offboard(
 		full_inputs.iter().map(|v| v.id()).eq(offboard_vtxo_ids.iter().copied()),
 		"get_full_vtxos should return inputs in the exact same order",
 	);
-	let mut vtxo_keys = Vec::with_capacity(full_inputs.len());
-	for v in &full_inputs {
-		vtxo_keys.push(wallet.get_vtxo_key(v).await?);
-	}
+	wallet.ensure_program_recoveries(&full_inputs).await
+		.context("old offboard position recovery is not ready")?;
 	let ctx = OffboardForfeitContext::new(&full_inputs, &offboard_tx)
 		.context("no offboard inputs")?;
-	// `prepare_offboard` refuses to checkpoint a mismatched nonce count, so
-	// only a checkpoint written by a bark that predates that check can land
-	// here. Fail the drive rather than panic: a panic would take down the
-	// sync task and every step queued behind this one.
-	let sigs = ctx.user_sign_forfeits(&vtxo_keys, &server_forfeit_cosign_nonces)
-		.context("stored offboard has an unusable set of forfeit cosign nonces")?;
+	ctx.validate_offboard_tx(&OffboardRequest {
+		script_pubkey: action.check_destination(wallet.network().await?)?.script_pubkey(),
+		net_amount: action.onchain_output_amount,
+		deduct_fees_from_gross_amount: action.kind.deduct_fees_from_gross_amount(),
+		fee_rate: action.committed_fee_rate,
+	}).context("stored offboard transaction does not match the request")?;
+	OffboardForfeitError::check_count(
+		"forfeit cosign nonces", full_inputs.len(), server_forfeit_cosign_nonces.len(),
+	).context("stored offboard has an unusable set of forfeit cosign nonces")?;
+	let mut user_nonces = Vec::with_capacity(full_inputs.len());
+	let mut user_shares = Vec::with_capacity(full_inputs.len());
+	let contexts = ctx.signing_inputs().context("invalid offboard forfeit signing inputs")?;
+	for ((vtxo, input), server_nonce) in full_inputs.iter().zip(contexts)
+		.zip(server_forfeit_cosign_nonces.iter())
+	{
+		let key = wallet.vtxo_signing_key(vtxo).await?;
+		let prepared = wallet.prepare_vtxo_signature(&key, input).await
+			.context("program rejected the offboard forfeit transaction")?;
+		user_nonces.push(prepared.public_nonce());
+		user_shares.push(prepared.finish(&key, Some(server_nonce.clone()), None).await?
+			.user_partial);
+	}
+	let sigs = ctx.assemble_external_forfeits(
+		&server_forfeit_cosign_nonces, user_nonces, user_shares,
+	).context("invalid externally signed offboard forfeits")?;
+	let progress = Progress::ForfeitsPrepared {
+		offboard_vtxo_ids, offboard_tx, movement_id,
+		user_nonces: sigs.public_nonces,
+		partial_signatures: sigs.partial_signatures.iter().map(|s| s.serialize()).collect(),
+	};
+	let checkpoint = WalletActionCheckpoint::Offboard(Offboard {
+		progress: progress.clone(), ..action.clone()
+	});
+	wallet.inner.db.upsert_wallet_action_checkpoint(&action.id, &checkpoint).await?;
+	Ok(progress)
+}
+
+/// Replay durable shares and trade them for the server-signed offboard transaction.
+async fn finish_offboard(
+	wallet: &Wallet,
+	offboard_vtxo_ids: Vec<VtxoId>,
+	offboard_tx: Transaction,
+	user_nonces: Vec<musig::PublicNonce>,
+	partial_signatures: Vec<[u8; 32]>,
+	movement_id: MovementId,
+) -> Result<Progress, AdvanceError> {
+	let (mut srv, _) = wallet.require_server().await?;
+	let inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await?;
+	wallet.ensure_program_recoveries(&inputs).await
+		.context("old offboard position recovery is not ready")?;
 
 	let offboard_txid = offboard_tx.compute_txid();
 	let finish_resp = srv.client.finish_offboard(protos::FinishOffboardRequest {
 		offboard_txid: offboard_txid.as_byte_array().to_vec(),
-		user_nonces: sigs.public_nonces.iter()
+		user_nonces: user_nonces.iter()
 			.map(|n| n.serialize().to_vec())
 			.collect(),
-		partial_signatures: sigs.partial_signatures.iter()
-			.map(|s| s.serialize().to_vec())
-			.collect(),
+		partial_signatures: partial_signatures.iter().map(|s| s.to_vec()).collect(),
 	}).await.map_err(AdvanceError::Server)?.into_inner();
 
 	let signed_offboard_tx = bitcoin::consensus::deserialize::<Transaction>(
@@ -833,24 +939,6 @@ async fn finish_offboard(
 	Ok(Progress::ReadyForBroadcast { offboard_vtxo_ids, signed_offboard_tx, movement_id })
 }
 
-/// Whether a server rejection of a prepare request proves the input
-/// vtxos were still spendable when the server processed it.
-///
-/// The server validates the request parameters (fee rate freshness,
-/// amounts, the address blocklist) only after its input spendability
-/// check, so these rejections can only be raised for unspent inputs.
-/// Matching is conservative: anything unrecognized returns false, so
-/// callers fall back to the behavior that is safe for spent inputs.
-fn rejection_proves_inputs_spendable(error: &AdvanceError) -> bool {
-	let AdvanceError::Server(status) = error else {
-		return false;
-	};
-	// TODO: We need to formalize server errors more, perhaps with a dedicated error code system.
-	let msg = status.message();
-	msg.contains("fee rate is no longer valid")
-		|| msg.contains("does not match expected amount")
-		|| msg.contains("output address is blocked")
-}
 
 /// Check whether the offboard tx made it to the mempool or chain even
 /// though the server no longer holds a session for it (the server also
@@ -892,6 +980,9 @@ async fn broadcast_offboard(
 	offboard_tx: Transaction,
 	movement_id: MovementId,
 ) -> Result<Progress, AdvanceError> {
+	let inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await?;
+	wallet.ensure_program_recoveries(&inputs).await
+		.context("offboard recovery is not ready for broadcast")?;
 	let offboard_txid = offboard_tx.compute_txid();
 	wallet.inner.chain.broadcast_tx(&offboard_tx).await.with_context(|| format!(
 		"error broadcasting offboard tx {}", offboard_txid,

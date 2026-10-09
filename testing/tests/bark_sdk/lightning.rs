@@ -1,19 +1,31 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
+use bitcoin::{Amount, FeeRate, Network};
+use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 
 use ark::lightning::{PaymentHash, Preimage};
+use ark::{Vtxo, VtxoId, vtxo::Full};
 use bitcoin_ext::BlockDelta;
-use ark_testing::{TestContext, btc, util::{FutureExt, poll_interval}};
+use ark_testing::{TestContext, btc, sat, util::{FutureExt, poll_interval}};
 use ark_testing::balance::assert_balance_consistent;
+use ark_testing::daemon::captaind::{proxy::ArkRpcProxy, ArkClient};
 
-use bark::actions::lightning::pay::LightningSendState;
-use bark::actions::lightning::receive::LightningReceiveState;
+use bark::actions::lightning::pay::{LightningSendState, Progress as SendProgress};
+use bark::actions::lightning::receive::{LightningReceiveState, Progress as ReceiveProgress};
+use bark::exit::ExitState;
 use bark::movement::MovementStatus;
+use bark::onchain::OnchainWallet;
+use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::subsystem::Subsystem;
-use bark::LightningSendOptions;
+use bark::vtxo::VtxoState;
+use bark::{LightningSendOptions, OpenWalletArgs, Wallet, WalletSeed};
 use cln_rpc::plugins::hold;
 use server::database::Db;
+use server_rpc::protos;
 use server_rpc::protos::mailbox_server::mailbox_message::Message as MailboxMsg;
 
 /// Wait until the hold plugin holds the payment's HTLCs. The invoice turns
@@ -480,4 +492,341 @@ async fn pay_with_retry_for() {
 		).await.expect("db read").expect("payment attempt");
 		assert_eq!(attempt.retry_for, Some(expected));
 	}
+}
+
+/// Only registration fails: every claim and revocation signature comes from
+/// captaind. Count signing requests, including failures, to catch any attempt to
+/// re-sign a superseded HTLC after restarting from the signed checkpoint.
+#[derive(Clone)]
+struct SignedSuccessorRegistrationFailure {
+	claim_requests: Arc<AtomicUsize>,
+	revocation_requests: Arc<AtomicUsize>,
+	signed_responses: Arc<AtomicUsize>,
+	registration_failures: Arc<AtomicUsize>,
+	registration_error: tonic::Code,
+}
+
+impl SignedSuccessorRegistrationFailure {
+	fn new(registration_error: tonic::Code) -> Self {
+		Self {
+			claim_requests: Arc::new(AtomicUsize::new(0)),
+			revocation_requests: Arc::new(AtomicUsize::new(0)),
+			signed_responses: Arc::new(AtomicUsize::new(0)),
+			registration_failures: Arc::new(AtomicUsize::new(0)),
+			registration_error,
+		}
+	}
+
+	fn signing_requests(&self) -> (usize, usize) {
+		(
+			self.claim_requests.load(Ordering::SeqCst),
+			self.revocation_requests.load(Ordering::SeqCst),
+		)
+	}
+}
+
+#[async_trait::async_trait]
+impl ArkRpcProxy for SignedSuccessorRegistrationFailure {
+	async fn claim_lightning_receive(
+		&self, upstream: &mut ArkClient, req: protos::ClaimLightningReceiveRequest,
+	) -> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
+		self.claim_requests.fetch_add(1, Ordering::SeqCst);
+		let response = upstream.claim_lightning_receive(req).await?.into_inner();
+		self.signed_responses.fetch_add(1, Ordering::SeqCst);
+		Ok(response)
+	}
+
+	async fn request_lightning_pay_htlc_revocation(
+		&self, upstream: &mut ArkClient, req: protos::ArkoorPackageCosignRequest,
+	) -> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
+		self.revocation_requests.fetch_add(1, Ordering::SeqCst);
+		let response = upstream.request_lightning_pay_htlc_revocation(req).await?.into_inner();
+		self.signed_responses.fetch_add(1, Ordering::SeqCst);
+		Ok(response)
+	}
+
+	async fn register_vtxo_transactions(
+		&self, upstream: &mut ArkClient, req: protos::RegisterVtxoTransactionsRequest,
+	) -> Result<protos::Empty, tonic::Status> {
+		if self.signed_responses.load(Ordering::SeqCst) != 0 {
+			self.registration_failures.fetch_add(1, Ordering::SeqCst);
+			return Err(tonic::Status::new(
+				self.registration_error, "registration unavailable after real cosigning",
+			));
+		}
+		Ok(upstream.register_vtxo_transactions(req).await?.into_inner())
+	}
+}
+
+/// Open the same durable wallet, including its fee wallet, without a daemon
+/// that could race the public fallback being exercised.
+async fn reopen_signed_successor_wallet(ctx: &TestContext, name: &str) -> Wallet {
+	let datadir = ctx.datadir.join(name);
+	let mnemonic: bip39::Mnemonic = tokio::fs::read_to_string(datadir.join("mnemonic"))
+		.await.unwrap().parse().unwrap();
+	let config = toml::from_str(&tokio::fs::read_to_string(datadir.join("config.toml"))
+		.await.unwrap()).unwrap();
+	let db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(datadir.join("db.sqlite")).unwrap());
+	let onchain = OnchainWallet::load_or_create(
+		Network::Regtest, mnemonic.to_seed(""), db.clone(),
+	).await.unwrap();
+	Wallet::open(
+		Network::Regtest,
+		WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic),
+		config,
+		OpenWalletArgs {
+			persister: Some(db),
+			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
+			run_daemon: false,
+			..Default::default()
+		},
+	).await.expect("reopening the signed-successor checkpoint")
+}
+
+/// The signed branch, not just its amount, must survive inventory adoption,
+/// publication, CSV maturity and the final on-chain claim.
+async fn confirm_signed_successor_exit(
+	ctx: &TestContext, wallet: &Wallet, saved: &[Vtxo<Full>], superseded: &[VtxoId],
+) {
+	assert!(!saved.is_empty());
+	let ids = saved.iter().map(|v| v.id()).collect::<HashSet<_>>();
+	assert_eq!(wallet.exit_mgr().get_exit_vtxo_ids().await.into_iter().collect::<HashSet<_>>(), ids);
+	for vtxo in saved {
+		assert_eq!(wallet.get_full_vtxo(vtxo.id()).await.unwrap(), *vtxo,
+			"adoption must retain the complete saved genesis and signatures");
+		assert_eq!(wallet.get_vtxo_by_id(vtxo.id()).await.unwrap().state, VtxoState::Exited);
+	}
+	for id in superseded {
+		assert_eq!(wallet.get_vtxo_by_id(*id).await.unwrap().state, VtxoState::Spent);
+		assert!(wallet.exit_mgr().get_exit_vtxo(*id).await.is_none(),
+			"superseded HTLCs must not have their own exit");
+	}
+
+	for _ in 0..40 {
+		wallet.sync_onchain().await.unwrap();
+		wallet.progress_exits().await.expect("progressing exact signed successor exits");
+		if wallet.exit_mgr().list_claimable().await.len() == saved.len() {
+			break;
+		}
+		let tip = ctx.bitcoind().sync_client().tip().unwrap().height;
+		let blocks = wallet.exit_mgr().all_claimable_at_height().await
+			.and_then(|height| height.checked_blocks_since(tip)).unwrap_or(1).max(1);
+		ctx.generate_blocks(blocks).await;
+	}
+	let claimable = wallet.exit_mgr().list_claimable().await;
+	assert_eq!(claimable.iter().map(|v| v.id()).collect::<HashSet<_>>(), ids,
+		"every saved successor must become claimable");
+	for vtxo in saved {
+		let exact_tx = vtxo.transactions().find(|item| item.tx.compute_txid() == vtxo.point().txid)
+			.expect("saved successor transaction").tx;
+		assert!(exact_tx.input.iter().all(|input| !input.witness.is_empty()));
+		let confirmed = ctx.bitcoind().transaction_confirmation(exact_tx.compute_txid()).unwrap();
+		assert!(confirmed.confirmations.unwrap_or(0) > 0);
+		assert_eq!(ctx.bitcoind().sync_client().get_raw_transaction(&exact_tx.compute_txid(), None)
+			.unwrap(), exact_tx, "the confirmed transaction must retain the saved signatures");
+	}
+
+	let amount = saved.iter().map(|v| v.amount()).sum::<Amount>();
+	let payout = ctx.bitcoind().get_new_address();
+	let claim = wallet.exit_mgr().drain_exits(
+		&claimable, wallet, payout.clone(), Some(FeeRate::from_sat_per_vb(2).unwrap()),
+	).await.unwrap();
+	let fee = claim.fee().expect("claim PSBT has all prevouts");
+	assert!(fee > Amount::ZERO && fee < amount);
+	let claim = claim.extract_tx().unwrap();
+	assert_eq!(claim.input.iter().map(|i| i.previous_output).collect::<HashSet<_>>(),
+		saved.iter().map(|v| v.point()).collect::<HashSet<_>>(),
+		"claim must consume the refund/receive successors, never the old HTLCs");
+	assert_eq!(claim.output.len(), 1);
+	assert_eq!(claim.output[0].value, amount - fee);
+	assert_eq!(claim.output[0].script_pubkey, payout.script_pubkey());
+	let claim_txid = ctx.bitcoind().sync_client().send_raw_transaction(&claim).unwrap();
+	ctx.generate_blocks(1).await;
+	wallet.progress_exits().await.unwrap();
+	assert_eq!(ctx.bitcoind().get_received_by_address(&payout), amount - fee);
+	assert!(ctx.bitcoind().transaction_confirmation(claim_txid)
+		.unwrap().confirmations.unwrap_or(0) > 0);
+	for id in ids {
+		assert!(matches!(wallet.exit_mgr().get_exit_vtxo(id).await.unwrap().state(),
+			ExitState::Claimed(state) if state.txid == claim_txid));
+	}
+	let spendable = wallet.spendable_vtxos().await.unwrap();
+	assert!(spendable.iter().all(|v| !superseded.contains(&v.id())
+		&& saved.iter().all(|successor| successor.id() != v.id())),
+		"neither spent inputs nor exited successors may become reusable");
+}
+
+/// A locally owned Delivering checkpoint predates inventory insertion. Its
+/// public fallback must adopt those exact signatures after a wallet restart.
+#[tokio::test]
+async fn receive_signed_successor_exit_after_registration_failure() {
+	let ctx = TestContext::new("bark_sdk/receive_signed_successor_exit_after_registration_failure").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let fault = SignedSuccessorRegistrationFailure::new(tonic::Code::InvalidArgument);
+	let proxy = srv.start_proxy_no_mailbox(fault.clone()).await;
+	let wallet = ctx.bark_sdk("bark", &proxy.address).funded(sat(1_000_000))
+		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	wallet.stop_daemon_wait().await.unwrap();
+	lightning.sync().await;
+
+	let invoice_amount = sat(100_000);
+	let invoice = wallet.bolt11_invoice(invoice_amount, None, None).await.unwrap();
+	let payment_hash = PaymentHash::from(&invoice);
+	let mut mailbox = wallet.subscribe_mailbox_messages(None).await.unwrap();
+	let (paid, claimed) = tokio::join!(
+		lightning.external.try_pay_bolt11(invoice.to_string()),
+		async {
+			loop {
+				let message = mailbox.next().wait_millis(30_000).await.unwrap().unwrap();
+				if let Some(MailboxMsg::IncomingLightningPayment(incoming)) = message.message {
+					assert_eq!(incoming.payment_hash, payment_hash.to_vec());
+					break;
+				}
+			}
+			wallet.try_claim_lightning_receive(payment_hash, false).await
+		},
+	);
+	paid.expect("real Lightning payment must settle before fallback");
+	claimed.expect_err("registration must reject the signed local claim");
+	drop(mailbox);
+
+	let checkpoint = wallet.lightning_receive_checkpoint(payment_hash).await.unwrap().unwrap();
+	assert!(checkpoint.claim_destination.is_none());
+	let ReceiveProgress::Delivering(delivery) = &checkpoint.progress else {
+		panic!("receive must retain its signed Delivering checkpoint: {:?}", checkpoint.progress);
+	};
+	assert!(!delivery.vtxos.is_empty());
+	assert!(!delivery.input_vtxo_ids.is_empty());
+	assert_eq!(delivery.vtxos.iter().map(|v| v.amount()).sum::<Amount>(), invoice_amount);
+	for vtxo in &delivery.vtxos {
+		wallet.validate_vtxo(vtxo).await.unwrap();
+		assert!(wallet.get_vtxo_by_id(vtxo.id()).await.is_err(),
+			"the fault must precede local successor inventory insertion");
+	}
+	assert!(fault.registration_failures.load(Ordering::SeqCst) > 0);
+	let signed_requests = fault.signing_requests();
+	assert!(signed_requests.0 > 0);
+	assert_eq!(signed_requests.1, 0);
+	drop(wallet);
+
+	let wallet = reopen_signed_successor_wallet(&ctx, "bark").await;
+	assert_eq!(wallet.lightning_receive_checkpoint(payment_hash).await.unwrap(), Some(checkpoint.clone()));
+	assert!(wallet.exit_mgr().get_exit_vtxo_ids().await.is_empty());
+	wallet.attempt_lightning_receive_exit(payment_hash).await
+		.expect("public fallback must exit saved local Delivering successors");
+	assert!(wallet.lightning_receive_checkpoint(payment_hash).await.unwrap().is_none());
+	assert_eq!(fault.signing_requests(), signed_requests, "fallback must not re-sign old HTLCs");
+	srv.stop().await.unwrap();
+	confirm_signed_successor_exit(&ctx, &wallet, &delivery.vtxos, &delivery.input_vtxo_ids).await;
+	assert_eq!(fault.signing_requests(), signed_requests);
+	assert_eq!(wallet.spendable_vtxos().await.unwrap().len(), 0);
+	drop(wallet);
+	proxy.stop.send(()).unwrap();
+	lightning.internal.stop().await.unwrap();
+	lightning.external.stop().await.unwrap();
+}
+
+/// Signed revocation outputs are still a stuck send when registration fails.
+/// Opting into exit must recover the refund branch rather than its old HTLCs.
+#[tokio::test]
+async fn send_signed_successor_exit_after_registration_failure() {
+	let ctx = TestContext::new("bark_sdk/send_signed_successor_exit_after_registration_failure").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.htlc_send_expiry_delta = BlockDelta::new(96)).create().await;
+	let fault = SignedSuccessorRegistrationFailure::new(tonic::Code::Unavailable);
+	let proxy = srv.start_proxy_no_mailbox(fault.clone()).await;
+	let board_amount = sat(500_000);
+	let wallet = ctx.bark_sdk("bark", &proxy.address).funded(sat(1_000_000)).boarded(board_amount)
+		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	wallet.stop_daemon_wait().await.unwrap();
+	lightning.sync().await;
+	let original_ids = wallet.spendable_vtxos().await.unwrap().iter().map(|v| v.id()).collect::<Vec<_>>();
+	let invoice_amount = sat(100_000);
+	let payment_hash = Preimage::random().compute_payment_hash();
+	let mut hold_client = lightning.external.hold_client().await;
+	let invoice = hold_client.invoice(hold::InvoiceRequest {
+		payment_hash: payment_hash.to_vec(),
+		amount_msat: invoice_amount.to_sat() * 1_000,
+		description: Some(hold::invoice_request::Description::Memo("signed refund exit".into())),
+		min_final_cltv_expiry: Some(18),
+		expiry: Some(3600),
+		routing_hints: vec![],
+	}).await.unwrap().into_inner().bolt11;
+	wallet.pay_lightning_invoice(invoice, None, false).await.unwrap();
+	wait_for_hold_invoice_accepted(&mut hold_client, payment_hash).await;
+	hold_client.cancel(hold::CancelRequest { payment_hash: payment_hash.to_vec() })
+		.await.unwrap();
+
+	// CLN reconciliation can lag xpay's failure. Only stop once the genuine
+	// refund signatures have reached the durable, publicly reported stuck state.
+	async {
+		loop {
+			let _ = wallet.check_lightning_payment(payment_hash, false).await;
+			if wallet.stuck_failed_lightning_sends().await.unwrap().iter().any(|send|
+				send.invoice.payment_hash() == payment_hash
+					&& matches!(&send.progress, SendProgress::RevocationStuck { revocation, .. }
+						if !revocation.vtxos.is_empty())
+			) {
+				break;
+			}
+			tokio::time::sleep(poll_interval()).await;
+		}
+	}.wait_millis(60_000).await;
+	let checkpoint = wallet.lightning_send_checkpoint(payment_hash).await.unwrap().unwrap();
+	let SendProgress::RevocationStuck { htlcs, revocation } = &checkpoint.progress else {
+		panic!("signed refunds must be reported as stuck: {:?}", checkpoint.progress);
+	};
+	assert!(!checkpoint.allow_exit_of_htlcs);
+	assert!(!revocation.vtxos.is_empty());
+	assert_eq!(revocation.vtxos.iter().map(|v| v.amount()).sum::<Amount>(), checkpoint.total_amount());
+	for vtxo in &revocation.vtxos {
+		wallet.validate_vtxo(vtxo).await.unwrap();
+		assert!(wallet.get_vtxo_by_id(vtxo.id()).await.is_err(),
+			"registration must fail before refund inventory insertion");
+	}
+	assert!(fault.registration_failures.load(Ordering::SeqCst) > 0);
+	let signed_requests = fault.signing_requests();
+	assert_eq!(signed_requests.0, 0);
+	assert!(signed_requests.1 > 0);
+	drop(wallet);
+
+	let wallet = reopen_signed_successor_wallet(&ctx, "bark").await;
+	assert_eq!(wallet.lightning_send_checkpoint(payment_hash).await.unwrap(), Some(checkpoint.clone()));
+	assert_eq!(wallet.stuck_failed_lightning_sends().await.unwrap(), vec![checkpoint.clone()]);
+	let tip = ctx.bitcoind().sync_client().tip().unwrap().height;
+	let near_expiry = checkpoint.htlc_expiry
+		.saturating_sub(wallet.config().vtxo_refresh_expiry_threshold) + BlockDelta::new(1);
+	if let Some(blocks) = near_expiry.checked_blocks_since(tip) {
+		if blocks > 0 {
+			ctx.generate_blocks(blocks).await;
+		}
+	}
+	assert!(checkpoint.is_htlc_near_expiry(&wallet).await.unwrap());
+	let _ = wallet.check_lightning_payment(payment_hash, false).await;
+	assert!(wallet.exit_mgr().get_exit_vtxo_ids().await.is_empty(),
+		"saved refunds must not bypass explicit exit opt-in");
+	assert_eq!(wallet.stuck_failed_lightning_sends().await.unwrap(), vec![checkpoint.clone()]);
+
+	wallet.allow_lightning_send_to_exit(payment_hash).await.unwrap();
+	wallet.check_lightning_payment(payment_hash, false).await.unwrap();
+	assert!(wallet.lightning_send_checkpoint(payment_hash).await.unwrap().is_none());
+	assert!(wallet.stuck_failed_lightning_sends().await.unwrap().is_empty());
+	assert_eq!(fault.signing_requests(), signed_requests, "exit must not request another refund signature");
+	let change = wallet.spendable_vtxos().await.unwrap();
+	assert_eq!(change.iter().map(|v| v.amount()).sum::<Amount>(), board_amount - checkpoint.total_amount());
+	assert!(change.iter().all(|v| !original_ids.contains(&v.id()) && !htlcs.vtxo_ids.contains(&v.id())));
+	let mut superseded = original_ids;
+	superseded.extend_from_slice(&htlcs.vtxo_ids);
+	srv.stop().await.unwrap();
+	confirm_signed_successor_exit(&ctx, &wallet, &revocation.vtxos, &superseded).await;
+	assert_eq!(fault.signing_requests(), signed_requests);
+	assert_eq!(wallet.spendable_vtxos().await.unwrap(), change,
+		"exiting the refunds must neither reuse inputs nor consume unrelated change");
+	drop(wallet);
+	proxy.stop.send(()).unwrap();
+	lightning.internal.stop().await.unwrap();
+	lightning.external.stop().await.unwrap();
 }

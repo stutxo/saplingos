@@ -77,6 +77,7 @@ All endpoints return JSON. Amounts are denominated in satoshis.";
 		(path = "/api/v1/wallet", api = api::v1::wallet::WalletApiDoc),
 		(path = "/api/v1/bitcoin", api = api::v1::bitcoin::BitcoinApiDoc),
 		(path = "/api/v1/notifications", api = api::v1::notifications::NotificationsApiDoc),
+		(path = "/api/v1/receive/program", api = api::v1::receive::ReceiveApiDoc),
 	),
 	info(
 		title = "barkd REST API",
@@ -132,6 +133,7 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 pub struct RestServer {
 	shutdown: CancellationToken,
 	jh: JoinHandle<()>,
+	receive_jh: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -376,6 +378,18 @@ impl RestServer {
 		let listener = tokio::net::TcpListener::bind(socket_addr).await
 			.context("Failed to bind to address")?;
 
+		// Program delivery uses a separate listener with only prepare/commit.
+		// Never expose the administrative router (including its optional-auth
+		// mode) through the coordinator URL.
+		let receive_bind = state.wallet.read().as_ref()
+			.and_then(|wallet| wallet.config().sapio.as_ref())
+			.and_then(|sapio| sapio.receive_bind);
+		let receive_listener = match receive_bind {
+			Some(address) => Some(tokio::net::TcpListener::bind(address).await
+				.context("Failed to bind program receive address")?),
+			None => None,
+		};
+
 		log::info!("Server starting on http://{}", socket_addr);
 
 		if web_ui_attached {
@@ -392,7 +406,7 @@ impl RestServer {
 		let router = router
 			.layer(cors_layer(config))
 			.layer(axum::middleware::from_fn(error::log_errors))
-			.with_state(state);
+			.with_state(state.clone());
 
 		let shutdown2 = shutdown.clone();
 		let jh = tokio::spawn(async move {
@@ -405,7 +419,21 @@ impl RestServer {
 			}
 		});
 
-		Ok(RestServer { shutdown, jh })
+		let receive_jh = receive_listener.map(|listener| {
+			let router = axum::Router::new()
+				.nest("/api/v1/receive/program", api::v1::receive::router())
+				.with_state(state.clone());
+			let shutdown = shutdown.clone();
+			tokio::spawn(async move {
+				if let Err(e) = axum::serve(listener, router.into_make_service())
+					.with_graceful_shutdown(shutdown_signal(shutdown)).await
+				{
+					error!("Error running program receive listener: {:#}", e);
+				}
+			})
+		});
+
+		Ok(RestServer { shutdown, jh, receive_jh })
 	}
 
 	/// Stop the REST server
@@ -417,6 +445,9 @@ impl RestServer {
 	pub async fn stop_wait(self) -> anyhow::Result<()> {
 		self.stop();
 		self.jh.await?;
+		if let Some(jh) = self.receive_jh {
+			jh.await?;
+		}
 		Ok(())
 	}
 }

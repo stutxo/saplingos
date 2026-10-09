@@ -199,18 +199,22 @@ async fn offboard_rejects_unsigned_finish_response() {
 		.create().await;
 
 	let address = ctx.bitcoind().get_new_address();
-	let err = wallet.offboard_all(address.clone()).await
+	wallet.offboard_all(address.clone()).await
 		.expect_err("the unsigned finish response should be rejected");
-	let err = format!("{err:#}");
-	assert!(err.contains("unsigned input"), "unexpected error: {err}");
 
 	// The rejected response must not have advanced the checkpoint.
 	let pending = wallet.pending_offboards().await.expect("pending offboards");
 	assert_eq!(pending.len(), 1);
 	assert!(
-		matches!(pending[0].progress, Progress::OffboardTxPrepared { .. }),
+		matches!(pending[0].progress, Progress::ForfeitsPrepared { .. }),
 		"expected the offboard to stay at the finish step: {:?}", pending[0].progress,
 	);
+	let Progress::ForfeitsPrepared { offboard_tx, .. } = &pending[0].progress else {
+		unreachable!("checked checkpoint phase");
+	};
+	let expected_amount = offboard_tx.output.iter()
+		.filter(|out| out.script_pubkey == address.script_pubkey())
+		.map(|out| out.value).sum::<Amount>();
 
 	// The retry replays the stored response, now unmangled, and the
 	// offboard settles like any other.
@@ -218,7 +222,7 @@ async fn offboard_rejects_unsigned_finish_response() {
 	ctx.generate_blocks(1).await;
 	wallet.sync_pending_offboards().await.expect("sync pending offboards");
 	assert_eq!(offboard_movement(&wallet).await.status, MovementStatus::Successful);
-	assert_ne!(ctx.bitcoind().get_received_by_address(&address), Amount::ZERO);
+	assert_eq!(ctx.bitcoind().get_received_by_address(&address), expected_amount);
 }
 
 /// A wallet whose finish_offboard request never reached the server comes

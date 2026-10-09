@@ -245,6 +245,15 @@ pub struct Config {
 	///
 	/// Default value: 250
 	pub vtxo_key_gap_limit: u32,
+
+	/// Exact program/root and recovery construction for newly issued joint keys.
+	#[serde(default)]
+	pub sapio: Option<crate::sapio::SapioConfig>,
+
+	/// Per-key auxiliary evidence for this wallet invocation's ordinary spends.
+	/// Recovery evidence is separately fixed in each key's recovery template.
+	#[serde(default)]
+	pub sapio_witnesses: std::collections::BTreeMap<bitcoin::secp256k1::PublicKey, Vec<u8>>,
 }
 
 impl Config {
@@ -277,7 +286,9 @@ impl Config {
 			daemon_manual_sync: false,
 			change_vtxo_split_factor: 2,
 			vtxo_key_gap_limit: DEFAULT_VTXO_KEY_GAP_LIMIT,
-		};
+			sapio: None,
+			sapio_witnesses: Default::default(),
+	};
 
 		if network != Network::Bitcoin {
 			ret.vtxo_refresh_expiry_threshold = BlockDelta::new(12);
@@ -300,12 +311,21 @@ impl Config {
 		let default = config::Config::try_from(&Self::network_default(network))
 			.expect("default config failed to deconstruct");
 
-		let config = config::Config::builder()
+		let source = config::Config::builder()
 			.add_source(default)
 			.add_source(config::File::from(path.as_ref()).required(false))
 			.add_source(config::Environment::with_prefix("BARK"))
-			.build().context("error building config")?
-			.try_deserialize::<Config>().context("error parsing config")?;
+			.build().context("error building config")?;
+		for obsolete in ["sapio_cosigner_pubkey", "sapio_endpoint", "sapio_program_id"] {
+			if source.get::<serde_json::Value>(obsolete).is_ok_and(|value| !value.is_null()) {
+				bail!("{obsolete} cannot identify an authorized program; configure sapio with its exact program and attested root");
+			}
+		}
+		let config = source.try_deserialize::<Config>().context("error parsing config")?;
+		if let Some(sapio) = &config.sapio { sapio.validate()?; }
+		if config.sapio_witnesses.values().any(|witness| witness.len() > 65_536) {
+			bail!("Sapio spend evidence exceeds the protocol bound");
+		}
 
 		// Caught here so an out-of-range limit is refused up front, rather than
 		// failing the first scan that reads it.

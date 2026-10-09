@@ -118,6 +118,7 @@ use secp256k1_musig::musig::PublicNonce;
 
 use crate::{musig, scripts, Vtxo, VtxoId, ServerVtxo};
 use crate::attestations::ArkoorCosignAttestation;
+use crate::musig::context::{SigningContextError, SigningInput};
 use crate::vtxo::{Full, ServerVtxoPolicy, VtxoPolicy, VtxoRef};
 use crate::vtxo::genesis::{GenesisItem, GenesisTransition};
 
@@ -187,6 +188,16 @@ pub enum ArkoorSigningError {
 		expected: usize,
 		got: usize,
 	},
+	#[error(transparent)]
+	SigningContext(#[from] SigningContextError),
+	#[error("external signing nonce data is missing")]
+	MissingExternalNonces,
+	#[error("Wrong number of completed signatures. Expected {expected}, got {got}")]
+	InvalidNbSignatures { expected: usize, got: usize },
+	#[error("Invalid completed signature at index {index}: {error}")]
+	InvalidSignature { index: usize, error: SigningContextError },
+	#[error("Wrong number of attestations. Expected {expected}, got {got}")]
+	InvalidNbAttestations { expected: usize, got: usize },
 }
 
 /// The destination of an arkoor pacakage
@@ -307,6 +318,7 @@ pub mod state {
 		impl Sealed for super::UserSigned {}
 		impl Sealed for super::ServerCanCosign {}
 		impl Sealed for super::ServerSigned {}
+		impl Sealed for super::ExternalNonces {}
 	}
 
 	pub trait BuilderState: sealed::Sealed {}
@@ -318,6 +330,10 @@ pub mod state {
 	// The user has generated their nonces
 	pub struct UserGeneratedNonces;
 	impl BuilderState for UserGeneratedNonces {}
+
+	/// Nonces belong to an external signer; no local keypair or secret nonce exists.
+	pub struct ExternalNonces;
+	impl BuilderState for ExternalNonces {}
 
 	// The user can sign
 	pub struct UserSigned;
@@ -390,6 +406,73 @@ pub struct ArkoorBuilder<S: state::BuilderState> {
 }
 
 impl<S: state::BuilderState> ArkoorBuilder<S> {
+	/// Export owned signing contexts in nonce order: input spend, checkpoint
+	/// output spends in output order, then the optional dust isolation fanout.
+	pub fn signing_inputs(&self) -> Result<Vec<SigningInput>, SigningContextError> {
+		let participants = vec![self.user_pubkey(), self.server_pubkey()];
+		let input_tree = self.input.output_taproot();
+		let checkpoint_tree = ServerVtxoPolicy::new_checkpoint(self.user_pubkey()).taproot(
+			self.server_pubkey(), self.input.exit_delta(), self.input.expiry_height(),
+		);
+		let mut contexts = Vec::with_capacity(self.nb_sigs());
+		if let Some((checkpoint, _)) = &self.checkpoint_data {
+			contexts.push(SigningInput::key_spend(
+				checkpoint.clone(), 0, vec![self.input.txout()], &input_tree, participants.clone(),
+			)?);
+			for tx in &self.unsigned_arkoor_txs {
+				contexts.push(Self::checkpoint_signing_input(
+					tx, checkpoint, &checkpoint_tree, participants.clone(),
+				)?);
+			}
+		} else {
+			let tx = self.unsigned_arkoor_txs.first().ok_or(
+				SigningContextError::InvalidContext("missing arkoor transaction"),
+			)?;
+			contexts.push(SigningInput::key_spend(
+				tx.clone(), 0, vec![self.input.txout()], &input_tree, participants.clone(),
+			)?);
+		}
+		if let Some(tx) = &self.unsigned_isolation_fanout_tx {
+			let parent = self.checkpoint_data.as_ref().map(|(tx, _)| tx)
+				.or_else(|| self.unsigned_arkoor_txs.first())
+				.ok_or(SigningContextError::InvalidContext("missing isolation parent"))?;
+			contexts.push(Self::checkpoint_signing_input(
+				tx, parent, &checkpoint_tree, participants,
+			)?);
+		}
+		if contexts.len() != self.sighashes.len() {
+			return Err(SigningContextError::InvalidContext("signing context count mismatch"));
+		}
+		for (context, hash) in contexts.iter().zip(&self.sighashes) {
+			if context.sighash()? != hash.to_byte_array() {
+				return Err(SigningContextError::InvalidContext("signing context order mismatch"));
+			}
+		}
+		Ok(contexts)
+	}
+
+	fn checkpoint_signing_input(
+		tx: &Transaction,
+		parent: &Transaction,
+		tree: &bitcoin::taproot::TaprootSpendInfo,
+		participants: Vec<PublicKey>,
+	) -> Result<SigningInput, SigningContextError> {
+		let input = tx.input.first().ok_or(
+			SigningContextError::InvalidContext("missing checkpoint spend input"),
+		)?;
+		if input.previous_output.txid != parent.compute_txid() {
+			return Err(SigningContextError::InvalidContext("checkpoint parent mismatch"));
+		}
+		let prevout = parent.output.get(input.previous_output.vout as usize).ok_or(
+			SigningContextError::InvalidContext("checkpoint output index out of bounds"),
+		)?;
+		let mut context = SigningInput::key_spend(
+			tx.clone(), 0, vec![prevout.clone()], tree, participants,
+		)?;
+		context.psbt.inputs[0].non_witness_utxo = Some(parent.clone());
+		Ok(context)
+	}
+
 	/// Access the input VTXO
 	pub fn input(&self) -> &Vtxo<Full> {
 		&self.input
@@ -1131,6 +1214,21 @@ impl<S: state::BuilderState> ArkoorBuilder<S> {
 }
 
 impl ArkoorBuilder<state::Initial> {
+	/// Install externally generated aggregate ownership nonces, in signing-input order.
+	pub fn with_external_nonces(
+		mut self,
+		nonces: Vec<musig::PublicNonce>,
+	) -> Result<ArkoorBuilder<state::ExternalNonces>, ArkoorSigningError> {
+		if nonces.len() != self.nb_sigs() {
+			return Err(ArkoorSigningError::InvalidNbUserNonces {
+				expected: self.nb_sigs(), got: nonces.len(),
+			});
+		}
+		self.signing_inputs()?;
+		self.user_pub_nonces = Some(nonces);
+		Ok(self.to_state())
+	}
+
 	/// Create builder with checkpoint transaction
 	pub fn new_with_checkpoint(
 		input: Vtxo<Full>,
@@ -1219,7 +1317,8 @@ impl ArkoorBuilder<state::Initial> {
 		}
 	}
 
-	pub(crate) fn new(
+	/// Reconstruct a checked transaction plan without any attestation or signing state.
+	pub fn new(
 		input: Vtxo<Full>,
 		outputs: Vec<ArkoorDestination>,
 		isolated_outputs: Vec<ArkoorDestination>,
@@ -1497,6 +1596,74 @@ impl ArkoorBuilder<state::ServerSigned> {
 	}
 }
 
+impl ArkoorBuilder<state::ExternalNonces> {
+	pub fn user_pub_nonces(&self) -> Result<&[PublicNonce], ArkoorSigningError> {
+		self.user_pub_nonces.as_deref().ok_or(ArkoorSigningError::MissingExternalNonces)
+	}
+
+	/// Use an externally signed ownership attestation without changing the wire request.
+	pub fn cosign_request_with_attestation(
+		&self,
+		attestation: ArkoorCosignAttestation,
+	) -> Result<ArkoorCosignRequest<Vtxo<Full>>, ArkoorSigningError> {
+		let request = ArkoorCosignRequest::new_with_attestation(
+			self.user_pub_nonces()?.to_vec(), self.input.clone(), self.outputs.clone(),
+			self.isolated_outputs.clone(), self.checkpoint_data.is_some(), attestation,
+		);
+		request.verify_attestation().map_err(ArkoorSigningError::InvalidAttestation)?;
+		Ok(request)
+	}
+
+	/// Verify every server share against the exact message, tweak, and corresponding nonce.
+	pub fn verify_cosign_response(&self, data: &ArkoorCosignResponse) -> Result<(), ArkoorSigningError> {
+		let nonces = self.user_pub_nonces()?;
+		if data.server_pub_nonces.len() != self.nb_sigs() {
+			return Err(ArkoorSigningError::InvalidNbServerNonces {
+				expected: self.nb_sigs(), got: data.server_pub_nonces.len(),
+			});
+		}
+		if data.server_partial_sigs.len() != self.nb_sigs() {
+			return Err(ArkoorSigningError::InvalidNbServerPartialSigs {
+				expected: self.nb_sigs(), got: data.server_partial_sigs.len(),
+			});
+		}
+		if nonces.len() != self.nb_sigs() {
+			return Err(ArkoorSigningError::InvalidNbUserNonces {
+				expected: self.nb_sigs(), got: nonces.len(),
+			});
+		}
+		for (index, ((nonce, server_nonce), signature)) in nonces.iter()
+			.zip(&data.server_pub_nonces).zip(&data.server_partial_sigs).enumerate()
+		{
+			if !scripts::verify_partial_sig(
+				self.sighashes[index], self.taptweak_at(index),
+				(self.server_pubkey(), server_nonce), (self.user_pubkey(), nonce), signature,
+			) {
+				return Err(ArkoorSigningError::InvalidPartialSignature { index });
+			}
+		}
+		Ok(())
+	}
+
+	/// Verify all external signatures before entering the ordinary signed builder state.
+	pub fn finish_external(
+		mut self,
+		signatures: Vec<schnorr::Signature>,
+	) -> Result<ArkoorBuilder<state::UserSigned>, ArkoorSigningError> {
+		if signatures.len() != self.nb_sigs() {
+			return Err(ArkoorSigningError::InvalidNbSignatures {
+				expected: self.nb_sigs(), got: signatures.len(),
+			});
+		}
+		for (index, (context, signature)) in self.signing_inputs()?.iter().zip(&signatures).enumerate() {
+			context.verify_signature(signature)
+				.map_err(|error| ArkoorSigningError::InvalidSignature { index, error })?;
+		}
+		self.full_signatures = Some(signatures);
+		Ok(self.to_state())
+	}
+}
+
 impl ArkoorBuilder<state::UserGeneratedNonces> {
 	pub fn user_pub_nonces(&self) -> &[PublicNonce] {
 		self.user_pub_nonces.as_ref().expect("State invariant")
@@ -1718,6 +1885,87 @@ mod test {
 	use crate::SECP;
 	use crate::test_util::dummy::DummyTestVtxoSpec;
 	use crate::vtxo::VtxoId;
+
+	#[test]
+	fn external_signing_matches_native_with_checkpoints_and_isolation() {
+		let user = Keypair::new(&SECP, &mut rand::thread_rng());
+		let server = Keypair::new(&SECP, &mut rand::thread_rng());
+		let (funding, input) = DummyTestVtxoSpec {
+			amount: Amount::from_sat(10_330), fee: Amount::from_sat(330),
+			expiry_height: BlockHeight::new(1000), exit_delta: BlockDelta::new(128),
+			user_keypair: user, server_keypair: server,
+		}.build();
+		for checkpoint in [true, false] {
+			let normal = vec![ArkoorDestination {
+				total_amount: Amount::from_sat(9_670),
+				policy: VtxoPolicy::new_pubkey(user.public_key()),
+			}];
+			let isolated = vec![
+				ArkoorDestination {
+					total_amount: Amount::from_sat(100),
+					policy: VtxoPolicy::new_pubkey(user.public_key()),
+				},
+				ArkoorDestination {
+					total_amount: Amount::from_sat(230),
+					policy: VtxoPolicy::new_pubkey(user.public_key()),
+				},
+			];
+			let build = || ArkoorBuilder::new(
+				input.clone(), normal.clone(), isolated.clone(), checkpoint,
+			).unwrap();
+			let native = build().generate_user_nonces(user);
+			let nonces = native.user_pub_nonces().to_vec();
+			assert!(matches!(build().with_external_nonces(vec![]),
+				Err(ArkoorSigningError::InvalidNbUserNonces { .. })));
+			let external = build().with_external_nonces(nonces.clone()).unwrap();
+			assert!(external.user_keypair.is_none());
+			assert!(external.user_sec_nonces.is_none());
+			let native_request = native.cosign_request();
+			let request = external.cosign_request_with_attestation(native_request.attestation.clone()).unwrap();
+			assert_eq!(native_request, request);
+			let response = ArkoorBuilder::from_cosign_request(request).unwrap()
+				.server_cosign(&server).unwrap().cosign_response();
+			external.verify_cosign_response(&response).unwrap();
+			let mut truncated = response.clone();
+			truncated.server_pub_nonces.pop();
+			assert!(matches!(external.verify_cosign_response(&truncated),
+				Err(ArkoorSigningError::InvalidNbServerNonces { .. })));
+			let mut reordered = response.clone();
+			reordered.server_partial_sigs.swap(0, 1);
+			assert!(matches!(external.verify_cosign_response(&reordered),
+				Err(ArkoorSigningError::InvalidPartialSignature { .. })));
+			let native = native.user_cosign(&user, &response).unwrap();
+			let signatures = native.full_signatures.as_ref().unwrap().clone();
+			let contexts = external.signing_inputs().unwrap();
+			assert_eq!(contexts.len(), if checkpoint { 3 } else { 2 });
+			for (context, signature) in contexts.iter().zip(&signatures) {
+				context.verify_signature(signature).unwrap();
+			}
+			let mut changed = contexts[0].clone();
+			changed.tweak = None;
+			assert!(changed.sighash().is_err());
+			let mut changed = contexts[0].clone();
+			changed.psbt.inputs[0].witness_utxo.as_mut().unwrap().value += Amount::ONE_SAT;
+			assert!(changed.verify_signature(&signatures[0]).is_err());
+			assert!(matches!(
+				build().with_external_nonces(nonces.clone()).unwrap().finish_external(vec![]),
+				Err(ArkoorSigningError::InvalidNbSignatures { .. }),
+			));
+			let mut wrong = signatures.clone();
+			wrong.swap(0, 1);
+			assert!(matches!(
+				build().with_external_nonces(nonces).unwrap().finish_external(wrong),
+				Err(ArkoorSigningError::InvalidSignature { .. }),
+			));
+			let signed = external.finish_external(signatures).unwrap();
+			assert_eq!(signed.build_signed_vtxos(), native.build_signed_vtxos());
+			assert_eq!(signed.build_signed_internal_vtxos(), native.build_signed_internal_vtxos());
+			assert_eq!(signed.signed_virtual_transactions(), native.signed_virtual_transactions());
+			for vtxo in signed.build_signed_vtxos() {
+				vtxo.validate(&funding).unwrap();
+			}
+		}
+	}
 
 	/// Verify that all signed internal vtxos pass validation.
 	fn verify_signed_internal_vtxos(

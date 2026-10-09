@@ -18,4 +18,6 @@ mod offboard;
 mod payment_request;
 mod recovery;
 mod round;
+#[cfg(feature = "sapio-integration")]
+mod sapio;
 mod vtxo_lock;

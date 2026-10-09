@@ -22,17 +22,17 @@ sqlite = ["rusqlite", "bdk_wallet/rusqlite"]
 sqlite-bundled = ["sqlite", "rusqlite/bundled"]
 # Used for testing, enables testing storage adaptor implementation
 filestore = ["tokio/fs"]
-indexed-db = ["dep:indexed-db", "dep:web-sys", "dep:serde-wasm-bindgen"]
+indexed-db = ["dep:indexed-db", "dep:web-sys", "dep:serde-wasm-bindgen", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 rand = ["bitcoin/rand", "bip39/rand"]
 
 # TLS implementations
-tls-native-roots = ["bark-server-rpc/tls-native-roots"]
-tls-webpki-roots = ["bark-server-rpc/tls-webpki-roots"]
+tls-native-roots = ["bark-server-rpc/tls-native-roots", "reqwest/rustls-tls-native-roots"]
+tls-webpki-roots = ["bark-server-rpc/tls-webpki-roots", "reqwest/rustls-tls-webpki-roots"]
 
 # Native features
 native = ["bark-server-rpc/tonic-native"]
-socks5-proxy = ["bark-bitcoin-ext/rpc-socks5-proxy", "bark-server-rpc/socks5-proxy", "http"]
+socks5-proxy = ["bark-bitcoin-ext/rpc-socks5-proxy", "bark-server-rpc/socks5-proxy", "http", "reqwest/socks"]
 
 # Web features
 wasm-web = [
@@ -40,7 +40,7 @@ wasm-web = [
 	"bark-server-rpc/tonic-web",
 	"bark-bitcoin-ext/wasm-web",
 	"getrandom",
-	"wasm-bindgen-futures",
+	"dep:wasm-bindgen-futures",
 	"dep:wasm-bindgen",
 	"dep:js-sys",
 ]
@@ -78,6 +78,7 @@ lazy_static.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rmp-serde.workspace = true
 config.workspace = true
 

@@ -18,6 +18,7 @@ use crate::encode::{
 	LengthPrefixedVector, OversizedVectorError, ProtocolDecodingError, ProtocolEncoding, ReadExt, WriteExt
 };
 use crate::error::IncorrectSigningKeyError;
+use crate::musig::context::{SigningContextError, SigningInput};
 use crate::tree::{self, Tree};
 use crate::vtxo::{self, Full, GenesisItem, GenesisTransition, HarkLeafVtxoPolicy, MaybePreimage, ServerVtxo, TapScriptClause};
 use crate::vtxo::policy::{check_block_delta, check_block_height, HarkLeaf_v0_VtxoPolicy};
@@ -1264,6 +1265,135 @@ pub struct LeafVtxoCosignRequest {
 	pub pub_nonce: musig::PublicNonce,
 }
 
+/// A leaf cosign session whose persistent user key is held by an external signer.
+///
+/// This does not affect the independent, ephemeral keys that cosign the round tree.
+pub struct ExternalLeafVtxoCosignContext {
+	vtxo: Vtxo<Full>,
+	signing_input: SigningInput,
+}
+
+impl ExternalLeafVtxoCosignContext {
+	/// Authenticate the leaf input against its actual parent and hashlock script.
+	pub fn new(
+		vtxo: &Vtxo<Full>,
+		chain_anchor: &Transaction,
+	) -> Result<Self, SigningContextError> {
+		if chain_anchor.compute_txid() != vtxo.chain_anchor().txid {
+			return Err(SigningContextError::InvalidContext("incorrect chain anchor"));
+		}
+		let last = vtxo.genesis.items.last()
+			.ok_or(SigningContextError::InvalidContext("missing hArk leaf transition"))?;
+		let (user_pubkey, unlock_hash, version) = match &last.transition {
+			GenesisTransition::HashLockedCosigned(inner) => {
+				(inner.user_pubkey, inner.unlock.hash(), HashlockVersion::V1)
+			},
+			GenesisTransition::HashLockedCosigned_v0(inner) => {
+				(inner.user_pubkey, inner.unlock.hash(), HashlockVersion::V0)
+			},
+			_ => return Err(SigningContextError::InvalidContext("not a hArk leaf VTXO")),
+		};
+		if user_pubkey != vtxo.user_pubkey() {
+			return Err(SigningContextError::InvalidContext("incorrect leaf user key"));
+		}
+		let taproot = match version {
+			HashlockVersion::V1 => leaf_cosign_taproot(
+				user_pubkey, vtxo.server_pubkey(), vtxo.expiry_height(), unlock_hash,
+			),
+			HashlockVersion::V0 => leaf_cosign_taproot_v0(
+				user_pubkey, vtxo.server_pubkey(), vtxo.expiry_height(), unlock_hash,
+			),
+		};
+		let pubkey = musig::combine_keys([user_pubkey, vtxo.server_pubkey()])
+			.x_only_public_key().0;
+		let script = match version {
+			HashlockVersion::V1 => unlock_clause(pubkey, unlock_hash),
+			HashlockVersion::V0 => unlock_clause_v0(pubkey, unlock_hash),
+		};
+		let leaf_version = taproot::LeafVersion::TapScript;
+		let control_block = taproot.control_block(&(script.clone(), leaf_version))
+			.ok_or(SigningContextError::InvalidContext("missing leaf control block"))?;
+
+		let mut parent = chain_anchor.clone();
+		let mut prevout = vtxo.chain_anchor();
+		let mut leaf_tx = None;
+		let mut transactions = vtxo.transactions().peekable();
+		while let Some(item) = transactions.next() {
+			if transactions.peek().is_none() {
+				leaf_tx = Some(item.tx);
+				break;
+			}
+			prevout = OutPoint::new(item.tx.compute_txid(), u32::try_from(item.output_idx)
+				.map_err(|_| SigningContextError::InvalidContext("invalid parent output index"))?);
+			parent = item.tx;
+		}
+		let mut leaf_tx = leaf_tx
+			.ok_or(SigningContextError::InvalidContext("missing hArk leaf transaction"))?;
+		if leaf_tx.input.len() != 1 || leaf_tx.input[0].previous_output != prevout {
+			return Err(SigningContextError::InvalidContext("incorrect leaf parent"));
+		}
+		let prev_txout = parent.output.get(prevout.vout as usize)
+			.ok_or(SigningContextError::InvalidContext("missing leaf parent output"))?.clone();
+		leaf_tx.input[0].witness.clear();
+		let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(leaf_tx)
+			.map_err(|_| SigningContextError::InvalidContext("invalid unsigned leaf transaction"))?;
+		psbt.inputs[0].witness_utxo = Some(prev_txout);
+		psbt.inputs[0].non_witness_utxo = Some(parent);
+		psbt.inputs[0].tap_internal_key = Some(taproot.internal_key());
+		psbt.inputs[0].tap_merkle_root = taproot.merkle_root();
+		psbt.inputs[0].tap_scripts.insert(control_block, (script.clone(), leaf_version));
+		let mut participants = vec![user_pubkey, vtxo.server_pubkey()];
+		participants.sort_by_key(|key| key.serialize());
+		let signing_input = SigningInput {
+			psbt,
+			input_index: 0,
+			script_leaf: Some(TapLeafHash::from_script(&script, leaf_version)),
+			participants,
+			tweak: None,
+		};
+		signing_input.sighash()?;
+		Ok(Self { vtxo: vtxo.clone(), signing_input })
+	}
+
+	/// The complete, authenticated transaction context for the external signer.
+	pub fn signing_input(&self) -> &SigningInput {
+		&self.signing_input
+	}
+
+	pub fn request(&self, user_nonce: musig::PublicNonce) -> LeafVtxoCosignRequest {
+		LeafVtxoCosignRequest { vtxo_id: self.vtxo.id(), pub_nonce: user_nonce }
+	}
+
+	/// Verify the final signature before attaching it to the original VTXO.
+	pub fn finalize(
+		mut self,
+		signature: schnorr::Signature,
+	) -> Result<Vtxo<Full>, SigningContextError> {
+		self.signing_input.verify_signature(&signature)?;
+		if !self.vtxo.provide_unlock_signature(signature) {
+			return Err(SigningContextError::InvalidContext("VTXO rejected leaf signature"));
+		}
+		Ok(self.vtxo)
+	}
+
+	/// Assemble the external user share and server response, then verify the final signature.
+	pub fn finalize_with_partial(
+		self,
+		user_nonce: &musig::PublicNonce,
+		user_share: &musig::PartialSignature,
+		response: &LeafVtxoCosignResponse,
+	) -> Result<Vtxo<Full>, SigningContextError> {
+		let signature = musig::combine_partial_signatures(
+			self.signing_input.participants.iter().copied(),
+			musig::nonce_agg(&[user_nonce, &response.public_nonce]),
+			self.signing_input.sighash()?,
+			None,
+			&[user_share, &response.partial_signature],
+		);
+		self.finalize(signature)
+	}
+}
+
 pub struct LeafVtxoCosignContext<'a> {
 	key: &'a Keypair,
 	pub_nonce: musig::PublicNonce,
@@ -2159,12 +2289,70 @@ mod test {
 	}
 
 	#[test]
+	fn external_leaf_cosign_authenticates_both_hashlock_versions() {
+		let mut rng = rand::rngs::StdRng::seed_from_u64(44);
+		let user_key = Keypair::new(&SECP, &mut rng);
+		let user_cosign_key = Keypair::new(&SECP, &mut rng);
+		let server_key = Keypair::new(&SECP, &mut rng);
+		let server_cosign_key = Keypair::new(&SECP, &mut rng);
+		let preimage = [42; 32];
+		// Include an internal transaction that pays the authenticated hArk leaf.
+		// A leaf-only tree does not create that parent output.
+		let outputs = [
+			VtxoRequest {
+				amount: Amount::from_sat(100_000),
+				policy: VtxoPolicy::new_pubkey(user_key.public_key()),
+			},
+			VtxoRequest {
+				amount: Amount::from_sat(40_000),
+				policy: VtxoPolicy::new_pubkey(user_cosign_key.public_key()),
+			},
+		];
+		for version in [HashlockVersion::V0, HashlockVersion::V1] {
+			let (tree, anchor) = crate::test_util::build_signed_tree(
+				version, outputs.iter().cloned(), &user_cosign_key, &server_key,
+				&server_cosign_key, UnlockHash::hash(&preimage),
+			);
+			let vtxo = tree.into_cached_tree().build_vtxo(0);
+			let ctx = ExternalLeafVtxoCosignContext::new(&vtxo, &anchor).unwrap();
+			let input = ctx.signing_input().clone();
+			let msg = input.sighash().unwrap();
+			assert_eq!(msg, hashlocked_leaf_sighash_from_vtxo(&vtxo, &anchor).unwrap().to_byte_array());
+			let (user_sec_nonce, user_nonce) = musig::nonce_pair_with_msg(&user_key, &msg);
+			let response = LeafVtxoCosignResponse::new_cosign(
+				&ctx.request(user_nonce), &vtxo, &anchor, &server_key,
+			).unwrap();
+			let (share, signature) = musig::partial_sign(
+				input.participants.iter().copied(),
+				musig::nonce_agg(&[&user_nonce, &response.public_nonce]),
+				&user_key, user_sec_nonce, msg, None, Some(&[&response.partial_signature]),
+			);
+			let signature = signature.unwrap();
+			input.verify_signature(&signature).unwrap();
+			let mut wrong_message = input.clone();
+			wrong_message.psbt.unsigned_tx.output[0].value += Amount::ONE_SAT;
+			assert!(wrong_message.verify_signature(&signature).is_err());
+			let mut missing_proof = input.clone();
+			missing_proof.psbt.inputs[0].tap_scripts.clear();
+			assert!(missing_proof.sighash().is_err());
+			let mut signed = ctx.finalize_with_partial(&user_nonce, &share, &response).unwrap();
+			assert!(signed.provide_unlock_preimage(preimage));
+			signed.validate(&anchor).unwrap();
+
+			let mut wrong_anchor = anchor.clone();
+			wrong_anchor.output[0].value += Amount::ONE_SAT;
+			assert!(ExternalLeafVtxoCosignContext::new(&vtxo, &wrong_anchor).is_err());
+		}
+	}
+
+	#[test]
 	fn leaf_cosign_rejects_non_hark_vtxo() {
 		// a board VTXO's last genesis transition is not hash-locked
 		let (funding_tx, vtxo) = DummyTestVtxoSpec::default().build();
 
 		let err = LeafVtxoCosignContext::new(&vtxo, &funding_tx, &DUMMY_USER_KEY).err().unwrap();
 		assert_eq!(err, NotHarkLeafError(vtxo.id()));
+		assert!(ExternalLeafVtxoCosignContext::new(&vtxo, &funding_tx).is_err());
 
 		let (_sec_nonce, pub_nonce) = musig::nonce_pair(&DUMMY_USER_KEY);
 		let req = LeafVtxoCosignRequest { vtxo_id: vtxo.id(), pub_nonce };

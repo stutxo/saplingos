@@ -631,6 +631,25 @@ const _: () = assert!(
 );
 
 impl<P: Policy> Vtxo<Full, P> {
+	/// Reconstruct the root previous output needed to validate an offline exit chain.
+	///
+	/// This authenticates the claimed shape, not its existence on the selected chain.
+	pub fn chain_anchor_txout(&self) -> Result<TxOut, validation::VtxoValidationError> {
+		let Some(first) = self.genesis.items.first() else {
+			if self.point != self.chain_anchor() {
+				return Err(validation::VtxoValidationError::Invalid(
+					"point of empty genesis vtxo doesn't match anchor point",
+				));
+			}
+			return Ok(self.txout());
+		};
+		let amount = self.chain_anchor_amount()
+			.ok_or(validation::VtxoValidationError::Invalid("onchain amount overflow"))?;
+		Ok(first.transition.input_txout(
+			amount, self.server_pubkey(), self.expiry_height(), self.exit_delta(),
+		))
+	}
+
 	/// Returns the total exit depth (including OOR depth) of the vtxo.
 	pub fn exit_depth(&self) -> u16 {
 		// The genesis item count is the VTXO's exit depth, bounded far below
@@ -717,6 +736,32 @@ impl<P: Policy> Vtxo<Full, P> {
 			GenesisTransition::HashLockedCosigned_v0(ref inner) => Some(inner.unlock.hash()),
 			_ => None,
 		}
+	}
+
+	/// Retain a signed hArk leaf even before its unlock preimage is available.
+	/// The returned witness contains signature, script and control block only;
+	/// it is recovery material, not a satisfiable transaction witness.
+	pub fn recovery_unlock_witness(&self) -> Option<(UnlockHash, bitcoin::Witness)> {
+		let (hash, signature, tree, legacy) = match &self.genesis.items.last()?.transition {
+			GenesisTransition::HashLockedCosigned(inner) => (
+				inner.unlock.hash(), inner.signature?,
+				inner.input_taproot(self.server_pubkey, self.expiry_height), false,
+			),
+			GenesisTransition::HashLockedCosigned_v0(inner) => (
+				inner.unlock.hash(), inner.signature?,
+				inner.input_taproot(self.server_pubkey, self.expiry_height), true,
+			),
+			_ => return None,
+		};
+		let script = if legacy {
+			crate::tree::signed::unlock_clause_v0(tree.internal_key(), hash)
+		} else {
+			crate::tree::signed::unlock_clause(tree.internal_key(), hash)
+		};
+		let control = tree.control_block(&(script.clone(), bitcoin::taproot::LeafVersion::TapScript))?;
+		Some((hash, bitcoin::Witness::from_slice(&[
+			&signature.serialize()[..], script.as_bytes(), &control.serialize(),
+		])))
 	}
 
 	/// Provide the leaf signature for an unfinalized hArk VTXO
@@ -1576,6 +1621,25 @@ mod test {
 
 		// this passes because the Eq is based on id which doesn't compare signatures
 		assert_eq!(g, *v);
+	}
+
+	#[test]
+	fn recovery_unlock_retains_signature_without_preimage() {
+		let mut vtxo = crate::test_util::VTXO_VECTORS.round1_vtxo.clone();
+		let signed = vtxo.transactions().last().unwrap().tx;
+		let expected = vtxo.recovery_unlock_witness().unwrap();
+		match &mut vtxo.genesis.items.last_mut().unwrap().transition {
+			GenesisTransition::HashLockedCosigned(inner) => inner.unlock = MaybePreimage::Hash(inner.unlock.hash()),
+			GenesisTransition::HashLockedCosigned_v0(inner) => inner.unlock = MaybePreimage::Hash(inner.unlock.hash()),
+			_ => panic!("test vector must have a hashlocked leaf"),
+		}
+		assert!(!vtxo.has_all_witnesses());
+		assert!(vtxo.transactions().last().unwrap().tx.input[0].witness.is_empty());
+		let (hash, witness) = vtxo.recovery_unlock_witness().unwrap();
+		assert_eq!((hash, witness.clone()), expected);
+		let parts = signed.input[0].witness.iter().collect::<Vec<_>>();
+		assert_eq!(witness, bitcoin::Witness::from_slice(&[parts[0], parts[2], parts[3]]));
+		assert_eq!(hash, bitcoin::hashes::sha256::Hash::hash(parts[1]));
 	}
 
 	#[test]

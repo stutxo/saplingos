@@ -10,8 +10,8 @@ use bark::vtxo::VtxoState;
 /// agrees with the wallet's VTXOs and operations: the spendable sats are the
 /// spendable VTXOs that need no refresh, every pending field is the locked
 /// VTXOs its operations report, no locked VTXO is counted twice and the
-/// totals add up. Returns the balance so callers can assert the individual
-/// amounts.
+/// totals include native exits and selected program recoveries. Returns the
+/// balance so callers can assert individual amounts and recovery branches.
 pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bark::Balance {
 	if sync {
 		wallet.sync().await;
@@ -97,8 +97,10 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 	assert!(pending_locked <= locked,
 		"pending fields count more than the locked VTXOs ({locked}): {balance:?}",
 	);
-	assert_eq!(balance.pending(), pending_locked + balance.pending_exit, "{balance:?}");
-	assert_eq!(balance.total(), spendable + needs_refresh + pending_locked + balance.pending_exit,
+	assert_eq!(balance.pending(),
+		pending_locked + balance.pending_exit + balance.pending_program_recovery, "{balance:?}");
+	assert_eq!(balance.total(),
+		spendable + needs_refresh + pending_locked + balance.pending_exit + balance.pending_program_recovery,
 		"total must be the sum of every field: {balance:?}",
 	);
 	assert_eq!(balance.has_pending(), balance.pending() > Amount::ZERO, "{balance:?}");

@@ -29,7 +29,9 @@
 //! ```
 
 use std::fs;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::str::FromStr;
 
@@ -38,6 +40,8 @@ use bark::chain::ChainSource;
 use bark::fs_perms;
 use bark::persist::adaptor::StorageAdaptorWrapper;
 use bitcoin::Network;
+use bitcoin::secp256k1::PublicKey;
+use serde::de::DeserializeOwned;
 use clap::Args;
 use log::{debug, info, warn};
 use tonic::transport::Uri;
@@ -138,6 +142,21 @@ pub struct ConfigOpts {
 	/// it concludes the wallet doesn't own a recovered/imported VTXO.
 	#[arg(long)]
 	pub gap_limit: Option<u32>,
+
+	/// JSON SapioConfig for new program-backed VTXOs (maximum 4 MiB).
+	///
+	/// Supply the exact evaluator, program and parameter bytes, explicit recovery
+	/// outputs and evidence, and a root pinned from independently verified attestation.
+	/// This command does not verify attestation or obtain a root from the endpoint.
+	/// The configuration is copied into config.toml; the input file is not needed later.
+	#[arg(long, value_name = "FILE")]
+	pub sapio_config: Option<PathBuf>,
+
+	/// JSON map from aggregate public keys to spend evidence byte arrays (maximum 4 MiB).
+	///
+	/// Each witness is at most 65,536 bytes. Recovery evidence belongs in sapio-config.
+	#[arg(long, value_name = "FILE")]
+	pub sapio_witnesses: Option<PathBuf>,
 }
 
 impl ConfigOpts {
@@ -248,6 +267,23 @@ impl ConfigOpts {
 		}
 		if let Some(v) = self.gap_limit {
 			writeln!(conf, "vtxo_key_gap_limit = {}", v).unwrap();
+		}
+
+		if self.sapio_config.is_some() || self.sapio_witnesses.is_some() {
+			let mut table: toml::Table = toml::from_str(&conf).context("invalid config flags")?;
+			if let Some(path) = &self.sapio_config {
+				let sapio: bark::sapio::SapioConfig = read_bounded_json(path, 4 * 1024 * 1024)?;
+				sapio.validate().context("invalid Sapio configuration")?;
+				table.insert("sapio".into(), toml::Value::try_from(&sapio)?);
+			}
+			if let Some(path) = &self.sapio_witnesses {
+				let witnesses: BTreeMap<PublicKey, Vec<u8>> = read_bounded_json(path, 4 * 1024 * 1024)?;
+				if witnesses.values().any(|witness| witness.len() > 65_536) {
+					bail!("Sapio spend evidence exceeds 65,536 bytes");
+				}
+				table.insert("sapio_witnesses".into(), toml::Value::try_from(&witnesses)?);
+			}
+			conf = toml::to_string_pretty(&table).context("failed to encode Sapio configuration")?;
 		}
 
 		let path = path.as_ref();
@@ -519,7 +555,30 @@ pub async fn read_mnemonic(datadir: &Path) -> anyhow::Result<String> {
 	Ok(s.trim().to_string())
 }
 
+/// Read a bounded JSON input before deserialization. The standard JSON recursion limit applies.
+pub fn read_bounded_json<T: DeserializeOwned>(path: &Path, max_bytes: usize) -> anyhow::Result<T> {
+	let file = fs::File::open(path)
+		.with_context(|| format!("failed to open {}", path.display()))?;
+	let mut bytes = Vec::new();
+	file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)
+		.with_context(|| format!("failed to read {}", path.display()))?;
+	if bytes.len() > max_bytes {
+		bail!("{} exceeds the {} byte input limit", path.display(), max_bytes);
+	}
+	serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
 pub async fn open_wallet(datadir: &Path, user_agent: &str) -> anyhow::Result<Option<BarkWallet>> {
+	open_wallet_inner(datadir, user_agent, false).await
+}
+
+/// Open only an existing wallet for saved recovery. Do not scan the Ark mailbox,
+/// create a wallet, or start maintenance. Chain source access remains available.
+pub async fn open_wallet_for_recovery(datadir: &Path, user_agent: &str) -> anyhow::Result<Option<BarkWallet>> {
+	open_wallet_inner(datadir, user_agent, true).await
+}
+
+async fn open_wallet_inner(datadir: &Path, user_agent: &str, recovery_only: bool) -> anyhow::Result<Option<BarkWallet>> {
 	debug!("Opening bark wallet in {}", datadir.display());
 
 	// read mnemonic file
@@ -577,6 +636,8 @@ pub async fn open_wallet(datadir: &Path, user_agent: &str) -> anyhow::Result<Opt
 			lock_manager: Some(lock_manager),
 			onchain: Some(onchain.clone()),
 			run_daemon: false,
+			create_if_not_exists: !recovery_only,
+			skip_recovery: recovery_only,
 			..Default::default()
 		},
 	).await?;
@@ -587,6 +648,9 @@ pub async fn open_wallet(datadir: &Path, user_agent: &str) -> anyhow::Result<Opt
 #[cfg(test)]
 mod test {
 	use super::*;
+	use bitcoin::bip32::{Xpriv, Xpub};
+	use bitcoin::hashes::{sha256, Hash};
+	use bitcoin::{Amount, ScriptBuf, TxOut};
 
 	fn tmp_dir() -> std::path::PathBuf {
 		let dir = std::env::temp_dir()
@@ -595,6 +659,61 @@ mod test {
 				.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
 		fs::create_dir_all(&dir).unwrap();
 		dir
+	}
+
+	#[test]
+	fn bounded_json_accepts_limit_and_rejects_larger_input() {
+		let dir = tmp_dir();
+		let path = dir.join("input.json");
+		fs::write(&path, b"[1,2]").unwrap();
+		assert_eq!(read_bounded_json::<Vec<u8>>(&path, 5).unwrap(), vec![1, 2]);
+		assert!(read_bounded_json::<Vec<u8>>(&path, 4).is_err());
+		fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn sapio_config_preserves_program_root_and_recovery_on_reload() {
+		let dir = tmp_dir();
+		let input = dir.join("sapio.json");
+		let witness_input = dir.join("witnesses.json");
+		let path = dir.join(CONFIG_FILE);
+		let root = Xpub::from_priv(&ark::SECP,
+			&Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap());
+		let sapio = bark::sapio::SapioConfig {
+			endpoint: "http://127.0.0.1:3999".into(),
+			root,
+			program: ark::sapio::program::Program::new(
+				sha256::Hash::from_byte_array([1; 32]), vec![2, 3], vec![4, 5],
+			).unwrap(),
+			recovery: bark::persist::models::ProgramRecoveryTemplate {
+				outputs: vec![TxOut {
+					value: Amount::from_sat(1_000),
+					script_pubkey: ScriptBuf::from_bytes([vec![0, 20], vec![42; 20]].concat()),
+				}],
+				remainder_output: Some(0),
+				lock_time: bitcoin::absolute::LockTime::ZERO,
+				witness: vec![6, 7],
+			},
+			coordinator_url: Some("http://127.0.0.1:4000".into()),
+			receive_bind: Some("127.0.0.1:4000".parse().unwrap()),
+		};
+		let witnesses = BTreeMap::from([(root.public_key, vec![8u8, 9])]);
+		fs::write(&input, serde_json::to_vec(&sapio).unwrap()).unwrap();
+		fs::write(&witness_input, serde_json::to_vec(&witnesses).unwrap()).unwrap();
+		let opts = ConfigOpts {
+			ark: Some("http://127.0.0.1:3535".into()),
+			esplora: Some("http://127.0.0.1:3002".into()),
+			sapio_config: Some(input.clone()),
+			sapio_witnesses: Some(witness_input.clone()),
+			..ConfigOpts::default()
+		};
+		opts.write_to_file(Network::Regtest, &path).unwrap();
+		fs::remove_file(input).unwrap();
+		fs::remove_file(witness_input).unwrap();
+		let loaded = Config::load(Network::Regtest, &path).unwrap();
+		assert_eq!(loaded.sapio, Some(sapio));
+		assert_eq!(loaded.sapio_witnesses, witnesses);
+		fs::remove_dir_all(dir).unwrap();
 	}
 
 	/// Options that fail wallet creation with "provide config flags or a

@@ -12,6 +12,7 @@ Name | Type | Description | Notes
 **pending_in_round_sat** | **i64** | Sats locked in VTXOs forfeited for a round that has not yet completed. | 
 **pending_lightning_send_sat** | **i64** | Sats locked in an outgoing Lightning payment that has not yet settled. | 
 **pending_offboard_sat** | **i64** | Sats locked in an offboard whose transaction has not been broadcast yet, including any change that comes back. Once the transaction is on the network the sats belong to the on-chain wallet. | 
+**pending_program_recovery_sat** | **i64** | Sats reserved for immutable program recovery whose selected Bitcoin payout has not confirmed. Alternative hArk branches count the same value only once. | 
 **spendable_sat** | **i64** | Sats that are immediately spendable, either in-round or out-of-round. | 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)

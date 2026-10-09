@@ -72,6 +72,14 @@ pub struct BitcoindState {
 
 pub type Bitcoind = Daemon<BitcoindHelper>;
 
+/// Chain metadata only: output script classifications can change across Core
+/// versions and are irrelevant when asserting confirmations of exact raw bytes.
+#[derive(Debug, serde::Deserialize)]
+pub struct TransactionConfirmation {
+	pub confirmations: Option<u32>,
+	pub blockhash: Option<bitcoin::BlockHash>,
+}
+
 /// A lightweight handle for polling a bitcoind node's block height.
 ///
 /// Unlike [`Bitcoind`], this can be stored without holding onto the
@@ -265,6 +273,10 @@ impl Bitcoind {
 			}
 		}
 		panic!("Failed to get raw transaction: {}", txid);
+	}
+
+	pub fn transaction_confirmation(&self, txid: Txid) -> Result<TransactionConfirmation, rpc::Error> {
+		self.sync_client().call("getrawtransaction", &[txid.to_string().into(), true.into()])
 	}
 
 	pub async fn prepare_funds(&self) {

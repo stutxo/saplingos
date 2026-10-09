@@ -9,7 +9,7 @@
 #[cfg(feature = "onchain-bdk")]
 use bdk_wallet::ChangeSet;
 use bitcoin::consensus::deserialize;
-use bitcoin::{Amount, BlockHash, Network, SignedAmount, Transaction, Txid};
+use bitcoin::{Amount, BlockHash, Network, OutPoint, SignedAmount, Transaction, Txid};
 use bitcoin::bip32::Fingerprint;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
@@ -30,14 +30,18 @@ use bark::movement::{
 };
 use bark::movement::update::MovementUpdate;
 use bark::persist::BarkPersister;
+use bark::persist::adaptor::{memory::MemoryStorageAdaptor, StorageAdaptorWrapper};
 use bark::persist::models::{
-	PaidInvoice, StoredExit, StoredRoundState, Unlocked, RoundStateId, SerdeRoundState,
+	PaidInvoice, ProgramRecoveryRecord, SerdeProgramKey, StoredExit, StoredRoundState, Unlocked,
+	RoundStateId, SerdeRoundState,
 };
 use bark::round::RoundState;
 use bark::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 
-struct Dummy;
+struct Dummy {
+	program_store: StorageAdaptorWrapper<MemoryStorageAdaptor>,
+}
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -125,16 +129,64 @@ impl BarkPersister for Dummy {
 		Ok(true)
 	}
 
-	async fn store_vtxo_key(&self, _index: u32, _public_key: PublicKey) -> anyhow::Result<()> {
-		Ok(())
+	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()> {
+		self.program_store.store_vtxo_key(index, public_key).await
+	}
+
+	async fn store_program_key(&self, record: &SerdeProgramKey) -> anyhow::Result<()> {
+		self.program_store.store_program_key(record).await
+	}
+
+	async fn get_program_key(&self, public_key: &PublicKey)
+		-> anyhow::Result<Option<SerdeProgramKey>>
+	{
+		self.program_store.get_program_key(public_key).await
+	}
+
+	async fn get_program_key_by_index(&self, index: u32)
+		-> anyhow::Result<Option<SerdeProgramKey>>
+	{
+		self.program_store.get_program_key_by_index(index).await
+	}
+
+	async fn list_program_keys(&self) -> anyhow::Result<Vec<SerdeProgramKey>> {
+		self.program_store.list_program_keys().await
+	}
+
+	async fn store_program_recoveries(&self, records: &[ProgramRecoveryRecord])
+		-> anyhow::Result<()>
+	{
+		self.program_store.store_program_recoveries(records).await
+	}
+
+	async fn get_program_recovery(&self, outpoint: OutPoint)
+		-> anyhow::Result<Option<ProgramRecoveryRecord>>
+	{
+		self.program_store.get_program_recovery(outpoint).await
+	}
+
+	async fn list_program_recoveries(&self) -> anyhow::Result<Vec<ProgramRecoveryRecord>> {
+		self.program_store.list_program_recoveries().await
+	}
+
+	async fn reserve_program_recovery(
+		&self,
+		inputs: &[(VtxoId, Option<VtxoState>)],
+		actors: &[String],
+	) -> anyhow::Result<()> {
+		self.program_store.reserve_program_recovery(inputs, actors).await
+	}
+
+	async fn has_program_recovery_reservation(&self, key: &str) -> anyhow::Result<bool> {
+		self.program_store.has_program_recovery_reservation(key).await
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
-		Ok(Some(0))
+		self.program_store.get_last_vtxo_key_index().await
 	}
 
-	async fn get_public_key_idx(&self, _public_key: &PublicKey) -> anyhow::Result<Option<u32>> {
-		Ok(Some(0))
+	async fn get_public_key_idx(&self, public_key: &PublicKey) -> anyhow::Result<Option<u32>> {
+		self.program_store.get_public_key_idx(public_key).await
 	}
 
 	async fn store_mailbox_checkpoint(&self, _checkpoint: u64) -> anyhow::Result<()> {
@@ -170,6 +222,10 @@ impl BarkPersister for Dummy {
 		&self,
 		_id: &WalletActionId,
 	) -> anyhow::Result<()> {
+		Ok(())
+	}
+
+	async fn finish_wallet_action(&self, _id: &WalletActionId) -> anyhow::Result<()> {
 		Ok(())
 	}
 
@@ -406,5 +462,5 @@ fn dummy_movement(status: MovementStatus) -> Movement {
 #[test]
 fn compiles_if_all_types_are_exported() {
 	// If this file compiles, we're good.
-	let _dummy = Dummy {};
+	let _dummy = Dummy { program_store: StorageAdaptorWrapper::new_memory() };
 }

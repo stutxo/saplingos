@@ -76,6 +76,8 @@ Class | Method | HTTP request | Description
 *OnchainApi* | [**onchain_sync**](docs/OnchainApi.md#onchain_sync) | **POST** /api/v1/onchain/sync | Sync on-chain wallet
 *OnchainApi* | [**onchain_transactions**](docs/OnchainApi.md#onchain_transactions) | **GET** /api/v1/onchain/transactions | List on-chain transactions
 *OnchainApi* | [**onchain_utxos**](docs/OnchainApi.md#onchain_utxos) | **GET** /api/v1/onchain/utxos | List on-chain UTXOs
+*ProgramReceiveApi* | [**commit**](docs/ProgramReceiveApi.md#commit) | **POST** /api/v1/receive/program/commit | Commit a program receive
+*ProgramReceiveApi* | [**prepare**](docs/ProgramReceiveApi.md#prepare) | **POST** /api/v1/receive/program/prepare | Prepare a program receive
 *WalletApi* | [**address**](docs/WalletApi.md#address) | **POST** /api/v1/wallet/addresses/next | Generate Ark address
 *WalletApi* | [**ark_info**](docs/WalletApi.md#ark_info) | **GET** /api/v1/wallet/ark-info | Get Ark server info
 *WalletApi* | [**balance**](docs/WalletApi.md#balance) | **GET** /api/v1/wallet/balance | Get wallet balance
@@ -257,6 +259,7 @@ Class | Method | HTTP request | Description
  - [PendingBoardInfo](docs/PendingBoardInfo.md)
  - [PendingRoundInfo](docs/PendingRoundInfo.md)
  - [PpmExpiryFeeEntry](docs/PpmExpiryFeeEntry.md)
+ - [ReceiveRequest](docs/ReceiveRequest.md)
  - [RefreshFees](docs/RefreshFees.md)
  - [RefreshRequest](docs/RefreshRequest.md)
  - [RoundFlowState](docs/RoundFlowState.md)

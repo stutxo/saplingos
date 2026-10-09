@@ -5,8 +5,9 @@
 //! - **exit broadcast**: every not-yet-confirmed transaction in the VTXO's tree chain is a
 //!   zero-fee transaction carrying a P2A anchor, so each must be CPFP-bumped to confirm. This is
 //!   the dominant, time-critical cost and is funded from the wallet's confirmed onchain UTXOs.
-//! - **claim/drain**: once the exit outputs mature past their CSV delta they are swept to an
-//!   onchain address with a single batched transaction whose fee comes out of the recovered value.
+//! - **claim/drain**: native exits are swept to an onchain address in a batched transaction,
+//!   paying from recovered value. Program exits use their exact pre-authorized claims and
+//!   an ordinary wallet pays their external P2A fee children; beneficiaries never change.
 //!
 //! [`Exit::estimate_emergency_exit_fee`] reports both as a breakdown for a set of VTXOs, reflecting
 //! the current chain state (already-confirmed tree transactions cost nothing).
@@ -14,7 +15,6 @@
 use bitcoin::transaction::{predict_weight, InputWeightPrediction};
 use bitcoin::{
 	Address, Amount, FeeRate, Sequence, Transaction, TxIn, TxOut, Weight, Witness, ScriptBuf,
-	sighash,
 };
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 
@@ -26,6 +26,7 @@ use ark::VtxoId;
 
 use crate::Wallet;
 use crate::exit::{Exit, ExitError};
+use crate::sapio::recovery::{verify_program_recovery, verify_program_recovery_template};
 
 /// The default safety margin applied to the exit-broadcast fee estimate.
 ///
@@ -35,9 +36,9 @@ pub const DEFAULT_BROADCAST_FEE_MARGIN: f64 = 1.2;
 
 /// A breakdown of the estimated onchain cost of unilaterally exiting a set of VTXOs.
 ///
-/// `exit_broadcast_fee` is paid now from confirmed onchain funds; `claim_fee` is paid later
-/// out of the recovered value. Use [ExitFeeEstimate::total] for the sum. See `fee_rate` for how
-/// each leg is priced.
+/// `exit_broadcast_fee` is paid from confirmed onchain funds. `claim_fee` includes native
+/// drain fees deducted from recovered value and externally funded program-claim CPFP fees.
+/// Use [ExitFeeEstimate::total] for the sum; `fee_rate` explains each leg's pricing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitFeeEstimate {
 	/// The total fees required to broadcast every not-yet-confirmed exit transaction, including
@@ -46,8 +47,8 @@ pub struct ExitFeeEstimate {
 	/// The onchain balance to fund the exit with at the chosen margin; the unscaled fee is the
 	/// floor below which the exit cannot complete.
 	pub exit_broadcast_fee: Amount,
-	/// Fee for transaction that drains the exit outputs. It is substracted from
-	/// the exited VTXO amount.
+	/// Native drain fee, deducted from recovered value, plus external-wallet CPFP
+	/// fees for immutable program claims. Program beneficiary amounts are never reduced.
 	pub claim_fee: Amount,
 	/// The fee rate used to price the exit-broadcast (CPFP) leg, before the fee margin. Unless an
 	/// explicit fee rate was supplied, the claim leg is priced separately at the chain's `regular`
@@ -77,8 +78,9 @@ impl Exit {
 	///  - `fee_rate` applies to both the broadcast and claim. If not provided, the
 	/// broadcast txs will use *fast* fee rate, and the claim one will use the *regular*
 	/// rate.
-	///  - `destination` influences only the claim transaction weight. If not set, a dummy P2TR address
-	/// for the wallet's network is used.
+	///  - `destination` influences only the native claim transaction weight. If not set, a dummy
+	/// P2TR address is used. A destination override with program VTXOs is rejected: beneficiaries
+	/// are pre-bound and estimation uses each saved immutable claim instead.
 	///  - `fee_margin` scales the broadcast leg, defaulting to [DEFAULT_BROADCAST_FEE_MARGIN].
 	/// Must be finite and non-negative.
 	///
@@ -153,10 +155,8 @@ impl Exit {
 		})
 	}
 
-	/// Builds the batched drain transaction for the given VTXOs and returns `fee_rate * weight`.
-	///
-	/// Mirrors the weight path of [Exit::drain_exits] but signs through the wallet's [VtxoSigner]
-	/// directly, since VTXOs are most often not claimable yet when estimating.
+	/// Weigh native witnesses without signing transactions, and price each saved immutable
+	/// program claim together with its external-fee child. Never call Sapio for an estimate.
 	async fn estimate_claim_fee(
 		&self,
 		vtxos: &[Vtxo<Full>],
@@ -168,6 +168,52 @@ impl Exit {
 			return Ok(Amount::ZERO);
 		}
 
+		let destination_override = destination.is_some();
+		let mut output_amount = Amount::ZERO;
+		let mut tx_ins = Vec::with_capacity(vtxos.len());
+		let mut witness_bytes = 0u64;
+		let mut program_fee = Amount::ZERO;
+		for vtxo in vtxos {
+			if let Some(program) = wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await
+				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
+			{
+				if destination_override {
+					return Err(ExitError::ClaimSigningError {
+						error: "program recovery beneficiaries are pre-bound; omit the destination override".into(),
+					});
+				}
+				let record = wallet.inner.db.get_program_recovery(vtxo.point()).await
+					.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
+					.ok_or_else(|| ExitError::InvalidWalletState {
+						error: format!("missing immutable recovery for {}", vtxo.id()),
+					})?;
+				verify_program_recovery_template(&record, &program)
+					.and_then(|_| verify_program_recovery(vtxo, &record, true))
+					.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?;
+				if wallet.chain().tx_confirmed(record.claim.compute_txid()).await
+					.map_err(|e| ExitError::InternalError { error: e.to_string() })?.is_none()
+				{
+					let fee = fee_rate * (record.claim.weight() + canonical_cpfp_child_weight());
+					program_fee = program_fee.checked_add(fee)
+						.filter(|fee| *fee <= Amount::MAX_MONEY)
+						.ok_or_else(|| ExitError::InternalError { error: "program claim fee overflow".into() })?;
+				}
+				continue;
+			}
+			let clause = wallet.find_signable_clause(vtxo).await
+				.ok_or(ExitError::ClaimMissingSignableClause { vtxo: vtxo.id() })?;
+			output_amount += vtxo.amount();
+			witness_bytes += clause.witness_size(vtxo) as u64;
+			tx_ins.push(TxIn {
+				previous_output: vtxo.point(),
+				script_sig: ScriptBuf::default(),
+				sequence: clause.sequence().unwrap_or(Sequence::ZERO),
+				witness: Witness::new(),
+			});
+		}
+		if tx_ins.is_empty() {
+			return Ok(program_fee);
+		}
 		let address = match destination {
 			Some(a) => a,
 			None => placeholder_p2tr_address(wallet).await?,
@@ -178,45 +224,18 @@ impl Exit {
 		let locktime = tip.to_locktime()
 			.map_err(|e| ExitError::InvalidLocktime { tip, error: e.to_string() })?;
 
-		let mut output_amount = Amount::ZERO;
-		let mut tx_ins = Vec::with_capacity(vtxos.len());
-		for vtxo in vtxos {
-			let clause = wallet.find_signable_clause(vtxo).await
-				.ok_or(ExitError::ClaimMissingSignableClause { vtxo: vtxo.id() })?;
-			output_amount += vtxo.amount();
-			tx_ins.push(TxIn {
-				previous_output: vtxo.point(),
-				script_sig: ScriptBuf::default(),
-				sequence: clause.sequence().unwrap_or(Sequence::ZERO),
-				witness: Witness::new(),
-			});
-		}
-
-		let mut tx = Transaction {
+		let tx = Transaction {
 			version: bitcoin::transaction::Version::TWO,
 			lock_time: locktime,
 			input: tx_ins,
 			output: vec![TxOut { script_pubkey: address.script_pubkey(), value: output_amount }],
 		};
-
-		// Sign each input to get a correctly-sized witness, then read off the weight. Signing
-		// borrows the transaction, so collect the witnesses first and apply them afterwards.
-		let prevouts = vtxos.iter().map(|v| v.txout()).collect::<Vec<_>>();
-		let prevouts = sighash::Prevouts::All(&prevouts);
-		let mut witnesses = Vec::with_capacity(vtxos.len());
-		{
-			let mut shc = sighash::SighashCache::new(&tx);
-			for (i, vtxo) in vtxos.iter().enumerate() {
-				let witness = wallet.sign_input(vtxo, i, &mut shc, &prevouts).await
-					.map_err(|e| ExitError::ClaimSigningError { error: e.to_string() })?;
-				witnesses.push(witness);
-			}
-		}
-		for (input, witness) in tx.input.iter_mut().zip(witnesses) {
-			input.witness = witness;
-		}
-
-		Ok(fee_rate * tx.weight())
+		// The empty transaction witnesses omit the two-byte marker/flag. Clause sizes
+		// already include each witness's item count and compact-size prefixes.
+		let weight = tx.weight() + Weight::from_wu(2 + witness_bytes);
+		(fee_rate * weight).checked_add(program_fee)
+			.filter(|fee| *fee <= Amount::MAX_MONEY)
+			.ok_or_else(|| ExitError::InternalError { error: "claim fee overflow".into() })
 	}
 }
 

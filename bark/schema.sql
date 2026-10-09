@@ -221,3 +221,11 @@ CREATE VIEW vtxo_view AS
 			JOIN most_recent_vtxo_state as vs
 				ON v.id = vs.vtxo_id
 /* vtxo_view(id,expiry_height,amount_sat,raw_bare,exit_depth,exit_tx_weight,registered,created_at,state,state_kind,last_updated_at) */;
+CREATE TABLE bark_program_key (
+				public_key TEXT PRIMARY KEY REFERENCES bark_vtxo_key(public_key),
+				descriptor BLOB NOT NULL
+			);
+CREATE TABLE bark_program_recovery (
+				controlled_outpoint TEXT PRIMARY KEY,
+				record BLOB NOT NULL
+			);

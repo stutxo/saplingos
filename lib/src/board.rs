@@ -17,12 +17,13 @@ use bitcoin::sighash::{self, SighashCache};
 use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{Amount, OutPoint, ScriptBuf, TapSighash, Transaction, TxOut, Txid};
 use bitcoin::hashes::Hash;
-use bitcoin::secp256k1::{Keypair, PublicKey};
+use bitcoin::secp256k1::{schnorr, Keypair, PublicKey};
 
 use bitcoin_ext::{BlockDelta, BlockHeight, TaprootSpendInfoExt};
 
 use crate::error::IncorrectSigningKeyError;
 use crate::{musig, scripts, SECP};
+use crate::musig::context::{SigningContextError, SigningInput};
 use crate::tree::signed::cosign_taproot;
 use crate::vtxo::{self, Full, Vtxo, VtxoId, VtxoPolicy, ServerVtxo, ServerVtxoPolicy, GenesisItem, GenesisTransition};
 
@@ -120,6 +121,17 @@ pub struct BoardCosignResponse {
 	pub partial_signature: musig::PartialSignature,
 }
 
+/// Errors returned by the external board signing path.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum BoardExternalSigningError {
+	#[error(transparent)]
+	Context(#[from] SigningContextError),
+	#[error("board funding or nonce data is missing")]
+	MissingData,
+	#[error("invalid server partial signature")]
+	InvalidServerSignature,
+}
+
 pub mod state {
 	mod sealed {
 		/// Just a trait to seal the BuilderState trait.
@@ -129,6 +141,7 @@ pub mod state {
 		impl Sealed for super::ServerCanCosign {}
 		impl Sealed for super::CanFinish {}
 		impl Sealed for super::ServerCanBuildVtxos {}
+		impl Sealed for super::ExternalCanFinish {}
 	}
 
 	/// A marker trait used as a generic for [super::BoardBuilder].
@@ -152,6 +165,10 @@ pub mod state {
 	pub struct CanFinish;
 	impl BuilderState for CanFinish {}
 
+	/// The user nonce is owned by an external signer, never by this builder.
+	pub struct ExternalCanFinish;
+	impl BuilderState for ExternalCanFinish {}
+
 	/// All the information for the server to build the VTXO is known.
 	pub struct ServerCanBuildVtxos;
 	impl BuilderState for ServerCanBuildVtxos {}
@@ -167,6 +184,7 @@ pub mod state {
 	impl HasFundingDetails for CanGenerateNonces {}
 	impl HasFundingDetails for ServerCanCosign {}
 	impl HasFundingDetails for CanFinish {}
+	impl HasFundingDetails for ExternalCanFinish {}
 }
 
 /// A request for the server to cosign an board vtxo.
@@ -279,6 +297,21 @@ impl BoardBuilder<state::Preparing> {
 }
 
 impl BoardBuilder<state::CanGenerateNonces> {
+	/// Export the exact exit transaction and authenticated funding tree.
+	pub fn signing_input(&self) -> Result<SigningInput, SigningContextError> {
+		self.external_signing_input()
+	}
+
+	/// Supply the aggregate ownership nonce without installing a secret key or nonce.
+	pub fn with_external_nonce(
+		mut self,
+		nonce: musig::PublicNonce,
+	) -> Result<BoardBuilder<state::ExternalCanFinish>, BoardExternalSigningError> {
+		self.external_signing_input()?;
+		self.user_pub_nonce = Some(nonce);
+		Ok(self.to_state())
+	}
+
 	/// Generate user nonces.
 	pub fn generate_user_nonces(mut self) -> BoardBuilder<state::CanFinish> {
 		let exit_data = self.exit_data.as_ref().expect("state invariant");
@@ -569,6 +602,111 @@ impl BoardBuilder<state::CanFinish> {
 	}
 }
 
+impl<S: BuilderState> BoardBuilder<S> {
+	/// Construct the exact future VTXO before releasing a funding or spend signature.
+	///
+	/// Its unsigned ancestor is only a preparation template, not an exit-ready chain.
+	pub fn build_unsigned_vtxo(&self) -> Result<Vtxo<Full>, BoardExternalSigningError> {
+		self.external_signing_input()?;
+		self.external_vtxo(None)
+	}
+
+	fn external_vtxo(
+		&self,
+		signature: Option<schnorr::Signature>,
+	) -> Result<Vtxo<Full>, BoardExternalSigningError> {
+		let data = self.exit_data.as_ref().ok_or(BoardExternalSigningError::MissingData)?;
+		let fee = self.fee.ok_or(BoardExternalSigningError::MissingData)?;
+		let amount = self.amount.and_then(|a| a.checked_sub(fee))
+			.ok_or(BoardExternalSigningError::MissingData)?;
+		Ok(Vtxo {
+			amount,
+			expiry_height: self.expiry_height,
+			server_pubkey: self.server_pubkey,
+			exit_delta: self.exit_delta,
+			anchor_point: self.utxo.ok_or(BoardExternalSigningError::MissingData)?,
+			genesis: Full { items: vec![GenesisItem {
+				transition: GenesisTransition::new_cosigned(
+					vec![self.user_pubkey, self.server_pubkey], signature,
+				),
+				output_idx: 0,
+				other_outputs: vec![],
+				fee_amount: fee,
+			}] },
+			policy: VtxoPolicy::new_pubkey(self.user_pubkey),
+			point: OutPoint::new(data.txid, BOARD_FUNDING_TX_VTXO_VOUT),
+		})
+	}
+
+	fn external_signing_input(&self) -> Result<SigningInput, SigningContextError> {
+		let data = self.exit_data.as_ref().ok_or(
+			SigningContextError::InvalidContext("missing board funding details"),
+		)?;
+		let amount = self.amount.ok_or(
+			SigningContextError::InvalidContext("missing board funding amount"),
+		)?;
+		let fee = self.fee.ok_or(SigningContextError::InvalidContext("missing board fee"))?;
+		let utxo = self.utxo.ok_or(SigningContextError::InvalidContext("missing board outpoint"))?;
+		if amount <= fee {
+			return Err(SigningContextError::InvalidContext("invalid board amount or fee"));
+		}
+		let current = compute_exit_data(
+			self.user_pubkey, self.server_pubkey, self.expiry_height,
+			self.exit_delta, amount, fee, utxo,
+		);
+		if current.tx != data.tx || current.funding_taproot.output_key() != data.funding_taproot.output_key() {
+			return Err(SigningContextError::InvalidContext("board parameters changed"));
+		}
+		let context = SigningInput::key_spend(
+			data.tx.clone(), 0,
+			vec![TxOut { value: amount, script_pubkey: data.funding_taproot.script_pubkey() }],
+			&data.funding_taproot, vec![self.user_pubkey, self.server_pubkey],
+		)?;
+		if context.sighash()? != data.sighash.to_byte_array()
+			|| data.tx.input.first().map(|i| i.previous_output) != self.utxo
+		{
+			return Err(SigningContextError::InvalidContext("board context changed"));
+		}
+		Ok(context)
+	}
+}
+
+impl BoardBuilder<state::ExternalCanFinish> {
+	pub fn signing_input(&self) -> Result<SigningInput, SigningContextError> {
+		self.external_signing_input()
+	}
+
+	pub fn user_pub_nonce(&self) -> Result<&musig::PublicNonce, BoardExternalSigningError> {
+		self.user_pub_nonce.as_ref().ok_or(BoardExternalSigningError::MissingData)
+	}
+
+	pub fn verify_cosign_response(
+		&self,
+		response: &BoardCosignResponse,
+	) -> Result<(), BoardExternalSigningError> {
+		self.external_signing_input()?;
+		let data = self.exit_data.as_ref().ok_or(BoardExternalSigningError::MissingData)?;
+		if !scripts::verify_partial_sig(
+			data.sighash, data.funding_taproot.tap_tweak(),
+			(self.server_pubkey, &response.pub_nonce),
+			(self.user_pubkey, self.user_pub_nonce()?),
+			&response.partial_signature,
+		) {
+			return Err(BoardExternalSigningError::InvalidServerSignature);
+		}
+		Ok(())
+	}
+
+	/// Finish only after verifying the external signature against the exact output key.
+	pub fn finish_external(
+		self,
+		signature: schnorr::Signature,
+	) -> Result<Vtxo<Full>, BoardExternalSigningError> {
+		self.external_signing_input()?.verify_signature(&signature)?;
+		self.external_vtxo(Some(signature))
+	}
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("board funding tx validation error: {0}")]
 pub struct BoardFundingTxValidationError(String);
@@ -583,6 +721,44 @@ mod test {
 	use crate::test_util::encoding_roundtrip;
 
 	use super::*;
+
+	#[test]
+	fn external_board_matches_native_and_rejects_changed_context() {
+		let (native, funding, user, server) = create_board_vtxo();
+		let fee = native.genesis.items[0].fee_amount;
+		let build = || BoardBuilder::new(
+			user.public_key(), native.expiry_height, server.public_key(), native.exit_delta,
+		).set_funding_details(native.amount() + fee, fee, native.chain_anchor()).unwrap();
+		let context = build().signing_input().unwrap();
+		let (_, nonce) = musig::nonce_pair_with_msg(&user, &context.sighash().unwrap());
+		let external = build().with_external_nonce(nonce).unwrap();
+		let response = BoardBuilder::new_for_cosign(
+			user.public_key(), native.expiry_height, server.public_key(), native.exit_delta,
+			native.amount() + fee, fee, native.chain_anchor(), nonce,
+		).server_cosign(&server);
+		external.verify_cosign_response(&response).unwrap();
+		let signature = match &native.genesis.items[0].transition {
+			GenesisTransition::Cosigned(data) => data.signature.unwrap(),
+			_ => panic!("expected board genesis"),
+		};
+		context.verify_signature(&signature).unwrap();
+		let mut invalid = context.clone();
+		invalid.psbt.inputs.clear();
+		assert!(invalid.sighash().is_err());
+		let mut invalid = context.clone();
+		invalid.psbt.inputs[0].tap_merkle_root = None;
+		assert!(invalid.sighash().is_err());
+		let mut changed = build().with_external_nonce(nonce).unwrap();
+		changed.expiry_height = BlockHeight::new(native.expiry_height.to_u32() + 1);
+		assert!(changed.finish_external(signature).is_err());
+		let wrong = SECP.sign_schnorr_no_aux_rand(
+			&bitcoin::secp256k1::Message::from_digest([0; 32]), &user,
+		);
+		assert!(build().with_external_nonce(nonce).unwrap().finish_external(wrong).is_err());
+		let completed = external.finish_external(signature).unwrap();
+		assert_eq!(completed, native);
+		completed.validate(&funding).unwrap();
+	}
 
 	#[test]
 	fn test_board_builder() {

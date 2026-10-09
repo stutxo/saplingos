@@ -35,6 +35,7 @@ use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
+use crate::sapio::recovery::{verify_program_recovery, verify_program_recovery_template};
 
 
 /// The maximum number of times we will call the fetch mailbox endpoint in one go
@@ -345,9 +346,9 @@ impl Wallet {
 
 	/// Turn raw byte arrays into VTXOs, then validate them.
 	///
-	/// This function only returns an error when it cannot process any VTXOs,
-	/// for example when the server is down or the chain tip is unknown.
-	/// No errors are returned for issues on individual VTXOs.
+	/// Program deposits without a verified prepared recovery are durably
+	/// quarantined, not discarded or made spendable. A storage failure leaves the
+	/// mailbox checkpoint unchanged so the original message can be retried.
 	async fn process_raw_vtxos(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
@@ -364,24 +365,47 @@ impl Wallet {
 			let vtxo = match Vtxo::<Full>::deserialize(&bytes) {
 				Ok(vtxo) => vtxo,
 				Err(e) => {
-					error!("Failed to deserialize arkoor VTXO: {}: {}", bytes.as_hex(), e);
+					error!("Failed to deserialize arkoor VTXO: {}", e);
 					invalid_vtxos.push(bytes);
 					continue;
 				}
 			};
 
+			let program = self.inner.db.get_program_key(&vtxo.user_pubkey()).await?;
 			if let Err(e) = self.validate_vtxo(&vtxo).await {
+				if program.is_some() {
+					self.quarantine_program_receive(&vtxo, bytes, "invalid or unverifiable program deposit").await?;
+					continue;
+				}
 				error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
 				invalid_vtxos.push(bytes);
 				continue;
 			}
 
 			if let Err(e) = check_arkoor_receive_policy(&vtxo, ark_info.server_pubkey) {
+				if program.is_some() {
+					self.quarantine_program_receive(&vtxo, bytes, "program deposit has an unsupported payment policy or server").await?;
+					continue;
+				}
 				error!("Refusing received arkoor VTXO {}: {}", vtxo.id(), e);
 				invalid_vtxos.push(bytes);
 				continue;
 			}
-			if self.find_signable_clause(&vtxo).await.is_none() {
+			if let Some(key) = program {
+				let prepared = match self.inner.db.get_program_recovery(vtxo.point()).await? {
+					Some(record) => verify_program_recovery(&vtxo, &record, false)
+						.and_then(|()| verify_program_recovery_template(&record, &key)),
+					None => Err(anyhow!("program deposit was not prepared")),
+				};
+				if prepared.is_err() {
+					self.quarantine_program_receive(&vtxo, bytes, "program deposit has no verified prepared recovery").await?;
+					continue;
+				}
+				if self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await.is_err() {
+					self.quarantine_program_receive(&vtxo, bytes, "program deposit recovery is not ready").await?;
+					continue;
+				}
+			} else if self.find_signable_clause(&vtxo).await.is_none() {
 				error!("Refusing received arkoor VTXO {}: not owned by this wallet", vtxo.id());
 				invalid_vtxos.push(bytes);
 				continue;
@@ -489,6 +513,18 @@ impl Wallet {
 		raw_vtxos: Vec<Vec<u8>>,
 	) -> anyhow::Result<()> {
 		let vtxos = self.process_raw_vtxos(raw_vtxos).await?;
+		if let Err(e) = self.register_vtxo_transactions_with_server(&vtxos).await {
+			warn!("Failed to register received arkoor vtxo transactions with server: {:#}", e);
+		}
+		self.store_received_arkoor_package(vtxos).await
+	}
+
+	/// Store a fully validated receive. Coordinated delivery calls this only after
+	/// the recovery package is durable; it does not require the Ark server online.
+	pub(crate) async fn store_received_arkoor_package(
+		&self,
+		vtxos: Vec<Vtxo<Full>>,
+	) -> anyhow::Result<()> {
 
 		// Serialize the receive dedup across all consumers of this wallet's
 		// mailbox so two of them can't both record a movement for the same
@@ -519,17 +555,6 @@ impl Wallet {
 			return Ok(());
 		}
 
-		// Redundantly re-register the received vtxos with the server. An
-		// up-to-date sender already does this after cosign, but older
-		// senders may not, so we do it on receive too to make sure the
-		// server has signed_tx rows for our spendable vtxos. Any failure
-		// is logged and swallowed: the receive must still proceed so we
-		// don't lose track of the vtxos locally, and later spends will
-		// retry registration if still needed.
-		if let Err(e) = self.register_vtxo_transactions_with_server(&new_vtxos).await {
-			warn!("Failed to register received arkoor vtxo transactions with server: {:#}", e);
-		}
-
 		// TODO: Make sure we don't effectively skip the entire package if the movement fails to
 		//       be recorded due to bark getting killed after this point.
 		let balance = new_vtxos
@@ -541,7 +566,7 @@ impl Wallet {
 		// Build received_on destinations from received VTXOs, aggregated by address
 		let mut received_by_address = HashMap::<ark::Address, Amount>::new();
 		for vtxo in &new_vtxos {
-			if let Ok(Some((index, _))) = self.pubkey_keypair(&vtxo.user_pubkey()).await {
+			if let Ok(Some(index)) = self.inner.db.get_public_key_idx(&vtxo.user_pubkey()).await {
 				if let Ok(address) = self.peek_address(index).await {
 					*received_by_address.entry(address).or_default() += vtxo.amount();
 				}
@@ -564,6 +589,34 @@ impl Wallet {
 
 		info!("Received arkoor (movement {}) for {}", movement_id, balance);
 
+		Ok(())
+	}
+
+	/// Retain rejected wire bytes only as diagnostic metadata. They must never
+	/// establish a canonical VTXO row: a forged outpoint could otherwise prevent
+	/// a later valid, prepared payment from being accepted.
+	pub(crate) async fn quarantine_program_receive(
+		&self,
+		vtxo: &Vtxo<Full>,
+		raw: &[u8],
+		reason: &str,
+	) -> anyhow::Result<()> {
+		let _guard = self.inner.lock_manager.lock(
+			MAILBOX_PROCESSING_LOCK_KEY, MAILBOX_PROCESSING_LOCK_TIMEOUT,
+		).await?;
+		if self.inner.db.get_wallet_vtxo(vtxo.id()).await?.is_some() {
+			return Ok(());
+		}
+		let movement = self.inner.movements.get_or_create_movement_with_action(
+			Subsystem::ARKOOR,
+			"program-receive-quarantine",
+			&format!("program-quarantine.{}", vtxo.id()),
+			MovementUpdate::new().metadata([
+				("reason".into(), serde_json::Value::String(reason.to_owned())),
+				("raw_vtxo".into(), serde_json::Value::String(raw.as_hex().to_string())),
+			]),
+		).await?;
+		warn!("Quarantined unsafe program deposit {} (movement {}): {}", vtxo.id(), movement, reason);
 		Ok(())
 	}
 
@@ -649,9 +702,8 @@ impl Wallet {
 				match lookup {
 					Ok(Some(send)) => {
 						let result = match (&send.progress, known_preimage) {
-							(Progress::PaymentInitiated(htlcs), Some(preimage)) => {
-								let htlcs = htlcs.clone();
-								self.settle_lightning_send_with_preimage(send, htlcs, preimage).await
+							(Progress::PaymentInitiated(_), Some(preimage)) => {
+								self.settle_lightning_send_with_preimage(payment_hash, preimage).await
 							},
 							(Progress::PaymentInitiated(_), None) => {
 								self.drive_action(send, DriveMode::UntilParkOrDone).await

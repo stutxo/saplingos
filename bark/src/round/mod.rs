@@ -28,10 +28,11 @@ use ark::{ArkInfo, ProtocolEncoding, SignedVtxoRequest, Vtxo, VtxoId, VtxoReques
 use ark::vtxo::{Full, PubkeyVtxoPolicy, VtxoPolicy};
 use ark::attestations::{DelegatedRoundParticipationAttestation, RoundAttemptAttestation};
 use ark::fees::FeeValidationError;
-use ark::forfeit::HashLockedForfeitBundle;
+use ark::forfeit::HarkForfeitSigningContext;
 use ark::musig::{self, PublicNonce, SecretNonce};
 use ark::rounds::{RoundAttempt, RoundEvent, RoundFinished, RoundSeq, ROUND_TX_VTXO_TREE_VOUT};
-use ark::tree::signed::{LeafVtxoCosignContext, UnlockHash, VtxoTreeSpec};
+use ark::sapio::protocol::{OwnershipProof, OwnershipRequest};
+use ark::tree::signed::{ExternalLeafVtxoCosignContext, LeafVtxoCosignResponse, UnlockHash, VtxoTreeSpec};
 use bitcoin_ext::{BlockDelta, BlockHeight, TxStatus};
 use server_rpc::{protos, ServerConnection, TryFromBytes, MAX_NB_FORFEIT_NONCE_IDS};
 
@@ -183,9 +184,6 @@ impl fmt::Display for RoundFlowKind {
 /// As soon as we have signed forfeit txs for the round, we keep track of this
 /// round attempt until we see another attempt we participated in confirm or
 /// we gain confidence that the failed attempt will never confirm.
-//
-//TODO(stevenroose) move the id in here and have the state persist itself with the wallet
-// to have better control. this way we can touch db before we sent forfeit sigs
 pub struct RoundState {
 	/// Round is fully done
 	pub(crate) done: bool,
@@ -210,6 +208,10 @@ pub struct RoundState {
 	// probably based on the input vtxos becoming close to expiry
 	pub(crate) sent_forfeit_sigs: bool,
 
+	/// Exact wire bundles, checkpointed before any share escapes. `None` is a
+	/// legacy checkpoint whose earlier handoffs cannot be reconstructed safely.
+	pub(crate) forfeit_bundles: Option<Vec<Vec<u8>>>,
+
 	/// The ID of the [Movement] associated with this round
 	pub(crate) movement_id: Option<MovementId>,
 }
@@ -225,6 +227,7 @@ impl RoundState {
 			flow: RoundFlowState::InteractivePending,
 			new_vtxos: Vec::new(),
 			sent_forfeit_sigs: false,
+			forfeit_bundles: Some(Vec::new()),
 			done: false,
 		}
 	}
@@ -241,6 +244,7 @@ impl RoundState {
 			flow: RoundFlowState::NonInteractivePending { unlock_hash, scheduled_height },
 			new_vtxos: Vec::new(),
 			sent_forfeit_sigs: false,
+			forfeit_bundles: Some(Vec::new()),
 			done: false,
 		}
 	}
@@ -324,6 +328,7 @@ impl RoundState {
 	/// Tries to cancel the round and returns whether it was succesfully canceled
 	/// or if it was already canceled or failed
 	pub async fn try_cancel(&mut self, wallet: &Wallet) -> anyhow::Result<bool> {
+		ensure!(!self.sent_forfeit_sigs, "cannot cancel a round after committing forfeit shares");
 		let ret = match self.flow {
 			RoundFlowState::NonInteractivePending { .. }
 				| RoundFlowState::Redelegating { .. }
@@ -425,7 +430,7 @@ impl RoundState {
 				VtxoPolicy::ServerHtlcRecv(_) |
 				VtxoPolicy::ServerHtlcRecv_v0(_) => return Ok(false),
 			};
-			if wallet.inner.db.get_public_key_idx(&user_pubkey).await?.is_none() {
+			if wallet.signing_key(&user_pubkey).await?.is_none() {
 				return Ok(false);
 			}
 		}
@@ -670,6 +675,8 @@ impl RoundState {
 						true
 					},
 					AttemptProgressResult::Finished { funding_tx, vtxos, unlock_hash } => {
+						// Interactive states cannot have released input forfeits yet.
+						self.forfeit_bundles = Some(Vec::new());
 						self.new_vtxos = vtxos;
 						let funding_txid = funding_tx.compute_txid();
 						self.flow = RoundFlowState::Finished { funding_tx, unlock_hash };
@@ -690,11 +697,24 @@ impl RoundState {
 		};
 	}
 
-	/// Sync the round's status and return it
-	///
-	/// When success or failure is returned, the round state can be eliminated
-	//TODO(stevenroose) make RoundState manage its own db record
-	pub async fn sync(&mut self, wallet: &Wallet) -> anyhow::Result<RoundStatus> {
+	/// Prepare the next transition; only `StoredRoundState::sync` may hand
+	/// shares to the server, after checkpointing this state.
+	async fn sync(&mut self, wallet: &Wallet) -> anyhow::Result<RoundStatus> {
+		if self.forfeit_bundles.is_none() {
+			let mut program_owned = false;
+			for input in &self.participation.inputs {
+				program_owned |= wallet.vtxo_signing_key(input).await?.program().is_some();
+			}
+			// Preserve native legacy replay. Program-owned positions must never
+			// recreate a possibly released share from an ambiguous checkpoint.
+			if !program_owned {
+				self.forfeit_bundles = Some(Vec::new());
+			} else if !matches!(self.flow,
+				RoundFlowState::InteractivePending | RoundFlowState::InteractiveOngoing { .. },
+			) {
+				bail!("legacy program round lacks durable forfeit shares; retaining input locks");
+			}
+		}
 		match self.flow {
 			RoundFlowState::Finished { ref funding_tx, .. } if self.done => {
 				Ok(RoundStatus::Confirmed {
@@ -766,7 +786,7 @@ impl RoundState {
 
 				match progress_delegated(
 					wallet, &self.participation, self.movement_id, unlock_hash, scheduled_height,
-					self.sent_forfeit_sigs,
+					self.sent_forfeit_sigs || self.forfeit_bundles.is_none(),
 				).await {
 					Ok(HarkProgressResult::RoundPending) => Ok(RoundStatus::Pending),
 					Ok(HarkProgressResult::RoundNotFound) => {
@@ -790,24 +810,9 @@ impl RoundState {
 						})
 					},
 					Ok(HarkProgressResult::Ok { funding_tx, new_vtxos }) => {
-						let funding_txid = funding_tx.compute_txid();
 						self.new_vtxos = new_vtxos;
-						self.flow = RoundFlowState::Finished {
-							funding_tx: funding_tx.clone(),
-							unlock_hash: unlock_hash,
-						};
-
-						persist_round_success(
-							wallet,
-							&self.participation,
-							self.movement_id,
-							&self.new_vtxos,
-							&funding_tx,
-						).await.context("failed to store successful round in DB!")?;
-
-						self.done = true;
-
-						Ok(RoundStatus::Confirmed { funding_txid })
+						self.flow = RoundFlowState::Finished { funding_tx, unlock_hash };
+						Ok(RoundStatus::Pending)
 					},
 					Ok(HarkProgressResult::FundingTxUnconfirmed { funding_txid }) => {
 						if let Some(mid) = self.movement_id {
@@ -817,18 +822,8 @@ impl RoundState {
 						Ok(RoundStatus::Unconfirmed { funding_txid })
 					},
 
-					//TODO(stevenroose) should we mark as failed for these cases?
-
-					Err(HarkForfeitError::Err(e)) => {
-						//TODO(stevenroose) we failed here but we might actualy be able to
-						// succeed if we retry. should we implement some kind of limited
-						// retry after which we mark as failed?
+					Err(e) => {
 						Err(e.context("error progressing delegated round"))
-					},
-					Err(HarkForfeitError::SentForfeits(e)) => {
-						self.sent_forfeit_sigs = true;
-						Err(e.context("error progressing delegated round \
-							after sending forfeit tx signatures"))
 					},
 				}
 			},
@@ -843,32 +838,21 @@ impl RoundState {
 					return Ok(RoundStatus::Unconfirmed { funding_txid });
 				}
 
-				match hark_vtxo_swap(
-					wallet, &self.participation, &mut self.new_vtxos, &funding_tx, unlock_hash,
-					self.sent_forfeit_sigs,
-				).await {
-					Ok(()) => {
-						persist_round_success(
-							wallet,
-							&self.participation,
-							self.movement_id,
-							&self.new_vtxos,
-							&funding_tx,
-						).await.context("failed to store successful round in DB!")?;
-
-						self.done = true;
-
-						Ok(RoundStatus::Confirmed { funding_txid })
-					},
-					Err(HarkForfeitError::Err(e)) => {
-						Err(e.context("error forfeiting VTXOs after round"))
-					},
-					Err(HarkForfeitError::SentForfeits(e)) => {
-						self.sent_forfeit_sigs = true;
-						Err(e.context("error after having signed and sent \
-							forfeit signatures to server"))
-					},
+				let bundles = self.forfeit_bundles.as_ref().context(
+					"legacy round lacks durable forfeit shares; retaining the old recovery position",
+				)?;
+				if bundles.is_empty() {
+					let (new_vtxos, bundles) = prepare_hark_swap(
+						wallet, &self.participation, &self.new_vtxos,
+						funding_tx, unlock_hash, self.sent_forfeit_sigs,
+					).await.context("preparing recoverable hArk swap")?;
+					self.new_vtxos = new_vtxos;
+					self.forfeit_bundles = Some(bundles);
+					// This flag is durable before send, so even an ambiguous network
+					// failure cannot make the old inputs spendable again.
+					self.sent_forfeit_sigs = true;
 				}
+				Ok(RoundStatus::Pending)
 			},
 		}
 	}
@@ -943,6 +927,92 @@ impl RoundState {
 		}
 	}
 
+}
+
+impl StoredRoundState {
+	/// Progress a round while durably recording both sides of every handoff.
+	/// No forfeit RPC runs until the exact leaves and user shares are on disk.
+	pub async fn sync(&mut self, wallet: &Wallet) -> anyhow::Result<RoundStatus> {
+		ensure!(!wallet.inner.db.has_program_recovery_reservation(
+			&crate::persist::models::recovery_round_key(self.id()),
+		).await?, "round {} was taken over by program recovery", self.id());
+		let status = self.state_mut().sync(wallet).await?;
+		wallet.inner.db.update_round_state(self).await
+			.context("failed to checkpoint round before forfeit handoff")?;
+		if self.state().done || !matches!(status, RoundStatus::Pending) {
+			return Ok(status);
+		}
+		let state = self.state_mut();
+		let RoundFlowState::Finished { funding_tx, unlock_hash } = &state.flow else {
+			return Ok(status);
+		};
+		let Some(bundles) = state.forfeit_bundles.as_ref().filter(|b| !b.is_empty()) else {
+			return Ok(status);
+		};
+		wallet.ensure_program_recoveries(&state.participation.inputs).await
+			.context("old round recovery is not ready for forfeit handoff")?;
+		for input in &state.participation.inputs {
+			let ctx = HarkForfeitSigningContext::new(input, *unlock_hash)?;
+			wallet.prepare_hark_recovery(input, &ctx).await?;
+		}
+		wallet.prepare_program_recoveries(&state.new_vtxos).await
+			.context("failed to preserve signed hashlocked round recovery ancestors")?;
+		wallet.preserve_hark_unlocks(&state.new_vtxos, &state.participation.inputs, *unlock_hash).await
+			.context("failed to preserve authenticated round unlock dependencies")?;
+		if !state.new_vtxos.iter().all(|v| v.has_all_witnesses()) {
+			let (mut srv, _) = wallet.require_server().await?;
+			let response = srv.client.forfeit_vtxos(protos::ForfeitVtxosRequest {
+				forfeit_bundles: bundles.clone(),
+			}).await;
+			let response = match response {
+				Ok(response) => response,
+				Err(error) if error.code() == tonic::Code::InvalidArgument
+					&& error.message().starts_with("no forfeit nonces generated for vtxo ") =>
+				{
+					// Only explicit nonce loss permits a new native signing session.
+					// Keep the exact saved leaves and forfeit transaction identities.
+					for vtxo in state.participation.inputs.iter().chain(&state.new_vtxos) {
+						ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
+							"program round forfeit nonce loss requires saved offline recovery");
+					}
+					state.forfeit_bundles = Some(prepare_hark_forfeits(
+						wallet, &state.participation, *unlock_hash,
+					).await?);
+					wallet.inner.db.update_round_state(self).await
+						.context("failed to checkpoint replacement native forfeit shares")?;
+					return Ok(RoundStatus::Pending);
+				},
+				Err(error) => return Err(error).context("forfeit handoff failed; inputs remain locked"),
+			};
+			let preimage = response.into_inner().unlock_preimage.as_slice().try_into()
+				.context("invalid round unlock preimage length")?;
+			for vtxo in &mut state.new_vtxos {
+				ensure!(vtxo.provide_unlock_preimage(preimage),
+					"invalid unlock preimage for round output {}", vtxo.id(),
+				);
+			}
+		}
+		for vtxo in &state.new_vtxos {
+			vtxo.validate(funding_tx).context("completed round output failed validation")?;
+		}
+		// Preserve completed bytes before recovery merging or registration: either
+		// operation can fail, and neither may force another signature on retry.
+		wallet.inner.db.update_round_state(self).await
+			.context("failed to checkpoint completed round outputs")?;
+		let state = self.state();
+		let funding_tx = state.funding_tx().context("missing finished round transaction")?;
+		wallet.ensure_program_recoveries(&state.new_vtxos).await
+			.context("completed round recovery is not ready")?;
+		wallet.register_vtxo_transactions_with_server(&state.new_vtxos).await
+			.context("couldn't register completed round outputs")?;
+		persist_round_success(
+			wallet, &state.participation, state.movement_id, &state.new_vtxos, funding_tx,
+		).await?;
+		let funding_txid = funding_tx.compute_txid();
+		self.state_mut().done = true;
+		wallet.inner.db.update_round_state(self).await?;
+		Ok(RoundStatus::Confirmed { funding_txid })
+	}
 }
 
 /// The state of the process flow of a round
@@ -1091,14 +1161,19 @@ async fn start_attempt(
 
 	let mut input_vtxos = Vec::with_capacity(participation.inputs.len());
 	for vtxo in participation.inputs.iter() {
-		let keypair = wallet.get_vtxo_key(vtxo).await
-			.map_err(HarkForfeitError::Err)?;
+		let key = wallet.vtxo_signing_key(vtxo).await?;
+		let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
+			input: vtxo.clone(),
+			proof: OwnershipProof::Round {
+				challenge: event.challenge.inner(), outputs: signed_reqs.clone(),
+			},
+		}).await?;
 		input_vtxos.push(protos::InputVtxo {
 			vtxo_id: vtxo.id().to_bytes().to_vec(),
 			attestation: {
-				let attestation = RoundAttemptAttestation::new(
-					event.challenge, vtxo.id(), &signed_reqs, &keypair,
-				);
+				let attestation = RoundAttemptAttestation::from_signature(
+					event.challenge, vtxo, &signed_reqs, signature,
+				)?;
 				attestation.serialize()
 			},
 		});
@@ -1106,7 +1181,7 @@ async fn start_attempt(
 
 	// Register VTXO transaction chains with server before round participation
 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
-		.map_err(HarkForfeitError::Err)?;
+		.context("failed to register round input transactions")?;
 
 	let resp = srv.client.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: input_vtxos,
@@ -1129,16 +1204,6 @@ async fn start_attempt(
 	Ok(AttemptState::AwaitingUnsignedVtxoTree { unlock_hash, cosign_keys })
 }
 
-/// just an internal type; need Error trait to work with anyhow
-#[derive(Debug, thiserror::Error)]
-enum HarkForfeitError {
-	/// An error happened after we sent forfeit signatures to the server
-	#[error("error after forfeits were sent")]
-	SentForfeits(#[source] anyhow::Error),
-	/// An error happened before we sent forfeit signatures to the server
-	#[error("error before forfeits were sent")]
-	Err(#[source] anyhow::Error),
-}
 
 async fn hark_cosign_leaf(
 	wallet: &Wallet,
@@ -1146,54 +1211,49 @@ async fn hark_cosign_leaf(
 	funding_tx: &Transaction,
 	vtxo: &mut Vtxo<Full>,
 ) -> anyhow::Result<()> {
-	let key = wallet.pubkey_keypair(&vtxo.user_pubkey()).await
-		.context("error fetching keypair").map_err(HarkForfeitError::Err)?
-		.with_context(|| format!(
-			"keypair {} not found for VTXO {}", vtxo.user_pubkey(), vtxo.id(),
-		))?.1;
-	let (ctx, cosign_req) = LeafVtxoCosignContext::new(vtxo, funding_tx, &key)
+	let key = wallet.vtxo_signing_key(&*vtxo).await?;
+	let ctx = ExternalLeafVtxoCosignContext::new(vtxo, funding_tx)
 		.with_context(|| format!("can't cosign leaf of VTXO {}", vtxo.id()))?;
-	let cosign_resp = srv.client.request_leaf_vtxo_cosign(
+	let prepared = wallet.prepare_vtxo_signature(&key, ctx.signing_input().clone()).await
+		.context("program rejected the round leaf transaction")?;
+	let cosign_req = ctx.request(prepared.public_nonce());
+	let cosign_resp: LeafVtxoCosignResponse = srv.client.request_leaf_vtxo_cosign(
 		protos::LeafVtxoCosignRequest::from(cosign_req),
 	).await
 		.with_context(|| format!("error requesting leaf cosign for vtxo {}", vtxo.id()))?
 		.into_inner().try_into()
 		.context("bad leaf vtxo cosign response")?;
-	ensure!(ctx.finalize(vtxo, cosign_resp),
-		"failed to finalize VTXO leaf signature for VTXO {}", vtxo.id(),
-	);
+	let signature = prepared.finish(
+		&key, Some(cosign_resp.public_nonce), Some(cosign_resp.partial_signature),
+	).await?.signature.context("round leaf signature is incomplete")?;
+	*vtxo = ctx.finalize(signature)
+		.context("invalid externally signed round leaf")?;
 
 	Ok(())
 }
 
-/// Finish the hArk VTXO swap protocol
-///
-/// This includes:
-/// - requesting cosignature of the locked hArk leaves
-/// - sending forfeit txs to the server in return for the unlock preimage
-///
-/// NB all the actions in this function are idempotent, meaning that the server
-/// allows them to be done multiple times. this means that if this function calls
-/// fails, it's safe to just call it again at a later time
-async fn hark_vtxo_swap(
+/// Prepare both sides of the swap before producing any input forfeit share.
+/// The caller checkpoints the completed leaves and exact wire bundles before send.
+async fn prepare_hark_swap(
 	wallet: &Wallet,
 	participation: &RoundParticipation,
-	output_vtxos: &mut [Vtxo<Full>],
+	output_vtxos: &[Vtxo<Full>],
 	funding_tx: &Transaction,
 	unlock_hash: UnlockHash,
 	sent_forfeit_sigs: bool,
-) -> Result<(), HarkForfeitError> {
-	let (mut srv, _) = wallet.require_server().await.map_err(HarkForfeitError::Err)?;
-
-	// before we start make sure the server has our input vtxo signatures
+) -> anyhow::Result<(Vec<Vtxo<Full>>, Vec<Vec<u8>>)> {
+	let (mut srv, _) = wallet.require_server().await?;
+	wallet.ensure_program_recoveries(&participation.inputs).await
+		.context("old round position recovery is not ready")?;
+	wallet.prepare_program_recoveries(output_vtxos).await
+		.context("replacement round recovery preparation failed")?;
 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
-		.context("couldn't send our input vtxo transactions to server")
-		.map_err(HarkForfeitError::Err)?;
+		.context("couldn't send our input vtxo transactions to server")?;
+	let mut output_vtxos = output_vtxos.to_vec();
 
 	// first get the leaves signed
 	for vtxo in output_vtxos.iter_mut() {
-		hark_cosign_leaf(wallet, &mut srv, funding_tx, vtxo).await
-			.map_err(HarkForfeitError::Err)?;
+		hark_cosign_leaf(wallet, &mut srv, funding_tx, vtxo).await?;
 	}
 
 	// Before we hand the server the forfeits of our inputs, check that the
@@ -1201,21 +1261,26 @@ async fn hark_vtxo_swap(
 	if !sent_forfeit_sigs {
 		// If we are refreshing only expired inputs, we don't care.
 		// Our new VTXOs could have been prepared a long time ago as well.
-		let tip = wallet.inner.chain.tip().await
-			.context("chain source error")
-			.map_err(HarkForfeitError::Err)?;
+		let tip = wallet.inner.chain.tip().await.context("chain source error")?;
 		if participation.inputs.iter().any(|v| v.expiry_height() > tip) {
 			let max_input_exit_delta = participation.inputs.iter().map(|v| v.exit_delta()).max()
 				.expect("minimum one input");
 			check_output_vtxos_exitable(
-				output_vtxos, tip, wallet.inner.config.vtxo_exit_margin, max_input_exit_delta,
-			)
-				.context("refusing to forfeit our input VTXOs")
-				.map_err(HarkForfeitError::Err)?;
+				&output_vtxos, tip, wallet.inner.config.vtxo_exit_margin, max_input_exit_delta,
+			).context("refusing to forfeit our input VTXOs")?;
 		}
 	}
 
-	// then do the forfeit dance
+	let forfeit_bundles = prepare_hark_forfeits(wallet, participation, unlock_hash).await?;
+	Ok((output_vtxos, forfeit_bundles))
+}
+
+/// Sign only the deterministic forfeit transactions, without obtaining fresh
+/// leaf signatures or replacing checkpointed successor bytes.
+async fn prepare_hark_forfeits(
+	wallet: &Wallet, participation: &RoundParticipation, unlock_hash: UnlockHash,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+	let (mut srv, _) = wallet.require_server().await?;
 
 	// the server caps the number of vtxo ids per nonces request, so for
 	// large participations we request the nonces in chunks
@@ -1225,63 +1290,32 @@ async fn hark_vtxo_swap(
 			unlock_hash: unlock_hash.to_byte_array().to_vec(),
 			vtxo_ids: inputs.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		}).await
-			.context("request forfeits nonces call failed")
-			.map_err(HarkForfeitError::Err)?
+			.context("request forfeits nonces call failed")?
 			.into_inner().public_nonces.into_iter()
 			.map(|b| musig::PublicNonce::from_bytes(b))
 			.collect::<Result<Vec<_>, _>>()
-			.context("invalid forfeit nonces")
-			.map_err(HarkForfeitError::Err)?;
+			.context("invalid forfeit nonces")?;
 
 		if nonces.len() != inputs.len() {
-			return Err(HarkForfeitError::Err(anyhow!(
-				"server sent {} nonce pairs, expected {}",
-				nonces.len(), inputs.len(),
-			)));
+			bail!("server sent {} nonce pairs, expected {}", nonces.len(), inputs.len());
 		}
 		server_nonces.extend(nonces);
 	}
 
 	let mut forfeit_bundles = Vec::with_capacity(participation.inputs.len());
 	for (input, nonces) in participation.inputs.iter().zip(server_nonces.into_iter()) {
-		let user_key = wallet.pubkey_keypair(&input.user_pubkey()).await
-			.ok().flatten().with_context(|| format!(
-				"failed to fetch keypair for vtxo user pubkey {}", input.user_pubkey(),
-			)).map_err(HarkForfeitError::Err)?.1;
-		forfeit_bundles.push(HashLockedForfeitBundle::new(
-			input, unlock_hash, &user_key, &nonces,
-		))
+		let ctx = HarkForfeitSigningContext::new(input, unlock_hash)?;
+		wallet.prepare_hark_recovery(input, &ctx).await
+			.context("hArk fallback recovery preparation failed")?;
+		let key = wallet.vtxo_signing_key(input).await?;
+		let prepared = wallet.prepare_vtxo_signature(&key, ctx.signing_input().clone()).await
+			.context("program rejected the hArk forfeit transaction")?;
+		let user_nonce = prepared.public_nonce();
+		let share = prepared.finish(&key, Some(nonces.clone()), None).await?.user_partial;
+		forfeit_bundles.push(ctx.assemble(user_nonce, share, &nonces)?.serialize());
 	}
 
-	let preimage = srv.client.forfeit_vtxos(protos::ForfeitVtxosRequest {
-		forfeit_bundles: forfeit_bundles.iter().map(|b| b.serialize()).collect(),
-	}).await
-		.context("forfeit vtxos call failed")
-		.map_err(HarkForfeitError::SentForfeits)?
-		.into_inner().unlock_preimage.as_slice().try_into()
-		.context("invalid preimage length")
-		.map_err(HarkForfeitError::SentForfeits)?;
-
-	for vtxo in output_vtxos.iter_mut() {
-		if !vtxo.provide_unlock_preimage(preimage) {
-			return Err(HarkForfeitError::SentForfeits(anyhow!(
-				"invalid preimage for vtxo {} with supposed unlock hash {}",
-				vtxo.id(), unlock_hash,
-			)));
-		}
-
-		// then validate the vtxo works
-		vtxo.validate(&funding_tx).with_context(|| format!(
-			"new VTXO {} does not pass validation after hArk forfeit protocol", vtxo.id(),
-		)).map_err(HarkForfeitError::SentForfeits)?;
-	}
-
-	// then register the output vtxos with the server
-	wallet.register_vtxo_transactions_with_server(output_vtxos).await
-		.context("couldn't register output vtxo transactions with server")
-		.map_err(HarkForfeitError::SentForfeits)?;
-
-	Ok(())
+	Ok(forfeit_bundles)
 }
 
 fn check_vtxo_fails_hash_lock(funding_tx: &Transaction, vtxo: &Vtxo<Full>) -> anyhow::Result<()> {
@@ -1470,25 +1504,25 @@ async fn progress_delegated(
 	unlock_hash: UnlockHash,
 	scheduled_height: Option<BlockHeight>,
 	sent_forfeit_sigs: bool,
-) -> Result<HarkProgressResult, HarkForfeitError> {
-	let (mut srv, ark_info) = wallet.require_server().await.map_err(HarkForfeitError::Err)?;
+) -> anyhow::Result<HarkProgressResult> {
+	let (mut srv, ark_info) = wallet.require_server().await?;
 
 	let resp = match srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
 		unlock_hash: unlock_hash.to_byte_array().to_vec(),
 	}).await {
 		Ok(resp) => resp.into_inner(),
 		Err(err) if err.code() == tonic::Code::NotFound => {
+			if sent_forfeit_sigs {
+				bail!("round disappeared after a possible forfeit handoff; retaining input locks");
+			}
 			return Ok(HarkProgressResult::RoundNotFound);
 		},
 		Err(err) => {
-			return Err(HarkForfeitError::Err(
-				anyhow::Error::from(err).context("error checking round participation status"),
-			));
+			return Err(anyhow::Error::from(err).context("error checking round participation status"));
 		},
 	};
 	let status = protos::RoundParticipationStatus::try_from(resp.status)
-		.context("unknown status from server")
-		.map_err(HarkForfeitError::Err)	?;
+		.context("unknown status from server")?;
 
 	if status == protos::RoundParticipationStatus::RoundPartPending {
 		trace!("Hark round still pending");
@@ -1507,11 +1541,9 @@ async fn progress_delegated(
 	}
 
 	let funding_tx_bytes = resp.round_funding_tx
-		.context("funding txid should be provided when status is not pending")
-		.map_err(HarkForfeitError::Err)?;
+		.context("funding transaction should be provided when status is not pending")?;
 	let funding_tx = deserialize::<Transaction>(&funding_tx_bytes)
-		.context("invalid funding txid")
-		.map_err(HarkForfeitError::Err)?;
+		.context("invalid funding transaction")?;
 	let funding_txid = funding_tx.compute_txid();
 	trace!("Funding tx for round participation with unlock hash {}: {} ({})",
 		unlock_hash, funding_tx.compute_txid(), funding_tx_bytes.as_hex(),
@@ -1519,8 +1551,7 @@ async fn progress_delegated(
 
 	// Check the confirmation status of the funding tx
 	let confirmed = check_funding_tx_confirmations(wallet, funding_txid, &funding_tx).await
-		.context("checking funding tx confirmations")
-		.map_err(HarkForfeitError::Err)?;
+		.context("checking funding tx confirmations")?;
 
 	// The server has issued the round and its funding tx is in our mempool or a
 	// block: the server no longer accepts these inputs, so hold them like the
@@ -1529,42 +1560,27 @@ async fn progress_delegated(
 	// imported as Spent.
 	let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 	wallet.inner.db.steal_lock(&input_ids, movement_id.map(|m| m.into())).await
-		.context("failed to lock inputs of issued delegated round")
-		.map_err(HarkForfeitError::Err)?;
+		.context("failed to lock inputs of issued delegated round")?;
 
 	if !confirmed {
 		return Ok(HarkProgressResult::FundingTxUnconfirmed { funding_txid });
 	}
 
-	let mut new_vtxos = resp.output_vtxos.into_iter()
+	let new_vtxos = resp.output_vtxos.into_iter()
 		.map(|v| <Vtxo<Full>>::deserialize(&v))
 		.collect::<Result<Vec<_>, _>>()
-		.context("invalid output VTXOs from server")
-		.map_err(HarkForfeitError::Err)?;
+		.context("invalid output VTXOs from server")?;
 
 	// Check that the vtxos match our participation in the exact order, and that
 	// the server-chosen tree parameters are safe, before we forfeit our inputs.
-	let tip = wallet.inner.chain.tip().await
-		.context("chain source error")
-		.map_err(HarkForfeitError::Err)?;
+	let tip = wallet.inner.chain.tip().await.context("chain source error")?;
 	check_round_matches_participation(
 		participation, &new_vtxos, &funding_tx, &ark_info, scheduled_height,
 		tip, wallet.inner.config.vtxo_exit_margin,
-	)
-		.context("new VTXOs received from server don't match our participation")
-		.map_err(HarkForfeitError::Err)?;
+	).context("new VTXOs received from server don't match our participation")?;
 
-	// NB keep the error kinds intact: marking a pre-forfeit failure as
-	// SentForfeits would set the round's forfeit flag, which disables the
-	// exitability check above on the next attempt.
-	hark_vtxo_swap(
-		wallet, participation, &mut new_vtxos, &funding_tx, unlock_hash, sent_forfeit_sigs,
-	).await.map_err(|e| match e {
-		HarkForfeitError::Err(e) =>
-			HarkForfeitError::Err(e.context("error forfeiting hArk VTXOs")),
-		HarkForfeitError::SentForfeits(e) =>
-			HarkForfeitError::SentForfeits(e.context("error forfeiting hArk VTXOs")),
-	})?;
+	// Discovery never forfeits. The StoredRoundState driver checkpoints these
+	// exact outputs before preparing the swap and its durable wire shares.
 
 	Ok(HarkProgressResult::Ok { funding_tx, new_vtxos })
 }
@@ -1800,6 +1816,8 @@ async fn persist_round_success(
 	debug!("Persisting newly finished round. {} new vtxos, movement ID {:?}",
 		new_vtxos.len(), movement_id,
 	);
+	wallet.ensure_program_recoveries(new_vtxos).await
+		.context("completed round recovery is not ready")?;
 
 	// we first try all actions that need to happen and only afterwards return errors
 	// so that we achieve maximum success
@@ -1928,6 +1946,9 @@ impl Wallet {
 			"timed out waiting for lock on round state {} (wallet {})",
 			id, self.fingerprint(),
 		))?;
+		ensure!(!self.inner.db.has_program_recovery_reservation(
+			&crate::persist::models::recovery_round_key(id),
+		).await?, "round {id} was taken over by program recovery");
 
 		if let Some(state) = self.inner.db.get_round_state_by_id(id).await? {
 			return Ok(Some(state.lock(guard)));
@@ -1950,6 +1971,11 @@ impl Wallet {
 			Some(g) => g,
 			None => return Ok(None),
 		};
+		if self.inner.db.has_program_recovery_reservation(
+			&crate::persist::models::recovery_round_key(id),
+		).await? {
+			return Ok(None);
+		}
 
 		Ok(self.inner.db.get_round_state_by_id(id).await?.map(|s| s.lock(guard)))
 	}
@@ -2121,14 +2147,17 @@ impl Wallet {
 		// Generate attestations for input vtxos
 		let mut input_vtxos = Vec::with_capacity(participation.inputs.len());
 		for vtxo in participation.inputs.iter() {
-			let keypair = self.get_vtxo_key(vtxo).await
-				.context("failed to get vtxo keypair")?;
+			let key = self.vtxo_signing_key(vtxo).await?;
+			let signature = self.sign_vtxo_ownership(&key, OwnershipRequest {
+				input: vtxo.clone(),
+				proof: OwnershipProof::DelegatedRound { outputs: participation.outputs.clone() },
+			}).await?;
 			input_vtxos.push(protos::InputVtxo {
 				vtxo_id: vtxo.id().to_bytes().to_vec(),
 				attestation: {
-					let attestation = DelegatedRoundParticipationAttestation::new(
-						vtxo.id(), &participation.outputs, &keypair,
-					);
+					let attestation = DelegatedRoundParticipationAttestation::from_signature(
+						vtxo, &participation.outputs, signature,
+					)?;
 					attestation.serialize()
 				},
 			});
@@ -2240,10 +2269,15 @@ impl Wallet {
 
 		// The keys of the participation were derived by the wallet that
 		// created it, so they may be past what this wallet has revealed.
-		let output_pubkeys = output_vtxos.iter().map(|v| v.user_pubkey()).collect::<Vec<_>>();
-		self.find_vtxo_keypairs(output_pubkeys, self.inner.config.vtxo_key_gap_limit).await?;
+		let mut undiscovered_pubkeys = Vec::new();
+		for output in &output_vtxos {
+			if self.signing_key(&output.user_pubkey()).await?.is_none() {
+				undiscovered_pubkeys.push(output.user_pubkey());
+			}
+		}
+		self.find_vtxo_keypairs(undiscovered_pubkeys, self.inner.config.vtxo_key_gap_limit).await?;
 		for vtxo in output_vtxos.iter() {
-			if self.pubkey_keypair(&vtxo.user_pubkey()).await?.is_none() {
+			if self.signing_key(&vtxo.user_pubkey()).await?.is_none() {
 				error!("Not recovering round participation {}: \
 					output vtxo {} is not ours", unlock_hash, vtxo.id(),
 				);
@@ -2336,60 +2370,35 @@ impl Wallet {
 		attempt: &RoundAttempt,
 		movement_kind: Option<RoundMovement>,
 	) -> anyhow::Result<StoredRoundState<Unlocked>> {
-		let movement = if let Some(kind) = movement_kind {
-			Some(self.inner.movements.new_guarded_movement_with_update(
-				Subsystem::ROUND,
-				kind.to_string(),
-				OnDropStatus::Failed,
-				participation.to_movement_update()?,
-			).await?)
-		} else {
-			None
-		};
-		let movement_id = movement.as_ref().map(|m| m.id());
-
+		// Publish a discoverable intent and take its ordinary round guard before
+		// locking inputs or exporting an attestation. Recovery can now coordinate
+		// even the first attempt, including movement-held and holder-less inputs.
+		let mut state = self.join_next_round(participation, movement_kind).await?;
+		let participation = &state.state().participation;
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
-		self.lock_vtxos(&input_ids, movement_id.map(|m| m.into())).await
-			.context("error locking input VTXOs")?;
-
-		match self.join_attempt_interactive_inner(participation, attempt, movement_id).await {
-			Ok(state) => {
-				if let Some(mut m) = movement {
-					m.stop();
-				}
-				Ok(state)
+		let movement_id = state.state().movement_id;
+		let attempt_state = match self.lock_vtxos(&input_ids, state.state().lock_holder()).await {
+			Ok(()) => start_attempt(self, participation, attempt).await,
+			Err(error) => Err(error.context("error locking input VTXOs")),
+		};
+		match attempt_state {
+			Ok(attempt_state) => {
+				state.state_mut().flow = RoundFlowState::InteractiveOngoing {
+					round_seq: attempt.round_seq,
+					attempt_seq: attempt.attempt_seq,
+					state: attempt_state,
+				};
+				self.inner.db.update_round_state(&state).await?;
+				Ok(state.unlock())
 			},
-			Err(e) => {
-				self.unlock_vtxos(&input_ids, movement_id.map(|m| m.into())).await
-					.context("error unlocking input VTXOs")?;
-				if let Some(mut m) = movement {
-					m.fail().await.context("error marking movement as failed")?;
-				}
-				Err(e)
+			Err(error) => {
+				// Preserve tonic rejection identifiers for the caller's native
+				// refresh/shrink behavior, after ownership-sensitive cleanup.
+				persist_round_failure(self, participation, movement_id).await?;
+				self.inner.db.remove_round_state(&state).await?;
+				Err(error)
 			},
 		}
-	}
-
-	async fn join_attempt_interactive_inner(
-		&self,
-		participation: RoundParticipation,
-		attempt: &RoundAttempt,
-		movement_id: Option<MovementId>,
-	) -> anyhow::Result<StoredRoundState<Unlocked>> {
-		// Submit synchronously to the in-flight attempt. On rejection the
-		// tonic::Status (carrying the unusable input ids in its `identifiers`
-		// metadata) propagates up the error chain untouched.
-		let attempt_state = start_attempt(self, &participation, attempt).await?;
-
-		let mut state = RoundState::new_interactive(participation, movement_id);
-		state.flow = RoundFlowState::InteractiveOngoing {
-			round_seq: attempt.round_seq,
-			attempt_seq: attempt.attempt_seq,
-			state: attempt_state,
-		};
-
-		let id = self.inner.db.store_round_state(&state).await?;
-		Ok(StoredRoundState::new(id, state))
 	}
 
 	/// Get all pending round states
@@ -2419,6 +2428,9 @@ impl Wallet {
 	pub async fn pending_round_balance(&self) -> anyhow::Result<Amount> {
 		let mut ret = Amount::ZERO;
 		for round in self.pending_round_states().await? {
+			if self.inner.db.has_program_recovery_reservation(
+				&crate::persist::models::recovery_round_key(round.id()),
+			).await? { continue; }
 			ret += round.state().pending_balance();
 		}
 		Ok(ret)
@@ -2483,7 +2495,7 @@ impl Wallet {
 					},
 				};
 
-				let status = match state.state_mut().sync(self).await {
+				let status = match state.sync(self).await {
 					Ok(s) => s,
 					Err(e) => {
 						warn!("Error syncing round: {:#}", e);
@@ -2550,7 +2562,7 @@ impl Wallet {
 			}
 		}
 
-		match state.state_mut().sync(self).await {
+		match state.sync(self).await {
 			Err(e) => warn!("Error syncing round #{}: {:#}", state.id(), e),
 			Ok(s) if s.is_final() => {
 				info!("Round #{} finished with result: {:?}", state.id(), s);
@@ -2749,10 +2761,11 @@ impl Wallet {
 	{
 		loop {
 			if !state.state().ongoing_participation() {
-				let status = state.state_mut().sync(self).await?;
+				let status = state.sync(self).await?;
 				match status {
 					RoundStatus::Failed { error } => bail!("round failed: {}", error),
 					RoundStatus::Canceled => bail!("round canceled"),
+					RoundStatus::Pending => continue,
 					status => return Ok(status),
 				}
 			}

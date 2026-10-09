@@ -5,6 +5,7 @@ mod exit;
 mod lightning;
 mod onchain;
 mod round;
+mod sapio;
 
 use std::cmp::Ordering;
 use std::{env, process};
@@ -162,7 +163,7 @@ enum Command {
 	#[command()]
 	Create(CreateOpts),
 
-	/// Print the configuration of your bark wallet
+	/// Print wallet configuration without the RPC password or program evidence
 	#[command()]
 	Config,
 
@@ -382,6 +383,10 @@ enum Command {
 	#[command(subcommand)]
 	Exit(exit::ExitCommand),
 
+	/// Configure and recover generic Sapio-backed VTXOs
+	#[command(subcommand)]
+	Sapio(sapio::SapioCommand),
+
 	/// Perform any lightning-related command
 	#[command(subcommand, visible_alias = "ln")]
 	Lightning(lightning::LightningCommand),
@@ -452,6 +457,11 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 		return Ok(())
 	}
 
+	// Saved program recovery must not run normal startup recovery or maintenance.
+	if let Command::Sapio(cmd) = cli.command {
+		return sapio::execute(cmd, &datadir, USER_AGENT).await;
+	}
+
 	let mut wallet = open_wallet(&datadir, USER_AGENT).await
 		.context("error opening wallet")?
 		.context("No wallet found")?;
@@ -459,7 +469,7 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 	let net = wallet.network().await?;
 
 	match cli.command {
-		Command::Create { .. } | Command::Dev(_) | Command::Message(MessageCommand::Verify { .. }) => {
+		Command::Create { .. } | Command::Dev(_) | Command::Sapio(_) | Command::Message(MessageCommand::Verify { .. }) => {
 			unreachable!("handled earlier")
 		},
 		Command::Config => {
@@ -468,6 +478,10 @@ async fn inner_main(cli: Cli) -> anyhow::Result<()> {
 			// serialization passes through, so swap the value here.
 			config.bitcoind_pass = config.bitcoind_pass
 				.map(|_| Secret::new("[redacted]".to_owned()));
+			config.sapio_witnesses.clear();
+			if let Some(sapio) = &mut config.sapio {
+				sapio.recovery.witness.clear();
+			}
 			output_json(&config)
 		},
 		Command::ArkInfo => {

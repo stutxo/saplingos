@@ -2171,6 +2171,96 @@
         }
       }
     },
+    "/api/v1/receive/program/commit": {
+      "post": {
+        "tags": [
+          "program-receive"
+        ],
+        "summary": "Commit a program receive",
+        "description": "Accepts only complete signed VTXOs whose exact recovery claims were already prepared. Verifies the complete chain, durably merges signed ancestors, and stores the received position before it acknowledges delivery. Returns a U-signed acknowledgement over the final signed VTXO bytes. The sender must checkpoint those bytes before calling this endpoint and must retry exactly those bytes after interruption. No new Sapio signature is requested. Requests are limited to 1 MiB and 16 VTXOs. This endpoint exists only on the configured receiving-only listener.",
+        "operationId": "commit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed durable delivery acknowledgement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request timed out; retry identical signed VTXOs"
+          },
+          "413": {
+            "description": "Request body too large"
+          },
+          "422": {
+            "description": "Commit rejected; keep the sender checkpoint"
+          },
+          "429": {
+            "description": "Coordinator busy"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/v1/receive/program/prepare": {
+      "post": {
+        "tags": [
+          "program-receive"
+        ],
+        "summary": "Prepare a program receive",
+        "description": "Validates unsigned candidate VTXOs for a stored program address and durably saves authorized recovery claims. Returns a versioned receipt with address, candidate encodings, ProgramKey descriptor, recovery records and a U signature. The sender must verify the descriptor aggregates U and S to the address key, each claim, and the receipt signature before it signs its inputs. Requests are limited to 1 MiB and 16 VTXOs. Each address admits at most 128 distinct prepared outputs. This endpoint exists only on the configured receiving-only listener; it does not grant administrative authority.",
+        "operationId": "prepare",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Cryptographically bound durable preparation receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request timed out; retry identical candidates"
+          },
+          "413": {
+            "description": "Request body too large"
+          },
+          "422": {
+            "description": "Preparation rejected"
+          },
+          "429": {
+            "description": "Coordinator busy"
+          }
+        },
+        "security": []
+      }
+    },
     "/api/v1/wallet": {
       "get": {
         "tags": [
@@ -3599,7 +3689,8 @@
           "pending_board_sat",
           "pending_arkoor_send_sat",
           "pending_offboard_sat",
-          "pending_exit_sat"
+          "pending_exit_sat",
+          "pending_program_recovery_sat"
         ],
         "properties": {
           "claimable_lightning_receive_sat": {
@@ -3648,6 +3739,12 @@
             "type": "integer",
             "format": "int64",
             "description": "Sats locked in an offboard whose transaction has not been broadcast\nyet, including any change that comes back. Once the transaction is on\nthe network the sats belong to the on-chain wallet.",
+            "minimum": 0
+          },
+          "pending_program_recovery_sat": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sats reserved for immutable program recovery whose selected Bitcoin payout\nhas not confirmed. Alternative hArk branches count the same value only once.",
             "minimum": 0
           },
           "spendable_sat": {
@@ -6740,6 +6837,27 @@
           }
         }
       },
+      "ReceiveRequest": {
+        "type": "object",
+        "required": [
+          "address",
+          "vtxos"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "Coordinated Ark address advertised by the recipient."
+          },
+          "vtxos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Canonical full VTXO protocol encodings, as hex. Maximum 16 per request."
+          }
+        },
+        "additionalProperties": false
+      },
       "RefreshFees": {
         "type": "object",
         "description": "Fees for refresh operations.",
@@ -7582,6 +7700,10 @@
     {
       "name": "notifications",
       "description": "Receive real-time notifications from barkd."
+    },
+    {
+      "name": "program-receive",
+      "description": "Coordinated receiving on the dedicated receiving-only listener."
     }
   ]
 }

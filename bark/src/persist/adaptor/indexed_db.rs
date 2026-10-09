@@ -7,8 +7,12 @@ use indexed_db::{Database, Factory, TransactionBuilder};
 use tokio::sync::{Mutex, MutexGuard};
 use web_sys::js_sys::JsString;
 use web_sys::wasm_bindgen::JsValue;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::wasm_bindgen;
 
-use crate::persist::adaptor::{Query, QueryRange, Record, SortKey, StorageAdaptor};
+use crate::persist::adaptor::{
+	validate_record_updates, Query, QueryRange, Record, RecordUpdate, SortKey, StorageAdaptor,
+};
 
 const OBJECT_STORE_PREFIX: &str = "bark.v1.";
 
@@ -119,6 +123,107 @@ fn sort_key_to_js(sk: &SortKey) -> JsValue {
 /// IndexedDbClient is single-threaded, so it is safe to send and sync.
 unsafe impl Sync for IndexedDbClient {}
 
+// indexed-db 0.4 does not expose transaction completion or strict durability.
+// Keep the ordinary query wrapper, but make conditional batches acknowledge the
+// browser's actual commit event, not merely the last successful request.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(inline_js = r#"
+export function barkPutBatch(name, version, partitions, updates, absent) {
+	return new Promise((resolve, reject) => {
+		let rejected = false;
+		const opening = indexedDB.open(name, version);
+		opening.onerror = () => reject(opening.error);
+		opening.onblocked = () => {
+			rejected = true;
+			reject(new Error("program storage database open is blocked"));
+		};
+		opening.onupgradeneeded = () => {
+			rejected = true;
+			opening.transaction.abort();
+			reject(new Error("program storage database version changed"));
+		};
+		opening.onsuccess = () => {
+			const db = opening.result;
+			if (rejected) { db.close(); return; }
+			let tx;
+			let failure;
+			try {
+				tx = db.transaction(partitions, "readwrite", { durability: "strict" });
+				tx.oncomplete = () => { db.close(); resolve(); };
+				tx.onabort = () => {
+					db.close();
+					reject(failure || tx.error || new Error("program storage transaction aborted"));
+				};
+				if (tx.durability !== "strict") {
+					throw new Error("strict IndexedDB durability is unavailable");
+				}
+				const bytesEqual = (a, b) =>
+					a.length === b.length && Array.from(a).every((v, i) => v === b[i]);
+				const sameRecord = (a, b) => a == null || b == null ? a == null && b == null :
+					a.partition === b.partition && bytesEqual(a.pk, b.pk) &&
+					bytesEqual(a.data, b.data) &&
+					JSON.stringify(a.sort_key ?? null) === JSON.stringify(b.sort_key ?? null);
+				let remaining = updates.length + absent.length;
+				const writes = updates.map(update => {
+					const record = update.updated ?? update.previous;
+					return {
+						store: tx.objectStore("bark.v1." + record.partition),
+						key: Array.from(record.pk, b => b.toString(16).padStart(2, "0")).join(""),
+						update,
+					};
+				});
+				for (const [partition, pk] of absent) {
+					writes.push({
+						store: tx.objectStore("bark.v1." + partition),
+						key: Array.from(pk, b => b.toString(16).padStart(2, "0")).join(""),
+						update: { previous: null, assertion: true },
+					});
+				}
+				for (const { store, key, update } of writes) {
+					const request = store.get(key);
+					request.onsuccess = () => {
+						try {
+							if (!sameRecord(request.result, update.previous)) {
+								throw new Error("record changed during atomic update");
+							}
+							// Keep the transaction active, but do not mutate any
+							// record until every comparison succeeds.
+							if (--remaining === 0) {
+								for (const write of writes) {
+									if (write.update.assertion) continue;
+									if (write.update.updated == null) {
+										write.store.delete(write.key);
+									} else {
+										write.store.put(write.update.updated, write.key);
+									}
+								}
+							}
+						} catch (error) {
+							failure = error;
+							tx.abort();
+						}
+					};
+				}
+			} catch (error) {
+				failure = error;
+				if (tx) { tx.abort(); }
+				else { db.close(); reject(error); }
+			}
+		};
+	});
+}
+"#)]
+extern "C" {
+	#[wasm_bindgen(js_name = barkPutBatch)]
+	fn put_batch_committed(
+		name: &str,
+		version: u32,
+		partitions: JsValue,
+		updates: JsValue,
+		absent: JsValue,
+	) -> web_sys::js_sys::Promise;
+}
+
 #[cfg(target_arch = "wasm32")]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl StorageAdaptor for IndexedDbClient {
@@ -159,6 +264,35 @@ impl StorageAdaptor for IndexedDbClient {
 			store.put_kv(&key, &value).await
 		}).await?;
 
+		Ok(())
+	}
+
+	async fn put_batch_checked(
+		&mut self, updates: Vec<RecordUpdate>, absent: &[(u8, Vec<u8>)],
+	) -> anyhow::Result<()> {
+		validate_record_updates(&updates)?;
+		if updates.is_empty() && absent.is_empty() {
+			return Ok(());
+		}
+		let mut partitions = updates.iter().map(|u| Ok(partition_name(u.record()?.partition)))
+			.collect::<anyhow::Result<HashSet<_>>>()?;
+		partitions.extend(absent.iter().map(|(partition, _)| partition_name(*partition)));
+		let mut guard = self.inner().await?;
+		let inner = guard.as_mut().unwrap();
+		for partition in &partitions {
+			if !inner.partitions.contains(partition) {
+				inner.add_partition(partition).await?;
+			}
+		}
+		let promise = put_batch_committed(
+			&inner.db,
+			inner.version,
+			serde_wasm_bindgen::to_value(&partitions)?,
+			serde_wasm_bindgen::to_value(&updates)?,
+			serde_wasm_bindgen::to_value(absent)?,
+		);
+		wasm_bindgen_futures::JsFuture::from(promise).await
+			.map_err(|e| anyhow!("durable IndexedDB batch failed: {e:?}"))?;
 		Ok(())
 	}
 
@@ -271,7 +405,10 @@ mod tests {
 	use super::*;
 	use crate::persist::adaptor::StorageAdaptorWrapper;
 	use crate::persist::adaptor::test_suite;
-	use crate::persist::test_suite::bark_persister_tests;
+	use crate::persist::BarkPersister;
+	use crate::persist::test_suite::{
+		bark_persister_tests, program_key_fixture, program_recovery_fixture,
+	};
 	use wasm_bindgen_test::wasm_bindgen_test;
 
 	wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -285,6 +422,23 @@ mod tests {
 	}
 
 	bark_persister_tests!(setup);
+
+	#[wasm_bindgen_test]
+	async fn program_records_survive_reopen() {
+		let name = "bark_program_records_reopen";
+		let key = program_key_fixture();
+		let recovery = program_recovery_fixture();
+		let db = StorageAdaptorWrapper::new(IndexedDbClient::open(name).await.unwrap());
+		db.store_program_key(&key).await.unwrap();
+		db.store_program_recoveries(&[recovery.clone()]).await.unwrap();
+		drop(db);
+
+		let db = StorageAdaptorWrapper::new(IndexedDbClient::open(name).await.unwrap());
+		assert_eq!(db.get_program_key(&key.program.public_key().unwrap()).await.unwrap(), Some(key.clone()));
+		assert_eq!(db.get_public_key_idx(&key.program.public_key().unwrap()).await.unwrap(), Some(key.index));
+		assert_eq!(db.get_program_recovery(recovery.controlled_outpoint).await.unwrap(), Some(recovery.clone()));
+		assert_eq!(db.list_program_recoveries().await.unwrap(), vec![recovery]);
+	}
 
 	/// Run the full test suite against IndexedDbClient.
 	#[wasm_bindgen_test]

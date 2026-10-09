@@ -10,9 +10,11 @@ use bitcoin_ext::{fee, TaprootSpendInfoExt, P2TR_DUST};
 use crate::{musig, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, SECP};
 use crate::connectors::ConnectorChain;
 use crate::encode::{ProtocolDecodingError, ProtocolEncoding, ReadExt, WriteExt};
+use crate::musig::context::{SigningContextError, SigningInput};
 use crate::tree::signed::UnlockHash;
-use crate::vtxo::{Full, GenesisItem, GenesisTransition};
+use crate::vtxo::{Full, GenesisItem, GenesisTransition, TapScriptClause};
 use crate::vtxo::policy::HarkForfeitVtxoPolicy;
+use crate::vtxo::policy::clause::DelayedSignClause;
 use crate::vtxo::genesis::ArkoorGenesis;
 
 
@@ -106,6 +108,168 @@ fn build_internal_forfeit_vtxo(
 		server_pubkey: vtxo.server_pubkey,
 		exit_delta: vtxo.exit_delta,
 		anchor_point: vtxo.anchor_point,
+	}
+}
+
+/// Authenticated hArk forfeit signing data and the exact output a fallback claim spends.
+///
+/// The parent is deliberately unsigned: the server need not disclose its complete
+/// forfeit signature. A presigned fallback can therefore have to wait for this
+/// known parent to appear on chain; it is not a fully signed VTXO ancestor.
+pub struct HarkForfeitSigningContext {
+	vtxo_id: VtxoId,
+	user_pubkey: PublicKey,
+	unlock_hash: UnlockHash,
+	signing_input: SigningInput,
+	recovery_outpoint: OutPoint,
+	recovery_taproot: bitcoin::taproot::TaprootSpendInfo,
+	recovery_clause: DelayedSignClause,
+}
+
+impl HarkForfeitSigningContext {
+	/// Build this context before authorizing or releasing the external user share.
+	pub fn new<G>(
+		vtxo: &Vtxo<G>,
+		unlock_hash: UnlockHash,
+	) -> Result<Self, SigningContextError> {
+		let tx = create_hark_forfeit_tx(vtxo, unlock_hash, None);
+		let recovery_outpoint = OutPoint::new(tx.compute_txid(), 0);
+		let signing_input = SigningInput::key_spend(
+			tx, 0, vec![vtxo.txout()], &vtxo.output_taproot(),
+			vec![vtxo.user_pubkey(), vtxo.server_pubkey()],
+		)?;
+		let policy = HarkForfeitVtxoPolicy { user_pubkey: vtxo.user_pubkey(), unlock_hash };
+		Ok(Self {
+			vtxo_id: vtxo.id(),
+			user_pubkey: vtxo.user_pubkey(),
+			unlock_hash,
+			signing_input,
+			recovery_outpoint,
+			recovery_taproot: policy.taproot(vtxo.server_pubkey(), vtxo.exit_delta()),
+			recovery_clause: policy.user_exit_clause(vtxo.exit_delta()),
+		})
+	}
+
+	pub fn signing_input(&self) -> &SigningInput {
+		&self.signing_input
+	}
+
+	/// The exact parent transaction, without the server's unknown final signature.
+	pub fn unsigned_parent(&self) -> &Transaction {
+		&self.signing_input.psbt.unsigned_tx
+	}
+
+	pub fn recovery_outpoint(&self) -> OutPoint {
+		self.recovery_outpoint
+	}
+
+	pub fn recovery_txout(&self) -> &TxOut {
+		&self.unsigned_parent().output[0]
+	}
+
+	pub fn recovery_taproot(&self) -> &bitcoin::taproot::TaprootSpendInfo {
+		&self.recovery_taproot
+	}
+
+	pub fn recovery_clause(&self) -> &DelayedSignClause {
+		&self.recovery_clause
+	}
+
+	/// Authenticate a delayed fallback claim against the unsigned forfeit parent.
+	///
+	/// `participants` are the untweaked signers of the user's ownership key
+	/// (for program ownership, U and S), not the server's forfeit cosigners.
+	pub fn recovery_signing_input(
+		&self,
+		tx: Transaction,
+		mut participants: Vec<PublicKey>,
+	) -> Result<SigningInput, SigningContextError> {
+		if tx.input.len() != 1 || tx.input[0].previous_output != self.recovery_outpoint
+			|| tx.input[0].sequence != self.recovery_clause.sequence() || tx.version.0 < 2
+		{
+			return Err(SigningContextError::InvalidContext("incorrect hArk fallback input"));
+		}
+		if participants.is_empty()
+			|| musig::combine_keys(participants.iter().copied()).x_only_public_key().0
+				!= self.user_pubkey.x_only_public_key().0
+		{
+			return Err(SigningContextError::InvalidContext("incorrect hArk fallback signing keys"));
+		}
+		let script = self.recovery_clause.tapscript();
+		let version = bitcoin::taproot::LeafVersion::TapScript;
+		let control = self.recovery_taproot.control_block(&(script.clone(), version))
+			.ok_or(SigningContextError::InvalidContext("missing hArk fallback control block"))?;
+		let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx)
+			.map_err(|_| SigningContextError::InvalidContext("invalid unsigned hArk fallback"))?;
+		psbt.inputs[0].witness_utxo = Some(self.recovery_txout().clone());
+		psbt.inputs[0].non_witness_utxo = Some(self.unsigned_parent().clone());
+		psbt.inputs[0].tap_internal_key = Some(self.recovery_taproot.internal_key());
+		psbt.inputs[0].tap_merkle_root = self.recovery_taproot.merkle_root();
+		psbt.inputs[0].tap_scripts.insert(control, (script.clone(), version));
+		participants.sort_by_key(|key| key.serialize());
+		let input = SigningInput {
+			psbt, input_index: 0,
+			script_leaf: Some(bitcoin::taproot::TapLeafHash::from_script(&script, version)),
+			participants, tweak: None,
+		};
+		input.sighash()?;
+		Ok(input)
+	}
+
+	/// Complete a fallback claim; its unsigned parent may still need to appear on chain.
+	pub fn finalize_recovery(
+		&self,
+		tx: Transaction,
+		participants: Vec<PublicKey>,
+		signature: schnorr::Signature,
+	) -> Result<Transaction, SigningContextError> {
+		let input = self.recovery_signing_input(tx, participants)?;
+		input.verify_signature(&signature)?;
+		let script = self.recovery_clause.tapscript();
+		let control = self.recovery_taproot
+			.control_block(&(script, bitcoin::taproot::LeafVersion::TapScript))
+			.ok_or(SigningContextError::InvalidContext("missing hArk fallback control block"))?;
+		let mut tx = input.psbt.unsigned_tx;
+		tx.input[0].witness = self.recovery_clause.witness(&signature, &control);
+		Ok(tx)
+	}
+
+	/// Validate an external aggregate user share before constructing the wire bundle.
+	pub fn assemble(
+		&self,
+		user_nonce: musig::PublicNonce,
+		user_share: musig::PartialSignature,
+		server_nonce: &musig::PublicNonce,
+	) -> Result<HashLockedForfeitBundle, SigningContextError> {
+		let tweak = self.signing_input.tweak
+			.ok_or(SigningContextError::InvalidContext("missing forfeit taproot tweak"))?;
+		let (key_agg, _) = musig::tweaked_key_agg(
+			self.signing_input.participants.iter().copied(), tweak,
+		);
+		let session = musig::Session::new(
+			&key_agg, musig::nonce_agg(&[&user_nonce, server_nonce]),
+			&self.signing_input.sighash()?,
+		);
+		if !session.partial_verify(
+			&key_agg, &user_share, &user_nonce, musig::pubkey_to(self.user_pubkey),
+		) {
+			return Err(SigningContextError::InvalidSignature);
+		}
+		Ok(HashLockedForfeitBundle {
+			vtxo_id: self.vtxo_id, unlock_hash: self.unlock_hash,
+			user_nonce, part_sig: user_share,
+		})
+	}
+
+	/// Attach a known, verified final signature without inventing a signed ancestor.
+	pub fn signed_parent(
+		&self,
+		signature: schnorr::Signature,
+	) -> Result<Transaction, SigningContextError> {
+		self.signing_input.verify_signature(&signature)?;
+		let mut tx = self.unsigned_parent().clone();
+		tx.input[0].witness = Witness::from_slice(&[&signature[..]]);
+		Ok(tx)
 	}
 }
 
@@ -370,6 +534,24 @@ mod test {
 	) {
 		let unlock_hash = UnlockHash::hash(&unlock_preimage);
 		assert_eq!(Ok(()), bundle.verify(vtxo, server_pub_nonce));
+		let external = HarkForfeitSigningContext::new(vtxo, unlock_hash).unwrap();
+		assert_eq!(
+			external.signing_input().sighash().unwrap(),
+			hark_forfeit_sighash(vtxo, unlock_hash).0.to_byte_array(),
+		);
+		assert_eq!(external.unsigned_parent(), &create_hark_forfeit_tx(vtxo, unlock_hash, None));
+		assert_eq!(external.recovery_outpoint(), OutPoint::new(external.unsigned_parent().compute_txid(), 0));
+		assert_eq!(external.recovery_txout(), &external.unsigned_parent().output[0]);
+		assert!(external.unsigned_parent().input[0].witness.is_empty());
+		assert_eq!(
+			external.assemble(bundle.user_nonce, bundle.part_sig, server_pub_nonce).unwrap(),
+			bundle,
+		);
+		let (_, wrong_nonce) = musig::nonce_pair(&VTXO_VECTORS.server_key);
+		assert_eq!(
+			external.assemble(bundle.user_nonce, bundle.part_sig, &wrong_nonce).err(),
+			Some(SigningContextError::InvalidSignature),
+		);
 
 		// finish it which triggers debug asserts on partial sigs
 		let (sig, tx, _vtxo) = bundle.finish(vtxo, server_pub_nonce, server_sec_nonce, &VTXO_VECTORS.server_key);
@@ -386,6 +568,7 @@ mod test {
 		let ff_input = vtxo.txout();
 		let ff_tx_expected = create_hark_forfeit_tx(vtxo, unlock_hash, Some(&sig));
 		assert_eq!(ff_tx_expected, tx);
+		assert_eq!(external.signed_parent(sig).unwrap(), tx);
 		verify_tx(&[ff_input], 0, &ff_tx_expected).expect("forfeit tx error");
 		assert_eq!(ff_tx_expected.compute_txid(), ff_point.txid);
 	}
@@ -437,5 +620,46 @@ mod test {
 
 		println!("verifying hard-coded forfeits");
 		verify_hark_forfeits(vtxo, unlock_preimage, server_sec_nonce, &server_pub_nonce, bundle);
+	}
+
+	#[test]
+	fn external_hark_recovery_keeps_unknown_parent_unsigned() {
+		let user_key = &VTXO_VECTORS.arkoor3_user_key;
+		let program_key = Keypair::from_seckey_slice(&SECP, &[3; 32]).unwrap();
+		let participants = vec![user_key.public_key(), program_key.public_key()];
+		// A bare fixture needs no alleged signed history for the group-owned output.
+		let mut vtxo = VTXO_VECTORS.arkoor3_vtxo.to_bare();
+		vtxo.policy = crate::VtxoPolicy::new_pubkey(musig::combine_keys(participants.iter().copied()));
+		let ctx = HarkForfeitSigningContext::new(&vtxo, UnlockHash::hash(&[42; 32])).unwrap();
+		let claim = Transaction {
+			version: bitcoin::transaction::Version(3),
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: ctx.recovery_outpoint(),
+				sequence: ctx.recovery_clause().sequence(),
+				script_sig: ScriptBuf::new(),
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: vtxo.amount() - Amount::from_sat(1_000),
+				script_pubkey: ScriptBuf::new_p2tr(&SECP, user_key.x_only_public_key().0, None),
+			}],
+		};
+		let input = ctx.recovery_signing_input(claim.clone(), participants.clone()).unwrap();
+		assert_eq!(input.psbt.inputs[0].non_witness_utxo.as_ref(), Some(ctx.unsigned_parent()));
+		let signature = musig::cosign_both(user_key, &program_key, input.sighash().unwrap(), None);
+		let signed = ctx.finalize_recovery(claim.clone(), participants.clone(), signature).unwrap();
+		verify_tx(&[ctx.recovery_txout().clone()], 0, &signed).unwrap();
+		assert!(ctx.unsigned_parent().input[0].witness.is_empty());
+
+		let mut wrong_parent = claim.clone();
+		wrong_parent.input[0].previous_output.vout = 1;
+		assert!(ctx.recovery_signing_input(wrong_parent, participants.clone()).is_err());
+		let mut premature = claim.clone();
+		premature.input[0].sequence = Sequence::ZERO;
+		assert!(ctx.recovery_signing_input(premature, participants.clone()).is_err());
+		let mut redirected = claim;
+		redirected.output[0].value -= Amount::ONE_SAT;
+		assert!(ctx.finalize_recovery(redirected, participants, signature).is_err());
 	}
 }

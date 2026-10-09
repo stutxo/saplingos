@@ -3,7 +3,7 @@ use std::convert::Infallible;
 
 use bitcoin::{Transaction, Txid};
 use bitcoin::amount::CheckedSum;
-use bitcoin::secp256k1::Keypair;
+use bitcoin::secp256k1::{schnorr, Keypair};
 
 use crate::{Vtxo, VtxoId, VtxoPolicy, ServerVtxo, Amount};
 use crate::arkoor::ArkoorDestination;
@@ -12,6 +12,8 @@ use crate::arkoor::{
 	ArkoorSigningError, ArkoorCosignRequest,
 };
 use crate::vtxo::Full;
+use crate::attestations::ArkoorCosignAttestation;
+use crate::musig::{self, context::{SigningContextError, SigningInput}};
 
 
 /// A builder struct for creating arkoor packages
@@ -105,6 +107,22 @@ pub struct ArkoorPackageCosignResponse {
 }
 
 impl ArkoorPackageBuilder<state::Initial> {
+	/// Supply one ordered nonce vector per input builder.
+	pub fn with_external_nonces(
+		self,
+		nonces: Vec<Vec<musig::PublicNonce>>,
+	) -> Result<ArkoorPackageBuilder<state::ExternalNonces>, ArkoorSigningError> {
+		if nonces.len() != self.builders.len() {
+			return Err(ArkoorSigningError::InvalidNbPackages {
+				expected: self.builders.len(), got: nonces.len(),
+			});
+		}
+		let builders = self.builders.into_iter().zip(nonces)
+			.map(|(builder, nonces)| builder.with_external_nonces(nonces))
+			.collect::<Result<_, _>>()?;
+		Ok(ArkoorPackageBuilder { builders })
+	}
+
 	/// Allocate outputs to inputs with splitting support
 	///
 	/// Distributes outputs across inputs in order, splitting outputs when needed
@@ -377,6 +395,55 @@ impl ArkoorPackageBuilder<state::UserGeneratedNonces> {
 
 }
 
+impl ArkoorPackageBuilder<state::ExternalNonces> {
+	/// Attestations follow input-builder order; each covers normal then isolated outputs.
+	pub fn cosign_request_with_attestations(
+		&self,
+		attestations: Vec<ArkoorCosignAttestation>,
+	) -> Result<ArkoorPackageCosignRequest<Vtxo<Full>>, ArkoorSigningError> {
+		if attestations.len() != self.builders.len() {
+			return Err(ArkoorSigningError::InvalidNbAttestations {
+				expected: self.builders.len(), got: attestations.len(),
+			});
+		}
+		let requests = self.builders.iter().zip(attestations)
+			.map(|(builder, attestation)| builder.cosign_request_with_attestation(attestation))
+			.collect::<Result<_, _>>()?;
+		Ok(ArkoorPackageCosignRequest { requests })
+	}
+
+	pub fn verify_cosign_response(
+		&self,
+		response: &ArkoorPackageCosignResponse,
+	) -> Result<(), ArkoorSigningError> {
+		if response.responses.len() != self.builders.len() {
+			return Err(ArkoorSigningError::InvalidNbPackages {
+				expected: self.builders.len(), got: response.responses.len(),
+			});
+		}
+		for (builder, response) in self.builders.iter().zip(&response.responses) {
+			builder.verify_cosign_response(response)?;
+		}
+		Ok(())
+	}
+
+	/// Each signature vector follows that input builder's signing context order.
+	pub fn finish_external(
+		self,
+		signatures: Vec<Vec<schnorr::Signature>>,
+	) -> Result<ArkoorPackageBuilder<state::UserSigned>, ArkoorSigningError> {
+		if signatures.len() != self.builders.len() {
+			return Err(ArkoorSigningError::InvalidNbPackages {
+				expected: self.builders.len(), got: signatures.len(),
+			});
+		}
+		let builders = self.builders.into_iter().zip(signatures)
+			.map(|(builder, signatures)| builder.finish_external(signatures))
+			.collect::<Result<_, _>>()?;
+		Ok(ArkoorPackageBuilder { builders })
+	}
+}
+
 impl ArkoorPackageBuilder<state::UserSigned> {
 	pub fn build_signed_vtxos(self) -> Vec<Vtxo<Full>> {
 		self.builders.into_iter()
@@ -438,6 +505,11 @@ impl ArkoorPackageBuilder<state::ServerSigned> {
 }
 
 impl<S: state::BuilderState> ArkoorPackageBuilder<S> {
+	/// Owned contexts grouped by input, with each group in nonce/signature order.
+	pub fn signing_inputs(&self) -> Result<Vec<Vec<SigningInput>>, SigningContextError> {
+		self.builders.iter().map(|builder| builder.signing_inputs()).collect()
+	}
+
 	/// Access the input VTXO IDs
 	pub fn input_ids<'a>(&'a self) -> impl Iterator<Item = VtxoId> + Clone + 'a {
 		self.builders.iter().map(|b| b.input().id())
@@ -521,6 +593,32 @@ mod test {
 			user_keypair: alice_keypair(),
 			server_keypair: server_keypair()
 		}.build()
+	}
+
+	#[test]
+	fn external_package_rejects_truncated_input_vectors() {
+		let (_, input) = dummy_vtxo_for_amount(Amount::from_sat(1000));
+		let build = || ArkoorPackageBuilder::new_single_output_with_checkpoints(
+			[input.clone()],
+			ArkoorDestination {
+				total_amount: Amount::from_sat(1000),
+				policy: VtxoPolicy::new_pubkey(bob_public_key()),
+			},
+			VtxoPolicy::new_pubkey(alice_public_key()),
+		).unwrap();
+		assert!(matches!(build().with_external_nonces(vec![]),
+			Err(ArkoorSigningError::InvalidNbPackages { .. })));
+		let contexts = build().signing_inputs().unwrap();
+		let nonces = contexts.iter().map(|inputs| inputs.iter().map(|context| {
+			musig::nonce_pair_with_msg(&alice_keypair(), &context.sighash().unwrap()).1
+		}).collect()).collect();
+		let external = build().with_external_nonces(nonces).unwrap();
+		assert!(matches!(external.cosign_request_with_attestations(vec![]),
+			Err(ArkoorSigningError::InvalidNbAttestations { .. })));
+		assert!(matches!(external.verify_cosign_response(&ArkoorPackageCosignResponse { responses: vec![] }),
+			Err(ArkoorSigningError::InvalidNbPackages { .. })));
+		assert!(matches!(external.finish_external(vec![]),
+			Err(ArkoorSigningError::InvalidNbPackages { .. })));
 	}
 
 	fn verify_package_builder(

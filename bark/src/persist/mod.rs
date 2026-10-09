@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bitcoin::bip32::Fingerprint;
-use bitcoin::{Amount, Transaction, Txid};
+use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
@@ -45,7 +45,8 @@ use crate::WalletProperties;
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
 use crate::exit::{ExitTxOrigin, ExitStateKind};
 use crate::persist::models::{
-	PaidInvoice, RoundStateId, SettledLightningReceive, StoredExit, StoredRoundState, Unlocked,
+	PaidInvoice, ProgramRecoveryRecord, RoundStateId, SerdeProgramKey, SettledLightningReceive,
+	StoredExit, StoredRoundState, Unlocked,
 };
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::movement::update::MovementUpdate;
@@ -308,6 +309,10 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// This operation is idempotent: if a VTXO already exists (same `id`), the
 	/// implementation should succeed without modifying the existing VTXO or its
 	/// state. This allows safe retries during crash recovery scenarios.
+	/// Recovery takeover is an exception to live-state retries: inserting or
+	/// reimporting Spendable/Locked data must atomically reject its own reserved
+	/// outpoint and reserved non-Spent ancestors. Historical Spent ancestry does
+	/// not block a disjoint sibling. Terminal replay retains existing bytes/state.
 	///
 	/// # Parameters
 	/// - `vtxos`: Slice of VTXO and state pairs to store.
@@ -424,6 +429,59 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// - Returns an error if the mapping cannot be stored.
 	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()>;
 
+	/// Atomically reserve the VTXO key index for the aggregate program public key
+	/// and durably store its immutable descriptor. An exact retry is idempotent;
+	/// changing any descriptor field or an existing key mapping is an error.
+	async fn store_program_key(&self, record: &SerdeProgramKey) -> anyhow::Result<()>;
+
+	/// Look up a program descriptor by its aggregate public key.
+	async fn get_program_key(&self, public_key: &PublicKey)
+		-> anyhow::Result<Option<SerdeProgramKey>>;
+
+	/// Look up immutable program ownership by its reserved derivation index.
+	async fn get_program_key_by_index(&self, index: u32)
+		-> anyhow::Result<Option<SerdeProgramKey>>;
+
+	/// List all persisted program descriptors.
+	async fn list_program_keys(&self) -> anyhow::Result<Vec<SerdeProgramKey>>;
+
+	/// Durably commit a batch of wallet-verified recovery records atomically.
+	///
+	/// Claims, prevouts and program keys are immutable per controlled outpoint.
+	/// Only compatible additional ancestor witnesses may be merged. Conflicting
+	/// records abort the entire batch. Storage does not validate signatures or
+	/// establish recovery readiness.
+	async fn store_program_recoveries(&self, records: &[ProgramRecoveryRecord])
+		-> anyhow::Result<()>;
+
+	/// Retrieve raw recovery data; the wallet must verify it before use.
+	async fn get_program_recovery(&self, outpoint: OutPoint)
+		-> anyhow::Result<Option<ProgramRecoveryRecord>>;
+
+	/// List raw recovery data without asserting recovery readiness.
+	async fn list_program_recoveries(&self) -> anyhow::Result<Vec<ProgramRecoveryRecord>>;
+
+	/// Atomically take over exactly the observed positions for immutable recovery.
+	/// Compare each full state (including lock holder), or absence, with `inputs`.
+	/// Any mismatch aborts everything. Existing Spendable/Locked rows become Exited;
+	/// Spent/Exited rows stay unchanged. Persist permanent reservation keys for
+	/// every input, including missing future outputs, and every supplied actor
+	/// or superseded-position key. Actor guards must be held by the caller
+	/// throughout selection and this commit. Keep checkpoints, signed bytes and
+	/// preimages; this is not cancellation. All live-state writes and imports
+	/// must enforce these tombstones in the same transaction/read-set as their write.
+	async fn reserve_program_recovery(
+		&self,
+		inputs: &[(VtxoId, Option<VtxoState>)],
+		actors: &[String],
+	) -> anyhow::Result<()>;
+
+	/// Whether recovery permanently took over this actor or VTXO. Keys come from
+	/// [`models::recovery_action_key`], [`models::recovery_round_key`],
+	/// [`models::recovery_vtxo_key`] or [`models::recovery_superseded_key`].
+	/// No operation may remove these tombstones.
+	async fn has_program_recovery_reservation(&self, key: &str) -> anyhow::Result<bool>;
+
 	/// Get the last revealed/used [Vtxo] key index.
 	///
 	/// Returns:
@@ -501,6 +559,15 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		id: &WalletActionId,
 	) -> anyhow::Result<()>;
+
+	/// Atomically remove a terminal action checkpoint and release only VTXOs
+	/// locked by that same action. Commit both changes durably or neither.
+	///
+	/// The caller must hold the action's lock and prove that its remaining
+	/// reservations are safe to reuse. Keep signed outputs and recovery records.
+	/// If the checkpoint is missing, succeed only when no locks remain for the
+	/// action; otherwise reject the ambiguous orphaned reservations.
+	async fn finish_wallet_action(&self, id: &WalletActionId) -> anyhow::Result<()>;
 
 	/// Record a settled outgoing lightning send.
 	///
@@ -649,6 +716,7 @@ pub trait BarkPersister: Send + Sync + 'static {
 	/// Any other current state (already Spendable, Locked by a different
 	/// holder, Spent, Exited) is a no-op, so calling this repeatedly is
 	/// equivalent to calling it once.
+	/// A matching lock must not be released if recovery reserved the VTXO.
 	async fn release_vtxo_lock(
 		&self,
 		vtxo_id: VtxoId,

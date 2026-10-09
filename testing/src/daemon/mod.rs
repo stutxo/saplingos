@@ -5,6 +5,7 @@ pub mod electrs;
 pub mod lightningd;
 pub mod postgres;
 pub mod tor;
+pub mod sapio;
 pub mod watchmand;
 
 use std::fs;

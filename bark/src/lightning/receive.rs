@@ -6,6 +6,7 @@ use log::{error, info, warn};
 use server_rpc::protos;
 
 use ark::lightning::{Bolt11InvoiceExt, Preimage, PaymentHash};
+use ark::{Vtxo, vtxo::Full};
 
 use crate::Wallet;
 use crate::actions::{DriveMode, WalletAction};
@@ -15,9 +16,48 @@ use crate::actions::lightning::receive::{
 };
 use crate::movement::MovementStatus;
 use crate::movement::update::MovementUpdate;
-use crate::vtxo::VtxoStateKind;
+use crate::persist::BarkPersister;
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 impl Wallet {
+	/// Native HTLCs use the ordinary exit tracker. Program HTLCs can only use
+	/// their saved, policy-authorized claims; never request a native C keypair.
+	/// A durable program takeover hands progression to recovery-only background sync.
+	/// Caller must own `action_id`'s driver guard for the complete operation.
+	pub(crate) async fn exit_lightning_vtxos(&self, vtxos: &[Vtxo<Full>], action_id: &str) -> anyhow::Result<()> {
+		self.ensure_program_recoveries(vtxos).await?;
+		let mut native = Vec::new();
+		let mut program = Vec::new();
+		for vtxo in vtxos {
+			if self.vtxo_signing_key(vtxo).await?.program().is_some() {
+				program.push(vtxo.point());
+			} else {
+				adopt_native_lightning_exit(self.inner.db.as_ref(), vtxo, action_id).await?;
+				native.push(vtxo.to_bare());
+			}
+		}
+		if !native.is_empty() {
+			self.inner.exit.start_exit_for_vtxos(&native).await?;
+		}
+		if !program.is_empty() {
+			let result = self.recover_program_vtxos_with_action_guard(&program, None, action_id).await;
+			match result {
+				Ok(_) => {},
+				Err(error) => {
+					// Reservation precedes chain I/O. A failed first broadcast does
+					// not give the cooperative actor permission to run again.
+					if !self.inner.db.has_program_recovery_reservation(
+						&crate::persist::models::recovery_action_key(action_id),
+					).await? {
+						return Err(error);
+					}
+					warn!("Program Lightning recovery handed off; background sync will retry: {error:#}");
+				},
+			}
+		}
+		Ok(())
+	}
+
 	/// Returns every in-progress lightning receive checkpoint, newest first.
 	pub async fn pending_lightning_receives(&self) -> anyhow::Result<Vec<LightningReceive>> {
 		let mut result = Vec::new();
@@ -189,7 +229,7 @@ impl Wallet {
 						warn!("server did not cancel lightning receive {}: {}", hash, e);
 					}
 				}
-				self.stop_wallet_action(&key).await?;
+				self.stop_wallet_action_with_guard(&key, _guard.as_ref()).await?;
 				Ok(())
 			},
 			Progress::HtlcsReady(_) => {
@@ -202,17 +242,11 @@ impl Wallet {
 		}
 	}
 
-	/// Fall back to exiting a stuck lightning receive's HTLC vtxos on-chain.
+	/// Fall back to an on-chain exit after preimage disclosure.
 	///
-	/// Once the preimage has been revealed, a failed claim leaves the receive
-	/// pending rather than auto-exiting (see [`Progress::PreimageRevealed`]).
-	/// This lets the caller explicitly publish the preimage on-chain by
-	/// exiting the HTLC vtxos, finishing the receive as failed.
-	///
-	/// Preconditions:
-	/// - the preimage must already have been revealed (the receive is in
-	///   [`Progress::PreimageRevealed`]);
-	/// - the HTLC vtxos must still be present.
+	/// A local [`Progress::Delivering`] receive exits its exact signed claim
+	/// successors, even when registration failed before inventory insertion.
+	/// External delivery cannot be redirected into an exit by this wallet.
 	pub async fn attempt_lightning_receive_exit(
 		&self,
 		payment: impl Into<PaymentHash>,
@@ -222,20 +256,25 @@ impl Wallet {
 		// Don't fight a live drive of the same action.
 		let _guard = self.inner.lock_manager.try_lock(&key).await
 			.context("receive operation already in progress for this payment")?;
+		if self.inner.db.has_program_recovery_reservation(
+			&crate::persist::models::recovery_action_key(&key),
+		).await? {
+			// The recovery-only continuation owns this checkpoint now.
+			return Ok(());
+		}
 
 		let recv = self.lightning_receive_checkpoint(hash).await?
 			.context("no pending lightning receive found for this payment hash")?;
 
-		let htlcs = match &recv.progress {
-			Progress::PreimageRevealed(htlcs) => htlcs,
-			_ => bail!("preimage must be revealed before attempting to exit"),
-		};
+		self.exit_lightning_receive_with_guard(&recv).await?;
 
-		self.exit_lightning_receive_htlcs(&recv, htlcs).await?;
-
-		// The receive is now terminal: release any locks and drop the
-		// checkpoint row.
-		self.stop_wallet_action(&key).await?;
+		// Native exit tracking or the recovery-only handoff is now durable.
+		// Retain a taken-over checkpoint for recovery continuation.
+		if !self.inner.db.has_program_recovery_reservation(
+			&crate::persist::models::recovery_action_key(&key),
+		).await? {
+			self.finish_wallet_action_with_guard(&key, _guard.as_ref()).await?;
+		}
 		Ok(())
 	}
 
@@ -249,19 +288,68 @@ impl Wallet {
 		recv: &LightningReceive,
 		htlcs: &Htlcs,
 	) -> anyhow::Result<()> {
+		let id = recv.id();
+		let _guard = self.inner.lock_manager.try_lock(&id).await
+			.context("receive operation already in progress for this payment")?;
+		if self.inner.db.has_program_recovery_reservation(
+			&crate::persist::models::recovery_action_key(&id),
+		).await? {
+			return Ok(());
+		}
+		let current = self.lightning_receive_checkpoint(recv.payment_hash).await?
+			.context("receive checkpoint no longer exists")?;
+		ensure!(current == *recv, "receive checkpoint changed; reload before exiting");
+		self.exit_lightning_receive_htlcs_with_guard(&current, htlcs).await
+	}
+
+	pub(crate) async fn exit_lightning_receive_with_guard(
+		&self, recv: &LightningReceive,
+	) -> anyhow::Result<()> {
+		match &recv.progress {
+			Progress::PreimageRevealed(htlcs) => {
+				self.exit_lightning_receive_htlcs_with_guard(recv, htlcs).await
+			},
+			Progress::Delivering(delivery) => {
+				if let Some(destination) = &recv.claim_destination {
+					ensure!(self.signing_key(&destination.policy().user_pubkey()).await?.is_some(),
+						"cannot exit externally owned receive successors");
+				}
+				ensure!(!delivery.vtxos.is_empty(), "receive has no saved claim successors");
+				for vtxo in &delivery.vtxos {
+					ensure!(self.signing_key(&vtxo.user_pubkey()).await?.is_some(),
+						"cannot exit externally owned receive successor");
+				}
+				self.mark_vtxos_as_spent(&delivery.input_vtxo_ids).await?;
+				self.exit_lightning_vtxos(&delivery.vtxos, &recv.id()).await?;
+				self.inner.movements.finish_movement_with_update(
+					delivery.movement_id, MovementStatus::Failed,
+					MovementUpdate::new().exited_vtxos(&delivery.vtxos),
+				).await?;
+				let amount = recv.invoice.get_payment_amount(None).unwrap_or(Amount::ZERO);
+				self.inner.db.record_settled_lightning_receive(
+					recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+				).await?;
+				Ok(())
+			},
+			_ => bail!("preimage must be revealed before attempting to exit"),
+		}
+	}
+
+	async fn exit_lightning_receive_htlcs_with_guard(
+		&self, recv: &LightningReceive, htlcs: &Htlcs,
+	) -> anyhow::Result<()> {
+		ensure!(matches!(&recv.progress, Progress::PreimageRevealed(saved) if saved == htlcs),
+			"cannot exit superseded or undisclosed receive HTLCs");
 		warn!("Exiting HTLC VTXOs for lightning receive {}", recv.payment_hash);
 
-		let mut vtxos = Vec::with_capacity(htlcs.vtxo_ids.len());
-		for id in htlcs.vtxo_ids.iter() {
-			vtxos.push(self.get_vtxo_by_id(*id).await?.vtxo);
-		}
-		let vtxo_refs = vtxos.iter().collect::<Vec<_>>();
-		self.inner.exit.start_exit_for_vtxos(&vtxo_refs).await?;
+		let vtxos = self.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await
+			.context("failed to hydrate lightning receive exit inputs")?;
+		self.exit_lightning_vtxos(&vtxos, &recv.id()).await?;
 
 		self.inner.movements.finish_movement_with_update(
 			htlcs.movement_id,
 			MovementStatus::Failed,
-			MovementUpdate::new().exited_vtxos(vtxo_refs),
+			MovementUpdate::new().exited_vtxos(&vtxos),
 		).await?;
 
 		// We only exit once the preimage has been revealed (Claiming phase), so
@@ -334,5 +422,77 @@ impl Wallet {
 		}
 
 		Ok(claimed)
+	}
+}
+
+/// Persist exact signed native successors before the exit tracker reads genesis.
+/// `Exited` also preserves the exit intent across a crash before tracker insertion;
+/// cooperative completion must not make these outputs spendable again.
+async fn adopt_native_lightning_exit(
+	db: &dyn BarkPersister, vtxo: &Vtxo<Full>, action_id: &str,
+) -> anyhow::Result<()> {
+	if let Some(saved) = db.get_full_vtxo(vtxo.id()).await? {
+		ensure!(saved == *vtxo, "saved Lightning exit successor differs from inventory");
+	} else {
+		db.store_vtxos(&[(vtxo, &VtxoState::Exited)]).await?;
+	}
+	let state = db.get_wallet_vtxo(vtxo.id()).await?.context("missing Lightning exit inventory")?.state;
+	if state == VtxoState::Exited { return Ok(()); }
+	let holder = VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: action_id.to_owned() }),
+	};
+	// Locking checks the holder as well as the state, so another action cannot
+	// lose an output that became spendable before this exit attempt.
+	db.update_vtxo_state_checked(vtxo.id(), holder, &[VtxoStateKind::Spendable]).await?;
+	db.update_vtxo_state_checked(vtxo.id(), VtxoState::Exited, &[VtxoStateKind::Locked]).await?;
+	Ok(())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use ark::test_util::VTXO_VECTORS;
+
+	use crate::persist::adaptor::StorageAdaptorWrapper;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn native_lightning_exit_adopts_saved_signed_successor_before_tracker() {
+		let db = StorageAdaptorWrapper::new_memory();
+		let successor = &VTXO_VECTORS.arkoor3_vtxo;
+		assert!(db.get_full_vtxo(successor.id()).await.unwrap().is_none());
+		adopt_native_lightning_exit(&db, successor, "ln_recv.signed").await.unwrap();
+		assert_eq!(db.get_full_vtxo(successor.id()).await.unwrap().as_ref(), Some(successor));
+		assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+		// Replay after a crash before native tracker insertion preserves both
+		// the complete genesis/witness and the non-spendable exit intent.
+		adopt_native_lightning_exit(&db, successor, "ln_recv.signed").await.unwrap();
+		assert_eq!(db.get_full_vtxo(successor.id()).await.unwrap().as_ref(), Some(successor));
+		assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+		assert!(db.get_full_vtxo(VTXO_VECTORS.arkoor_htlc_out_vtxo.id()).await.unwrap().is_none());
+	}
+
+	#[tokio::test]
+	async fn native_lightning_exit_does_not_take_another_action_or_spent_successor() {
+		let successor = &VTXO_VECTORS.arkoor3_vtxo;
+		for state in [
+			VtxoState::Spendable,
+			VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: "ln_pay.signed".into() }) },
+			VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: "another".into() }) },
+			VtxoState::Spent,
+		] {
+			let db = StorageAdaptorWrapper::new_memory();
+			db.store_vtxos(&[(successor, &state)]).await.unwrap();
+			let allowed = state == VtxoState::Spendable || matches!(
+				&state, VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id }) }
+					if id == "ln_pay.signed"
+			);
+			assert_eq!(adopt_native_lightning_exit(&db, successor, "ln_pay.signed").await.is_ok(), allowed);
+			assert_eq!(db.get_full_vtxo(successor.id()).await.unwrap().as_ref(), Some(successor));
+			assert_eq!(
+				db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state,
+				if allowed { VtxoState::Exited } else { state },
+			);
+		}
 	}
 }

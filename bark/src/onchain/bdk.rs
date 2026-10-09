@@ -9,7 +9,7 @@ use bdk_wallet::Wallet as BdkWallet;
 use bdk_wallet::coin_selection::DefaultCoinSelectionAlgorithm;
 use bdk_wallet::{Balance, KeychainKind, LocalOutput, TxBuilder, TxOrdering};
 use bitcoin::{
-	Address, Amount, FeeRate, Network, Psbt, Script, Sequence, Transaction, TxOut,
+	Address, Amount, FeeRate, Network, OutPoint, Psbt, Script, Sequence, Transaction, TxOut,
 	Txid, Weight, bip32, psbt,
 };
 use log::{debug, error, info, trace, warn};
@@ -20,6 +20,7 @@ use bitcoin_ext::bdk::{CpfpInternalError, WalletExt};
 use bitcoin_ext::cpfp::CpfpError;
 
 use crate::Wallet;
+use crate::actions::board::{Progress as BoardProgress, psbt_is_finalized};
 use crate::chain::{ChainSource, ChainSourceClient};
 use crate::exit::{ExitVtxo, ExitState};
 use crate::onchain::{LocalUtxo, MakeCpfpFees, Utxo, OnchainWalletTrait, WalletTxInfo};
@@ -34,8 +35,8 @@ const GENESIS_HEIGHT: BlockHeight = BlockHeight::ZERO;
 ///
 /// A tx is marked seen (`apply_unconfirmed_txs`) as soon as it's signed, not
 /// once it's actually reached the node: e.g. a board's funding tx is applied
-/// locally in `finish_psbt`, then only broadcast after a cosign round-trip
-/// with the Ark server. Without this grace period, a sync landing in that gap
+/// locally in `finish_psbt` after durable recovery preparation and before its
+/// action broadcasts it. Without this grace period, a sync landing in that gap
 /// would see the tx as absent from the node's mempool and evict it, handing
 /// its inputs back to the next coin selection while the "evicted" tx is still
 /// in flight and about to land in the mempool anyway -- a self-inflicted
@@ -87,6 +88,8 @@ impl<Cs: Send + Sync> TxBuilderExt for TxBuilder<'_, Cs> {
 			// claim signer can reconstruct the spend.
 			let vtxo = wallet.inner.db.get_full_vtxo(input.id()).await?
 				.context(format!("Unable to load VTXO for exit: {}", input.id()))?;
+			ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
+				"program recovery cannot be added to a dynamic fee transaction; use Wallet::recover_program_vtxos");
 			let mut psbt_in = psbt::Input::default();
 			psbt_in.set_exit_claim_input(&vtxo);
 			psbt_in.witness_utxo = Some(TxOut {
@@ -178,6 +181,32 @@ impl OnchainWallet {
 
 		Ok(Self { inner: wallet, db })
 	}
+
+	/// Coin selection must distinguish signed funding from a published parent.
+	/// The checkpoint also reserves signed inputs if BDK evicts the transaction.
+	/// An unsigned checkpoint alone does not consume the original safe coins.
+	async fn unavailable_board_funding(&self) -> anyhow::Result<Vec<OutPoint>> {
+		let mut unavailable = Vec::new();
+		for checkpoint in self.db.get_all_wallet_action_checkpoints().await? {
+			let Some(board) = checkpoint.into_board() else { continue };
+			let funding = board.funding()?;
+			let txid = funding.compute_txid();
+			if !matches!(board.progress, BoardProgress::Confirming { .. }) {
+				unavailable.extend(funding.output.iter().enumerate()
+					.map(|(vout, _)| OutPoint::new(txid, vout as u32)));
+			}
+			// Signing may have reached BDK's durable graph before the signed
+			// checkpoint was saved. Use the graph, not only canonical txs, so
+			// an eviction cannot free those committed inputs for another send.
+			if board.funding_tx.is_some()
+				|| board.funding_psbt.as_ref().is_some_and(psbt_is_finalized)
+				|| self.inner.tx_graph().get_tx(txid).is_some()
+			{
+				unavailable.extend(funding.input.iter().map(|input| input.previous_output));
+			}
+		}
+		Ok(unavailable)
+	}
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -216,7 +245,9 @@ impl OnchainWalletTrait for OnchainWallet {
 		destinations: &[(Address, Amount)],
 		fee_rate: FeeRate,
 	) -> anyhow::Result<Psbt> {
+		let unavailable = self.unavailable_board_funding().await?;
 		let mut b = self.inner.build_tx();
+		b.unspendable(unavailable);
 		b.ordering(TxOrdering::Untouched);
 		for (dest, amount) in destinations {
 			b.add_recipient(dest.script_pubkey(), *amount);
@@ -230,7 +261,9 @@ impl OnchainWalletTrait for OnchainWallet {
 		destination: Address,
 		fee_rate: FeeRate,
 	) -> anyhow::Result<Psbt> {
+		let unavailable = self.unavailable_board_funding().await?;
 		let mut b = self.inner.build_tx();
+		b.unspendable(unavailable);
 		b.drain_to(destination.script_pubkey());
 		b.fee_rate(fee_rate);
 		b.drain_wallet();
@@ -238,6 +271,18 @@ impl OnchainWalletTrait for OnchainWallet {
 	}
 
 	async fn finish_psbt(&mut self, mut psbt: Psbt) -> anyhow::Result<Psbt> {
+		// An unsigned board checkpoint may resume after the selection lock was
+		// lost in a crash. Never sign it over a newer locally signed spend, even
+		// when that spend has not reached the chain yet. Replaying this exact
+		// transaction after signing succeeded but checkpointing failed is safe.
+		let txid = psbt.unsigned_tx.compute_txid();
+		for input in &psbt.unsigned_tx.input {
+			for spend in self.inner.tx_graph().outspends(input.previous_output) {
+				ensure!(*spend == txid || self.inner.get_tx(*spend).is_none(),
+					"funding input {} is already spent by wallet transaction {}",
+					input.previous_output, spend);
+			}
+		}
 		#[allow(deprecated)]
 		let opts = bdk_wallet::SignOptions {
 			trust_witness_utxo: true,
@@ -610,5 +655,151 @@ impl OnchainWallet {
 			let _ = self.inner.take_staged();
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use bitcoin::{OutPoint, ScriptBuf, TxIn, Witness};
+	use bitcoin::hashes::Hash;
+	use bitcoin::locktime::absolute::LockTime;
+	use bitcoin::transaction::Version;
+
+	use ark::test_util::dummy::DummyTestVtxoSpec;
+
+	use crate::actions::board::Board;
+	use crate::movement::MovementId;
+	use crate::persist::adaptor::StorageAdaptorWrapper;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn resumed_board_funding_rejects_newer_spend_but_allows_exact_replay() {
+		let db = Arc::new(StorageAdaptorWrapper::new_memory());
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, [42; 64], db.clone())
+			.await.unwrap();
+		let address = wallet.address().await.unwrap();
+		let funding = Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint::new(Txid::all_zeros(), 0),
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::MAX,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(100_000),
+				script_pubkey: address.script_pubkey(),
+			}],
+		};
+		wallet.register_tx(&funding).await.unwrap();
+		let board = wallet.prepare_tx(
+			&[(address.clone(), Amount::from_sat(40_000))], FeeRate::from_sat_per_vb(1).unwrap(),
+		).await.unwrap();
+
+		// A crash leaves only the unsigned checkpoint: its old on-chain position
+		// is still spendable, and a later ordinary send may validly consume it.
+		drop(wallet);
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, [42; 64], db.clone())
+			.await.unwrap();
+		let competing = wallet.prepare_drain_tx(address, FeeRate::from_sat_per_vb(1).unwrap())
+			.await.unwrap();
+		let signed = wallet.finish_psbt(competing.clone()).await.unwrap();
+		drop(wallet);
+
+		// Resumption sees the persisted local spend before any broadcast/sync.
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, [42; 64], db)
+			.await.unwrap();
+		let error = wallet.finish_psbt(board).await.unwrap_err();
+		assert!(error.to_string().contains("already spent by wallet transaction"));
+		let replay = wallet.finish_psbt(competing).await.unwrap();
+		assert_eq!(replay.unsigned_tx, signed.unsigned_tx);
+		assert!(replay.inputs.iter().all(|input| input.final_script_witness.is_some()));
+	}
+
+	#[tokio::test]
+	async fn unpublished_board_funding_keeps_change_unavailable_and_signed_inputs_reserved() {
+		let db = Arc::new(StorageAdaptorWrapper::new_memory());
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, [43; 64], db.clone())
+			.await.unwrap();
+		let address = wallet.address().await.unwrap();
+		let funding = Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint::new(Txid::all_zeros(), 0),
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::MAX,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(100_000),
+				script_pubkey: address.script_pubkey(),
+			}],
+		};
+		wallet.register_tx(&funding).await.unwrap();
+		let fee_rate = FeeRate::from_sat_per_vb(1).unwrap();
+		let psbt = wallet.prepare_tx(
+			&[(address.clone(), Amount::from_sat(40_000))], fee_rate,
+		).await.unwrap();
+		let txid = psbt.unsigned_tx.compute_txid();
+		let original = psbt.unsigned_tx.input[0].previous_output;
+		let (_, signed_vtxo) = DummyTestVtxoSpec::default().build();
+		let mut board = Board {
+			id: format!("board.{}.0", txid),
+			funding_tx: None,
+			funding_psbt: Some(psbt.clone()),
+			vtxo_id: signed_vtxo.id(),
+			amount: signed_vtxo.amount(),
+			movement_id: MovementId(1),
+			progress: BoardProgress::PreparingFunding { signed_vtxo, sign_funding: true },
+		};
+		db.upsert_wallet_action_checkpoint(&board.id, &board.clone().into()).await.unwrap();
+
+		// Recovery preparation has not committed the original coins.
+		let safe = wallet.prepare_drain_tx(address.clone(), fee_rate).await.unwrap();
+		assert_eq!(safe.unsigned_tx.input[0].previous_output, original);
+
+		// Simulate a crash after BDK saved the signature, before the board
+		// checkpoint recorded it or the parent reached the network.
+		let signed = wallet.finish_psbt(psbt).await.unwrap();
+		drop(wallet);
+		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, [43; 64], db.clone())
+			.await.unwrap();
+		assert!(wallet.prepare_tx(
+			&[(address.clone(), Amount::from_sat(10_000))], fee_rate,
+		).await.is_err(), "unpublished board change must not fund another send");
+		assert!(wallet.prepare_drain_tx(address.clone(), fee_rate).await.is_err());
+
+		// Even after the sync grace period, eviction must not let a send
+		// compete with funding whose signatures have already been released.
+		let eviction_time = bark_runtime::timestamp_secs() + ONCHAIN_EVICTION_GRACE_SECS;
+		wallet.inner.apply_evicted_txs([(txid, eviction_time)]);
+		wallet.persist().await.unwrap();
+		assert!(wallet.inner.list_unspent().any(|utxo| utxo.outpoint == original));
+		assert!(wallet.prepare_drain_tx(address.clone(), fee_rate).await.is_err(),
+			"evicted signed funding must keep its original inputs reserved");
+
+		// Independent coins remain usable while board publication is pending.
+		let mut independent = funding.clone();
+		independent.input[0].previous_output = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+		wallet.register_tx(&independent).await.unwrap();
+		let independent_psbt = wallet.prepare_tx(
+			&[(address.clone(), Amount::from_sat(40_000))], fee_rate,
+		).await.unwrap();
+		assert_eq!(independent_psbt.unsigned_tx.input.len(), 1);
+		assert_eq!(independent_psbt.unsigned_tx.input[0].previous_output,
+			OutPoint::new(independent.compute_txid(), 0));
+
+		// The publication checkpoint, not merely a signature, releases change.
+		wallet.inner.apply_unconfirmed_txs([(signed.clone().extract_tx().unwrap(), eviction_time + 1)]);
+		wallet.persist().await.unwrap();
+		board.funding_psbt = Some(signed);
+		board.progress = BoardProgress::Confirming { last_park_error: None };
+		db.upsert_wallet_action_checkpoint(&board.id, &board.clone().into()).await.unwrap();
+		let drain = wallet.prepare_drain_tx(address, fee_rate).await.unwrap();
+		assert!(drain.unsigned_tx.input.iter().any(|input| input.previous_output.txid == txid));
+		assert!(drain.unsigned_tx.input.iter().all(|input| input.previous_output != original));
 	}
 }

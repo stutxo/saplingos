@@ -16,12 +16,12 @@ mod query;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use bitcoin::{Amount, Txid};
+use bitcoin::{Amount, OutPoint, Txid};
 use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
 use log::debug;
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use ark::{Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
@@ -33,7 +33,9 @@ use crate::exit::{ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::movement::update::MovementUpdate;
 use crate::persist::{BarkPersister, RoundStateId, StoredRoundState, Unlocked};
-use crate::persist::models::{PaidInvoice, SettledLightningReceive, StoredExit};
+use crate::persist::models::{
+	PaidInvoice, ProgramRecoveryRecord, SerdeProgramKey, SettledLightningReceive, StoredExit,
+};
 use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
@@ -185,14 +187,18 @@ impl BarkPersister for SqliteClient {
 	}
 
 	async fn update_round_state(&self, state: &StoredRoundState) -> anyhow::Result<()> {
-		let conn = self.connect()?;
-		query::update_round_state(&conn, state)?;
+		let mut conn = self.connect()?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::update_round_state(&tx, state)?;
+		tx.commit()?;
 		Ok(())
 	}
 
 	async fn remove_round_state(&self, round_state: &StoredRoundState) -> anyhow::Result<()> {
-		let conn = self.connect()?;
-		query::remove_round_state(&conn, round_state.id())?;
+		let mut conn = self.connect()?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::remove_round_state(&tx, round_state.id())?;
+		tx.commit()?;
 		Ok(())
 	}
 
@@ -211,7 +217,7 @@ impl BarkPersister for SqliteClient {
 		vtxos: &[(&Vtxo<Full>, &VtxoState)],
 	) -> anyhow::Result<()> {
 		let mut conn = self.connect()?;
-		let tx = conn.transaction()?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
 		for (vtxo, state) in vtxos {
 			query::store_vtxo_with_initial_state(&tx, vtxo, state)?;
@@ -271,6 +277,74 @@ impl BarkPersister for SqliteClient {
 		query::store_vtxo_key(&conn, index, public_key)
 	}
 
+	async fn store_program_key(&self, record: &SerdeProgramKey) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		conn.pragma_update(None, "synchronous", "FULL")?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::store_program_key(&tx, record)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn get_program_key(&self, public_key: &PublicKey)
+		-> anyhow::Result<Option<SerdeProgramKey>>
+	{
+		query::get_program_key(&self.connect()?, public_key)
+	}
+
+	async fn get_program_key_by_index(&self, index: u32)
+		-> anyhow::Result<Option<SerdeProgramKey>>
+	{
+		query::get_program_key_by_index(&self.connect()?, index)
+	}
+
+	async fn list_program_keys(&self) -> anyhow::Result<Vec<SerdeProgramKey>> {
+		query::list_program_keys(&self.connect()?)
+	}
+
+	async fn store_program_recoveries(&self, records: &[ProgramRecoveryRecord])
+		-> anyhow::Result<()>
+	{
+		let mut conn = self.connect()?;
+		conn.pragma_update(None, "synchronous", "FULL")?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::store_program_recoveries(&tx, records)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn get_program_recovery(&self, outpoint: OutPoint)
+		-> anyhow::Result<Option<ProgramRecoveryRecord>>
+	{
+		query::get_program_recovery(&self.connect()?, outpoint)
+	}
+
+	async fn list_program_recoveries(&self) -> anyhow::Result<Vec<ProgramRecoveryRecord>> {
+		query::list_program_recoveries(&self.connect()?)
+	}
+
+	async fn reserve_program_recovery(
+		&self,
+		inputs: &[(VtxoId, Option<VtxoState>)],
+		actors: &[String],
+	) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		conn.pragma_update(None, "synchronous", "FULL")?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::reserve_program_recovery(&tx, inputs, actors)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn has_program_recovery_reservation(&self, key: &str) -> anyhow::Result<bool> {
+		let mut conn = self.connect()?;
+		conn.pragma_update(None, "synchronous", "FULL")?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		let reserved = query::has_program_recovery_reservation(&tx, key)?;
+		tx.commit()?;
+		Ok(reserved)
+	}
+
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
 		let conn = self.connect()?;
 		query::get_last_vtxo_key_index(&conn)
@@ -297,8 +371,11 @@ impl BarkPersister for SqliteClient {
 		id: &WalletActionId,
 		checkpoint: &WalletActionCheckpoint,
 	) -> anyhow::Result<()> {
-		let conn = self.connect()?;
-		query::upsert_wallet_action_checkpoint(&conn, id, checkpoint)
+		let mut conn = self.connect()?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::upsert_wallet_action_checkpoint(&tx, id, checkpoint)?;
+		tx.commit()?;
+		Ok(())
 	}
 
 	async fn get_wallet_action_checkpoint(
@@ -320,8 +397,20 @@ impl BarkPersister for SqliteClient {
 		&self,
 		id: &WalletActionId,
 	) -> anyhow::Result<()> {
-		let conn = self.connect()?;
-		query::remove_wallet_action_checkpoint(&conn, id)
+		let mut conn = self.connect()?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::remove_wallet_action_checkpoint(&tx, id)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn finish_wallet_action(&self, id: &WalletActionId) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		conn.pragma_update(None, "synchronous", "FULL")?;
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		query::finish_wallet_action(&tx, id)?;
+		tx.commit()?;
+		Ok(())
 	}
 
 	async fn record_paid_invoice(
@@ -500,6 +589,7 @@ mod test {
 
 	use crate::{persist::sqlite::helpers::in_memory_db, vtxo::VtxoState};
 	use crate::persist::test_suite::bark_persister_tests;
+	use crate::persist::models::{recovery_action_key, recovery_round_key, recovery_vtxo_key};
 
 	use super::*;
 
@@ -604,4 +694,391 @@ mod test {
 	}
 
 	bark_persister_tests!(setup);
+
+	#[tokio::test]
+	async fn test_finish_wallet_action_write_failure_rolls_back() {
+		// FAIL deliberately leaves the statement's earlier writes in the
+		// transaction. Only rolling back the entire transaction restores both
+		// the deleted checkpoint and any newly appended state history.
+		for trigger in [
+			"CREATE TRIGGER fail_finish AFTER DELETE ON bark_wallet_action_checkpoint
+			BEGIN SELECT RAISE(FAIL, 'forced completion write failure'); END;",
+			"CREATE TRIGGER fail_finish AFTER INSERT ON bark_vtxo_state
+			BEGIN SELECT RAISE(FAIL, 'forced completion write failure'); END;",
+		] {
+			let directory = tempfile::tempdir().unwrap();
+			let path = directory.path().join("wallet.sqlite");
+			let db = SqliteClient::open(&path).unwrap();
+			let checkpoint: WalletActionCheckpoint =
+				crate::persist::test_suite::send_at_start().into();
+			let id = checkpoint.id();
+			let owned = VtxoState::Locked {
+				holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+			};
+			let vtxos = [&VTXO_VECTORS.board_vtxo, &VTXO_VECTORS.round1_vtxo];
+			db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+			for vtxo in vtxos {
+				db.store_vtxos(&[(vtxo, &owned)]).await.unwrap();
+			}
+			db.connect().unwrap().execute_batch(trigger).unwrap();
+
+			let error = db.finish_wallet_action(&id).await.unwrap_err();
+			assert!(format!("{error:#}").contains("forced completion write failure"));
+			drop(db);
+			let db = SqliteClient::open(&path).unwrap();
+			assert_eq!(db.get_wallet_action_checkpoint(&id).await.unwrap(),
+				Some(checkpoint));
+			for vtxo in vtxos {
+				assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, owned);
+				assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(vtxo));
+			}
+			let history_count: u64 = db.connect().unwrap().query_row(
+				"SELECT COUNT(*) FROM bark_vtxo_state", [], |row| row.get(0),
+			).unwrap();
+			assert_eq!(history_count, 2, "failed writes must not leave partial state history");
+			db.connect().unwrap().execute_batch("DROP TRIGGER fail_finish").unwrap();
+
+			db.finish_wallet_action(&id).await.unwrap();
+			drop(db);
+			let db = SqliteClient::open(&path).unwrap();
+			db.finish_wallet_action(&id).await.unwrap();
+			assert!(db.get_wallet_action_checkpoint(&id).await.unwrap().is_none());
+			for vtxo in vtxos {
+				assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state,
+					VtxoState::Spendable);
+			}
+			let history_count: u64 = db.connect().unwrap().query_row(
+				"SELECT COUNT(*) FROM bark_vtxo_state", [], |row| row.get(0),
+			).unwrap();
+			assert_eq!(history_count, 4, "retry must not append redundant unlocks");
+		}
+	}
+
+	#[tokio::test]
+	async fn program_records_survive_migration_and_reopen() {
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("wallet.sqlite");
+		let key = crate::persist::test_suite::program_key_fixture();
+		let recovery = crate::persist::test_suite::program_recovery_fixture();
+		let ordinary_key = key.program.user_pubkey;
+		let db = SqliteClient::open(&path).unwrap();
+		db.store_vtxo_key(0, ordinary_key).await.unwrap();
+		// Removing the additive program tables and their version markers
+		// reconstructs the schema immediately before program persistence.
+		db.connect().unwrap().execute_batch(
+			"DROP TABLE bark_program_key;
+			DROP TABLE bark_program_recovery;
+			DROP TABLE bark_program_recovery_reservation;
+			DELETE FROM migrations WHERE value >= 43;"
+		).unwrap();
+		drop(db);
+
+		let db = SqliteClient::open(&path).unwrap();
+		assert_eq!(db.get_public_key_idx(&ordinary_key).await.unwrap(), Some(0));
+		assert!(db.list_program_keys().await.unwrap().is_empty());
+		assert!(db.list_program_recoveries().await.unwrap().is_empty());
+		db.store_program_key(&key).await.unwrap();
+		db.store_program_recoveries(&[recovery.clone()]).await.unwrap();
+		drop(db);
+
+		let db = SqliteClient::open(&path).unwrap();
+		assert_eq!(db.get_program_key(&key.program.public_key().unwrap()).await.unwrap(), Some(key.clone()));
+		assert_eq!(db.get_public_key_idx(&key.program.public_key().unwrap()).await.unwrap(), Some(key.index));
+		assert_eq!(db.get_public_key_idx(&ordinary_key).await.unwrap(), Some(0));
+		assert_eq!(db.get_program_recovery(recovery.controlled_outpoint).await.unwrap(), Some(recovery.clone()));
+		assert_eq!(db.list_program_recoveries().await.unwrap(), vec![recovery]);
+	}
+
+	#[tokio::test]
+	async fn program_recovery_rejects_stale_snapshots_without_partial_reservations() {
+		// Force the competing writer to commit between snapshot and takeover:
+		// no scheduling or timestamp assumptions are needed.
+		for expected in [
+			None,
+			Some(VtxoState::Spendable),
+			Some(VtxoState::Locked { holder: None }),
+			Some(VtxoState::Locked {
+				holder: Some(VtxoLockHolder::Movement { id: MovementId::new(1) }),
+			}),
+		] {
+			let directory = tempfile::tempdir().unwrap();
+			let path = directory.path().join("wallet.sqlite");
+			let db = SqliteClient::open(&path).unwrap();
+			let competitor = SqliteClient::open(&path).unwrap();
+			let first = &VTXO_VECTORS.board_vtxo;
+			let raced = &VTXO_VECTORS.round1_vtxo;
+			db.store_vtxos(&[(first, &VtxoState::Spendable)]).await.unwrap();
+			if let Some(state) = &expected {
+				db.store_vtxos(&[(raced, state)]).await.unwrap();
+			}
+			let inputs = [(first.id(), Some(VtxoState::Spendable)), (raced.id(), expected.clone())];
+			let new_state = VtxoState::Locked {
+				holder: Some(VtxoLockHolder::Movement { id: MovementId::new(2) }),
+			};
+			if expected.is_some() {
+				competitor.update_vtxo_state_checked(
+					raced.id(), new_state.clone(), &VtxoStateKind::UNSPENT_STATES,
+				).await.unwrap();
+			} else {
+				competitor.store_vtxos(&[(raced, &new_state)]).await.unwrap();
+			}
+			let actor = recovery_action_key("stale-actor");
+			assert!(db.reserve_program_recovery(&inputs, &[actor.clone()]).await.is_err());
+			for key in [recovery_vtxo_key(first.id()), recovery_vtxo_key(raced.id()), actor] {
+				assert!(!db.has_program_recovery_reservation(&key).await.unwrap());
+			}
+			assert_eq!(db.get_wallet_vtxo(first.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
+			assert_eq!(db.get_wallet_vtxo(raced.id()).await.unwrap().unwrap().state, new_state);
+		}
+	}
+
+	#[tokio::test]
+	async fn program_recovery_write_failure_rolls_back_every_reservation_and_state() {
+		for trigger in [
+			"CREATE TRIGGER fail_recovery AFTER INSERT ON bark_program_recovery_reservation
+			WHEN NEW.key LIKE 'action/%'
+			BEGIN SELECT RAISE(FAIL, 'forced recovery write failure'); END;",
+			"CREATE TRIGGER fail_recovery AFTER INSERT ON bark_vtxo_state
+			BEGIN SELECT RAISE(FAIL, 'forced recovery write failure'); END;",
+		] {
+			let directory = tempfile::tempdir().unwrap();
+			let path = directory.path().join("wallet.sqlite");
+			let db = SqliteClient::open(&path).unwrap();
+			let first = &VTXO_VECTORS.board_vtxo;
+			let second = &VTXO_VECTORS.round1_vtxo;
+			let absent = VTXO_VECTORS.round2_vtxo.id();
+			db.store_vtxos(&[(first, &VtxoState::Spendable), (second, &VtxoState::Spendable)])
+				.await.unwrap();
+			let inputs = [
+				(first.id(), Some(VtxoState::Spendable)),
+				(second.id(), Some(VtxoState::Spendable)),
+				(absent, None),
+			];
+			let actor = recovery_action_key("rollback-actor");
+			db.connect().unwrap().execute_batch(trigger).unwrap();
+			let error = db.reserve_program_recovery(&inputs, &[actor.clone()]).await.unwrap_err();
+			assert!(format!("{error:#}").contains("forced recovery write failure"));
+			drop(db);
+			let db = SqliteClient::open(&path).unwrap();
+			for (id, expected) in &inputs {
+				assert!(!db.has_program_recovery_reservation(&recovery_vtxo_key(*id)).await.unwrap());
+				assert_eq!(db.get_wallet_vtxo(*id).await.unwrap().map(|v| v.state), *expected);
+			}
+			assert!(!db.has_program_recovery_reservation(&actor).await.unwrap());
+			let history_count: u64 = db.connect().unwrap().query_row(
+				"SELECT COUNT(*) FROM bark_vtxo_state", [], |row| row.get(0),
+			).unwrap();
+			assert_eq!(history_count, 2);
+			db.connect().unwrap().execute_batch("DROP TRIGGER fail_recovery").unwrap();
+			db.reserve_program_recovery(&inputs, &[actor.clone()]).await.unwrap();
+			assert!(db.has_program_recovery_reservation(&actor).await.unwrap());
+			for (id, expected) in &inputs {
+				assert!(db.has_program_recovery_reservation(&recovery_vtxo_key(*id)).await.unwrap());
+				assert_eq!(db.get_wallet_vtxo(*id).await.unwrap().map(|v| v.state),
+					expected.as_ref().map(|_| VtxoState::Exited));
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn program_recovery_tombstones_preserve_checkpoints_and_unselected_locks() {
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("wallet.sqlite");
+		let db = SqliteClient::open(&path).unwrap();
+		let checkpoint: WalletActionCheckpoint = crate::persist::test_suite::send_at_start().into();
+		let id = checkpoint.id();
+		let actor = recovery_action_key(&id);
+		let owned = VtxoState::Locked {
+			holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+		};
+		let selected = &VTXO_VECTORS.board_vtxo;
+		let unselected = &VTXO_VECTORS.round1_vtxo;
+		let spent = &VTXO_VECTORS.round2_vtxo;
+		let exited = &VTXO_VECTORS.arkoor_htlc_out_vtxo;
+		let absent = VtxoId::from_slice(&[0xedu8; 36]).unwrap();
+		db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.unwrap();
+		db.store_vtxos(&[
+			(selected, &owned), (unselected, &owned),
+			(spent, &VtxoState::Spent), (exited, &VtxoState::Exited),
+		]).await.unwrap();
+		let record = crate::persist::test_suite::program_recovery_fixture();
+		db.store_program_recoveries(&[record.clone()]).await.unwrap();
+		// Reconstruct version 43 with real actor and recovery data, then
+		// migrate forward before taking over. The new table is purely additive.
+		db.connect().unwrap().execute_batch(
+			"DROP TABLE bark_program_recovery_reservation;
+			DELETE FROM migrations WHERE value = 44;"
+		).unwrap();
+		drop(db);
+		let db = SqliteClient::open(&path).unwrap();
+		assert_eq!(db.get_wallet_action_checkpoint(&id).await.unwrap(), Some(checkpoint.clone()));
+		assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(record.clone()));
+		assert!(!db.has_program_recovery_reservation(&actor).await.unwrap());
+		db.reserve_program_recovery(&[
+			(selected.id(), Some(owned.clone())), (spent.id(), Some(VtxoState::Spent)),
+			(exited.id(), Some(VtxoState::Exited)), (absent, None),
+		], &[actor.clone()]).await.unwrap();
+		drop(db);
+
+		let db = SqliteClient::open(&path).unwrap();
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert!(db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.is_err());
+		assert_eq!(db.get_wallet_action_checkpoint(&id).await.unwrap(), Some(checkpoint.clone()));
+		assert!(db.get_all_wallet_action_checkpoints().await.unwrap().contains(&checkpoint));
+		assert_eq!(db.get_wallet_vtxo(unselected.id()).await.unwrap().unwrap().state, owned);
+		for (vtxo, state) in [(selected, VtxoState::Exited), (spent, VtxoState::Spent), (exited, VtxoState::Exited)] {
+			assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, state);
+			assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(vtxo));
+			assert!(db.has_program_recovery_reservation(&recovery_vtxo_key(vtxo.id())).await.unwrap());
+		}
+		assert!(db.has_program_recovery_reservation(&recovery_vtxo_key(absent)).await.unwrap());
+		assert!(db.get_wallet_vtxo(absent).await.unwrap().is_none());
+		assert_eq!(db.get_program_recovery(record.controlled_outpoint).await.unwrap(), Some(record));
+		let history_count: u64 = db.connect().unwrap().query_row(
+			"SELECT COUNT(*) FROM bark_vtxo_state", [], |row| row.get(0),
+		).unwrap();
+		assert_eq!(history_count, 5, "terminal states must not append history");
+
+		// Actor checkpoints may be the only source of signed recovery data.
+		// Neither removing an input nor attempting cleanup can discard them.
+		assert!(db.remove_wallet_action_checkpoint(&id).await.is_err());
+		db.remove_vtxo(selected.id()).await.unwrap();
+		drop(db);
+		let db = SqliteClient::open(&path).unwrap();
+		assert!(db.has_program_recovery_reservation(&actor).await.unwrap());
+		assert!(db.has_program_recovery_reservation(&recovery_vtxo_key(selected.id())).await.unwrap());
+		assert_eq!(db.get_wallet_action_checkpoint(&id).await.unwrap(), Some(checkpoint.clone()));
+		assert!(db.upsert_wallet_action_checkpoint(&id, &checkpoint).await.is_err());
+		assert!(db.finish_wallet_action(&id).await.is_err());
+		assert_eq!(db.get_wallet_vtxo(unselected.id()).await.unwrap().unwrap().state, owned);
+	}
+
+	#[tokio::test]
+	async fn program_recovery_serializes_actor_writes_and_blocks_round_restart() {
+		use crate::lock_manager::LockManager;
+		use crate::lock_manager::memory::MemoryLockManager;
+		use crate::round::{RoundFlowState, RoundParticipation};
+
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("wallet.sqlite");
+		let db = SqliteClient::open(&path).unwrap();
+		let round = RoundState {
+			done: false,
+			participation: RoundParticipation {
+				inputs: vec![], outputs: vec![], unblinded_mailbox_id: None,
+			},
+			flow: RoundFlowState::InteractivePending,
+			new_vtxos: vec![],
+			sent_forfeit_sigs: false,
+			forfeit_bundles: Some(Vec::new()),
+			movement_id: None,
+		};
+		let id = db.store_round_state(&round).await.unwrap();
+		let manager = MemoryLockManager::new();
+		let guard = manager.try_lock("test.recovery.round").await.unwrap();
+		let mut stored = db.get_round_state_by_id(id).await.unwrap().unwrap().lock(guard);
+		db.update_round_state(&stored).await.unwrap();
+		let checkpoint: WalletActionCheckpoint = crate::persist::test_suite::send_at_start().into();
+		let action = checkpoint.id();
+		db.upsert_wallet_action_checkpoint(&action, &checkpoint).await.unwrap();
+
+		let mut conn = db.connect().unwrap();
+		conn.pragma_update(None, "synchronous", "FULL").unwrap();
+		let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+		query::reserve_program_recovery(
+			&tx, &[], &[recovery_round_key(id), recovery_action_key(&action)],
+		).unwrap();
+		let mut competitor = db.connect().unwrap();
+		competitor.busy_timeout(std::time::Duration::ZERO).unwrap();
+		// A normal actor writer cannot acquire its transaction while takeover
+		// is uncommitted, so there is no check/write interleaving window.
+		let error = competitor.transaction_with_behavior(TransactionBehavior::Immediate).unwrap_err();
+		assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+		tx.commit().unwrap();
+
+		let tx = competitor.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+		stored.state_mut().done = true;
+		assert!(query::update_round_state(&tx, &stored).is_err());
+		assert!(query::upsert_wallet_action_checkpoint(&tx, &action, &checkpoint).is_err());
+		assert!(query::finish_wallet_action(&tx, &action).is_err());
+		assert!(query::remove_round_state(&tx, id).is_err());
+		assert!(query::remove_wallet_action_checkpoint(&tx, &action).is_err());
+		tx.commit().unwrap();
+		assert!(db.update_round_state(&stored).await.is_err());
+		assert!(!db.get_round_state_by_id(id).await.unwrap().unwrap().state().done);
+		assert!(db.remove_round_state(&stored).await.is_err());
+		assert!(!db.get_round_state_by_id(id).await.unwrap().unwrap().state().done);
+		assert!(db.has_program_recovery_reservation(&recovery_round_key(id)).await.unwrap());
+		assert!(db.update_round_state(&stored).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn program_recovery_wins_against_new_locks_and_live_reimports() {
+		for initial in [VtxoState::Spendable, VtxoState::Locked { holder: None }, VtxoState::Spent] {
+			let directory = tempfile::tempdir().unwrap();
+			let path = directory.path().join("wallet.sqlite");
+			let db = SqliteClient::open(&path).unwrap();
+			let competitor = SqliteClient::open(&path).unwrap();
+			let vtxo = &VTXO_VECTORS.board_vtxo;
+			db.store_vtxos(&[(vtxo, &initial)]).await.unwrap();
+			db.reserve_program_recovery(&[(vtxo.id(), Some(initial.clone()))], &[]).await.unwrap();
+			let final_state = if initial == VtxoState::Spent { VtxoState::Spent } else { VtxoState::Exited };
+			for live in [VtxoState::Spendable, VtxoState::Locked { holder: None }] {
+				assert!(competitor.update_vtxo_state_checked(
+					vtxo.id(), live.clone(), VtxoStateKind::ALL,
+				).await.is_err());
+				assert!(competitor.update_vtxo_states_checked(
+					&[vtxo.id()], live.clone(), VtxoStateKind::ALL,
+				).await.is_err());
+				assert!(competitor.store_vtxos(&[(vtxo, &live)]).await.is_err());
+			}
+			competitor.release_vtxo_lock(vtxo.id(), None).await.unwrap();
+			assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, final_state);
+			competitor.update_vtxo_state_checked(vtxo.id(), final_state.clone(), &[]).await.unwrap();
+			competitor.store_vtxos(&[(vtxo, &final_state)]).await.unwrap();
+			db.remove_vtxo(vtxo.id()).await.unwrap();
+			assert!(competitor.store_vtxos(&[(vtxo, &VtxoState::Spendable)]).await.is_err());
+			assert!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().is_none());
+		}
+	}
+
+	#[tokio::test]
+	async fn program_recovery_blocks_future_outputs_and_unspent_ancestor_imports() {
+		let ancestor = &VTXO_VECTORS.board_vtxo;
+		let successor = &VTXO_VECTORS.arkoor_htlc_out_vtxo;
+		assert!(successor.transactions().any(|item|
+			item.tx.input.iter().any(|input| input.previous_output == ancestor.id().to_point())));
+		for initial in [
+			None, Some(VtxoState::Locked { holder: None }), Some(VtxoState::Exited),
+			Some(VtxoState::Spent),
+		] {
+			let directory = tempfile::tempdir().unwrap();
+			let path = directory.path().join("wallet.sqlite");
+			let db = SqliteClient::open(&path).unwrap();
+			let competitor = SqliteClient::open(&path).unwrap();
+			if let Some(state) = &initial {
+				db.store_vtxos(&[(ancestor, state)]).await.unwrap();
+			}
+			db.reserve_program_recovery(&[(ancestor.id(), initial.clone())], &[]).await.unwrap();
+			let historical_spend = initial == Some(VtxoState::Spent);
+			for live in [VtxoState::Spendable, VtxoState::Locked { holder: None }] {
+				// An unrelated first row must roll back when the successor fails.
+				let unrelated = &VTXO_VECTORS.round1_vtxo;
+				let result = competitor.store_vtxos(&[(unrelated, &live), (successor, &live)]).await;
+				assert_eq!(result.is_ok(), historical_spend);
+				assert_eq!(db.get_wallet_vtxo(unrelated.id()).await.unwrap().is_some(), historical_spend);
+				assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().is_some(), historical_spend);
+			}
+			// Terminal imports remain available to preserve recovery history.
+			competitor.store_vtxos(&[(successor, &VtxoState::Exited)]).await.unwrap();
+		}
+
+		let directory = tempfile::tempdir().unwrap();
+		let db = SqliteClient::open(directory.path().join("wallet.sqlite")).unwrap();
+		db.reserve_program_recovery(&[(successor.id(), None)], &[]).await.unwrap();
+		assert!(db.store_vtxos(&[(successor, &VtxoState::Spendable)]).await.is_err());
+		assert!(db.get_wallet_vtxo(successor.id()).await.unwrap().is_none());
+		db.store_vtxos(&[(successor, &VtxoState::Exited)]).await.unwrap();
+		assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+	}
 }

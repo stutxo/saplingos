@@ -60,6 +60,18 @@ impl RoundAttemptAttestation {
 		Self { signature }
 	}
 
+	/// Construct an attestation from an external signature, verifying its typed context.
+	pub fn from_signature(
+		challenge: Challenge,
+		vtxo: &Vtxo,
+		vtxo_reqs: &[SignedVtxoRequest],
+		signature: schnorr::Signature,
+	) -> Result<Self, secp256k1::Error> {
+		let ret = Self { signature };
+		ret.verify(challenge, vtxo, vtxo_reqs)?;
+		Ok(ret)
+	}
+
 	/// Get the signature
 	pub fn signature(&self) -> &schnorr::Signature {
 		&self.signature
@@ -76,7 +88,8 @@ impl RoundAttemptAttestation {
 		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
 	}
 
-	fn compute_message(
+	/// Derive the protocol's domain-separated ownership message.
+	pub fn compute_message(
 		challenge: Challenge,
 		vtxo_id: VtxoId,
 		vtxo_reqs: &[SignedVtxoRequest],
@@ -130,6 +143,17 @@ impl DelegatedRoundParticipationAttestation {
 		Self { signature }
 	}
 
+	/// Construct an attestation from an external signature, verifying its typed context.
+	pub fn from_signature(
+		vtxo: &Vtxo,
+		vtxo_reqs: &[VtxoRequest],
+		signature: schnorr::Signature,
+	) -> Result<Self, secp256k1::Error> {
+		let ret = Self { signature };
+		ret.verify(vtxo, vtxo_reqs)?;
+		Ok(ret)
+	}
+
 	/// Get the signature
 	pub fn signature(&self) -> &schnorr::Signature {
 		&self.signature
@@ -145,7 +169,8 @@ impl DelegatedRoundParticipationAttestation {
 		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
 	}
 
-	fn compute_message(
+	/// Derive the protocol's domain-separated ownership message.
+	pub fn compute_message(
 		vtxo_id: VtxoId,
 		vtxo_reqs: &[VtxoRequest],
 	) -> Message {
@@ -200,18 +225,30 @@ impl LightningReceiveAttestation {
 		Self { signature }
 	}
 
+	/// Construct an attestation from an external signature, verifying its typed context.
+	pub fn from_signature<G>(
+		payment_hash: PaymentHash,
+		vtxo: &Vtxo<G>,
+		signature: schnorr::Signature,
+	) -> Result<Self, secp256k1::Error> {
+		let ret = Self { signature };
+		ret.verify(payment_hash, vtxo)?;
+		Ok(ret)
+	}
+
 	/// Get the signature
 	pub fn signature(&self) -> &schnorr::Signature {
 		&self.signature
 	}
 
 	/// Verify the attestation against a VTXO
-	pub fn verify(&self, payment_hash: PaymentHash, vtxo: &Vtxo) -> Result<(), secp256k1::Error> {
+	pub fn verify<G>(&self, payment_hash: PaymentHash, vtxo: &Vtxo<G>) -> Result<(), secp256k1::Error> {
 		let msg = Self::compute_message(payment_hash, vtxo.id());
 		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
 	}
 
-	fn compute_message(payment_hash: PaymentHash, vtxo_id: VtxoId) -> Message {
+	/// Derive the protocol's domain-separated ownership message.
+	pub fn compute_message(payment_hash: PaymentHash, vtxo_id: VtxoId) -> Message {
 		let mut engine = sha256::Hash::engine();
 		engine.write_all(Self::CHALLENGE_MESSAGE_PREFIX).unwrap();
 		engine.write_all(&payment_hash.to_byte_array()).unwrap();
@@ -262,18 +299,29 @@ impl VtxoStatusAttestation {
 		Self { signature }
 	}
 
+	/// Construct a status or recovery-query proof from an external signature.
+	pub fn from_signature<G>(
+		vtxo: &Vtxo<G>,
+		signature: schnorr::Signature,
+	) -> Result<Self, secp256k1::Error> {
+		let ret = Self { signature };
+		ret.verify(vtxo)?;
+		Ok(ret)
+	}
+
 	/// Get the signature
 	pub fn signature(&self) -> &schnorr::Signature {
 		&self.signature
 	}
 
 	/// Verify the attestation against a VTXO
-	pub fn verify(&self, vtxo: &Vtxo) -> Result<(), secp256k1::Error> {
+	pub fn verify<G>(&self, vtxo: &Vtxo<G>) -> Result<(), secp256k1::Error> {
 		let msg = Self::compute_message(vtxo.id());
 		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
 	}
 
-	fn compute_message(vtxo_id: VtxoId) -> Message {
+	/// Derive the protocol's domain-separated ownership message.
+	pub fn compute_message(vtxo_id: VtxoId) -> Message {
 		let mut engine = sha256::Hash::engine();
 		engine.write_all(Self::CHALLENGE_MESSAGE_PREFIX).unwrap();
 		engine.write_all(&vtxo_id.to_bytes()).unwrap();
@@ -317,6 +365,18 @@ impl OffboardRequestAttestation {
 		Self { signature }
 	}
 
+	/// Construct an attestation from an external signature, verifying its typed context.
+	pub fn from_signature(
+		req: &OffboardRequest,
+		inputs: &[VtxoId],
+		vtxo: &Vtxo,
+		signature: schnorr::Signature,
+	) -> Result<Self, secp256k1::Error> {
+		let ret = Self { signature };
+		ret.verify(req, inputs, vtxo)?;
+		Ok(ret)
+	}
+
 	/// Get the signature
 	pub fn signature(&self) -> &schnorr::Signature {
 		&self.signature
@@ -333,7 +393,8 @@ impl OffboardRequestAttestation {
 		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
 	}
 
-	fn compute_message(req: &OffboardRequest, inputs: &[VtxoId]) -> Message {
+	/// Derive the protocol's domain-separated ownership message.
+	pub fn compute_message(req: &OffboardRequest, inputs: &[VtxoId]) -> Message {
 		let mut eng = sha256::Hash::engine();
 		eng.input(Self::CHALLENGE_MESSAGE_PREFIX);
 		req.to_txout().encode(&mut eng).unwrap();
@@ -379,13 +440,25 @@ impl ArkoorCosignAttestation {
 		Self { signature }
 	}
 
+	/// Construct an attestation from an external signature, verifying its typed context.
+	pub fn from_signature(
+		vtxo: &Vtxo,
+		outputs: &[&ArkoorDestination],
+		signature: schnorr::Signature,
+	) -> Result<Self, secp256k1::Error> {
+		let ret = Self { signature };
+		ret.verify(vtxo, outputs)?;
+		Ok(ret)
+	}
+
 	/// Verify the attestation against a VTXO and outputs
 	pub fn verify(&self, vtxo: &Vtxo, outputs: &[&ArkoorDestination]) -> Result<(), secp256k1::Error> {
 		let msg = Self::compute_message(vtxo.id(), outputs);
 		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
 	}
 
-	fn compute_message(vtxo_id: VtxoId, outputs: &[&ArkoorDestination]) -> Message {
+	/// Derive the protocol's domain-separated ownership message.
+	pub fn compute_message(vtxo_id: VtxoId, outputs: &[&ArkoorDestination]) -> Message {
 		let mut eng = sha256::Hash::engine();
 		eng.input(Self::CHALLENGE_MESSAGE_PREFIX);
 		eng.input(&vtxo_id.to_bytes());
@@ -459,6 +532,12 @@ mod tests {
 		println!("RoundAttemptAttestation hex: {}", attestation.serialize().as_hex());
 		encoding_roundtrip(&attestation);
 		attestation.verify(challenge, &vtxo, &vtxo_reqs).expect("verification failed");
+		assert_eq!(RoundAttemptAttestation::from_signature(
+			challenge, &vtxo, &vtxo_reqs, attestation.signature,
+		).unwrap(), attestation);
+		assert!(RoundAttemptAttestation::from_signature(
+			Challenge::new([0; 32]), &vtxo, &vtxo_reqs, attestation.signature,
+		).is_err());
 
 		// Hard-coded attestation test
 		let vector = "ddbf11d8022ec8bcc85704e0ee0c27f1c26d024c43692653d060284ad5cf32ebf89d849b6943d7b1cb9e9c108251c23f067e95bf585fabcf4be5baab8a53897a";
@@ -490,6 +569,12 @@ mod tests {
 		println!("DelegatedRoundParticipationAttestation hex: {}", attestation.serialize().as_hex());
 		encoding_roundtrip(&attestation);
 		attestation.verify(&vtxo, &vtxo_reqs).expect("verification failed");
+		assert_eq!(DelegatedRoundParticipationAttestation::from_signature(
+			&vtxo, &vtxo_reqs, attestation.signature,
+		).unwrap(), attestation);
+		assert!(DelegatedRoundParticipationAttestation::from_signature(
+			&vtxo, &[], attestation.signature,
+		).is_err());
 
 		// Hard-coded attestation test
 		let vector = "fc482a0ef7b86427416865657986032bb49d458c3649097a389670aabee26bd7789218f18b2b58cc68524cb7ae4f224b19fcb6d905e50e63d32dacc04d78cf32";
@@ -514,6 +599,12 @@ mod tests {
 		println!("LightningReceiveAttestation hex: {}", attestation.serialize().as_hex());
 		encoding_roundtrip(&attestation);
 		attestation.verify(payment_hash, &vtxo).expect("verification failed");
+		assert_eq!(LightningReceiveAttestation::from_signature(
+			payment_hash, &vtxo, attestation.signature,
+		).unwrap(), attestation);
+		assert!(LightningReceiveAttestation::from_signature(
+			PaymentHash::from(sha256::Hash::hash(&[0; 32])), &vtxo, attestation.signature,
+		).is_err());
 
 		// Hard-coded attestation test
 		let vector = "a1240a572d9298c08a75102fb872b8d30bae521228083ec717f220d32de3b4446e7214e6e9e1c586c797fdff8b67e26d6f81a497dee5d584bdc80851e06c7fd5";
@@ -533,6 +624,11 @@ mod tests {
 		println!("VtxoStatusAttestation hex: {}", attestation.serialize().as_hex());
 		encoding_roundtrip(&attestation);
 		attestation.verify(&vtxo).expect("verification failed");
+		assert_eq!(VtxoStatusAttestation::from_signature(
+			&vtxo, attestation.signature,
+		).unwrap(), attestation);
+		let unrelated = DelegatedRoundParticipationAttestation::new(vtxo.id(), &[], &DUMMY_USER_KEY);
+		assert!(VtxoStatusAttestation::from_signature(&vtxo, unrelated.signature).is_err());
 
 		// Hard-coded attestation test
 		let vector = "ae3bb779ec3f700ccef8031f6589797ec7ac56443b01ed495bef210c8ca12a603c26ffaa2d30502a911c635b5926f1c898cad343b7cd31105aaa22c4c3688f54";
@@ -564,6 +660,10 @@ mod tests {
 		println!("ArkoorCosignAttestation hex: {}", attestation.serialize().as_hex());
 		encoding_roundtrip(&attestation);
 		attestation.verify(&vtxo, &outputs).expect("verification failed");
+		assert_eq!(ArkoorCosignAttestation::from_signature(
+			&vtxo, &outputs, attestation.signature,
+		).unwrap(), attestation);
+		assert!(ArkoorCosignAttestation::from_signature(&vtxo, &[], attestation.signature).is_err());
 	}
 
 	#[test]
@@ -591,6 +691,12 @@ mod tests {
 		println!("OffboardRequestAttestation hex: {}", attestation.serialize().as_hex());
 		encoding_roundtrip(&attestation);
 		attestation.verify(&offboard_req, &inputs, &vtxo).expect("verification failed");
+		assert_eq!(OffboardRequestAttestation::from_signature(
+			&offboard_req, &inputs, &vtxo, attestation.signature,
+		).unwrap(), attestation);
+		assert!(OffboardRequestAttestation::from_signature(
+			&offboard_req, &[], &vtxo, attestation.signature,
+		).is_err());
 
 		// Hard-coded attestation test
 		let vector = "d6c85934b715c086164294645fadbe6a08fe6263609f38b44c23239913935c2e30fe5e9ad099941e751facb039797b6c920a90095b5e1cf26cc8aa274082aead";

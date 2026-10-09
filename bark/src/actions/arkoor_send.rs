@@ -2,24 +2,28 @@
 //!
 //! Identity (`id`, `destination`, `amount`) and immutable parameters live
 //! on [`ArkoorSend`] as top-level fields; the mutable bit is the [`Progress`] enum.
+//!
+//! Completed outputs are checkpointed before coordinated receive commit or server
+//! registration. Retries beyond cosigning use those exact signed bytes; a lost
+//! acknowledgement must never trigger a new signature or release the old inputs.
 
 use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;
 use bitcoin::hex::DisplayHex;
-use log::{error, info, warn};
+use log::{error, info};
 
 use ark::{ProtocolEncoding, Vtxo};
-use ark::arkoor::ArkoorDestination;
 use ark::vtxo::{Full, VtxoId};
 use server_rpc::protos;
 
 use crate::Wallet;
-use crate::actions::{Advance, AdvanceError, WalletAction, WalletActionId};
+use crate::actions::{Advance, AdvanceError, WalletAction, WalletActionId, park_with_backoff};
 use crate::arkoor::{ArkoorCreateError, DeliveryOutcome, post_arkoor_to_mailboxes, split_change_amount};
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
 use crate::movement::update::MovementUpdate;
+use crate::sapio::receive::is_coordinated_address;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::vtxo::VtxoLockHolder;
 
@@ -54,10 +58,11 @@ impl ArkoorSend {
 	}
 }
 
-/// The four phases of an outgoing arkoor send.
+/// The phases of an outgoing arkoor send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Progress {
-	/// Inputs are locked and the change keypair is reserved.
+	/// Inputs are selected and the change key reserved. The durable action locks
+	/// the inputs idempotently before contacting either signer.
 	Cosigning,
 	/// Cosign succeeded and the movement is recorded; pending registration of
 	/// the signed vtxo transactions with the server.
@@ -99,6 +104,7 @@ impl From<ArkoorCreateError> for AdvanceError {
 			// Keep the cosign status typed so `is_server_rejection` can tell a
 			// rejection (InvalidArgument/NotFound) from a transient failure.
 			ArkoorCreateError::Cosign(status) => AdvanceError::Server(status),
+			error @ ArkoorCreateError::ProgramGuard(_) => AdvanceError::Other(error.into()),
 			ArkoorCreateError::Other(err) => AdvanceError::Other(err),
 		}
 	}
@@ -115,6 +121,13 @@ impl WalletAction for ArkoorSend {
 			Progress::Registration {
 				movement_id, signed_destination_vtxos, signed_change_vtxos,
 			} => {
+				// This stage is already durable. Recipient response loss retries
+				// the saved package rather than re-entering the signer.
+				wallet.ensure_program_recoveries(&signed_destination_vtxos).await?;
+				wallet.ensure_program_recoveries(&signed_change_vtxos).await?;
+				wallet.commit_program_receives(
+					&self.destination, &signed_destination_vtxos,
+				).await.map_err(ArkoorCreateError::ProgramGuard)?;
 				run_registration(
 					wallet, &signed_destination_vtxos, &signed_change_vtxos,
 				).await?;
@@ -129,6 +142,21 @@ impl WalletAction for ArkoorSend {
 				movement_id, signed_destination_vtxos, signed_change_vtxos,
 				last_park_error: _,
 			} => {
+				wallet.ensure_program_recoveries(&signed_destination_vtxos).await?;
+				wallet.ensure_program_recoveries(&signed_change_vtxos).await?;
+				if is_coordinated_address(&self.destination)? {
+					// Also enforce commit when resuming an older Delivery checkpoint.
+					wallet.commit_program_receives(
+						&self.destination, &signed_destination_vtxos,
+					).await.map_err(ArkoorCreateError::ProgramGuard)?;
+					return Ok(Advance::Next(ArkoorSend {
+						progress: Progress::Finalizing {
+							movement_id, signed_change_vtxos, delivery_succeeded: true,
+						},
+						..self
+					}));
+				}
+
 				// The receiver explicitly wants no delivery. We should honour it
 				if self.destination.delivery().is_empty() {
 					return Ok(Advance::Next(ArkoorSend {
@@ -184,21 +212,29 @@ impl WalletAction for ArkoorSend {
 		self.input_vtxo_ids.clone()
 	}
 
+	async fn on_retry(
+		self, _wallet: &Wallet, attempts: u32, error: AdvanceError,
+	) -> anyhow::Result<Advance<Self>> {
+		if matches!(&error, AdvanceError::Other(error)
+			if matches!(error.downcast_ref::<ArkoorCreateError>(), Some(ArkoorCreateError::ProgramGuard(_))))
+		{
+			// Preparation can require different evidence; delivery can require an
+			// unavailable recipient. Report both without releasing the checkpoint
+			// or its inputs. Subsequent sync retries the same persisted stage.
+			return Ok(Advance::Park { state: self, wake_after: None, error: Some(error) });
+		}
+		Ok(park_with_backoff(self, attempts, None))
+	}
+
 	async fn on_rejection(
 		self,
-		wallet: &Wallet,
+		_wallet: &Wallet,
 		error: AdvanceError,
 	) -> anyhow::Result<Advance<Self>> {
 		match self.progress.clone() {
 			Progress::Cosigning => {
 				let id = self.id.clone();
 				error!("arkoor send {} rejected during cosign: {:?}", id, error);
-				if let Err(cancel_err) = wallet.stop_wallet_action(&id).await {
-					warn!(
-						"could not stop arkoor send action {} after rejection: {:#}",
-						id, cancel_err,
-					);
-				}
 				Ok(Advance::Failed(error.into()))
 			},
 			// Cosign already burned the inputs server-side and inserted the
@@ -237,9 +273,13 @@ impl WalletAction for ArkoorSend {
 				}))
 			},
 			Progress::Finalizing { .. } => {
-				// Finalizing only touches local state, so a server-rejection here
-				// would be a bug. Surface as Failed rather than loop.
-				Ok(Advance::Failed(error.into()))
+				// Signatures have escaped. Even an unexpected failure must retain
+				// the checkpoint and locks until the old inputs are marked spent.
+				Ok(Advance::Park {
+					state: self,
+					wake_after: Some(DELIVERY_RETRY_BACKOFF),
+					error: Some(error),
+				})
 			},
 		}
 	}
@@ -255,13 +295,11 @@ pub(crate) async fn start_arkoor_send(
 	wallet.validate_arkoor_address(&destination).await
 		.context("invalid arkoor address")?;
 
-	let (change_keypair, change_key_index) = wallet.peek_next_keypair().await
-		.context("failed to derive arkoor change keypair")?;
-	if destination.policy().user_pubkey() == change_keypair.public_key() {
+	let (change_key, change_key_index) = wallet.derive_store_next_signing_key().await
+		.context("failed to derive arkoor change signing key")?;
+	if destination.policy().user_pubkey() == change_key.public_key() {
 		bail!("Cannot create arkoor to same address as change");
 	}
-	wallet.inner.db.store_vtxo_key(change_key_index, change_keypair.public_key()).await
-		.context("failed to store arkoor change keypair")?;
 
 	// The server refuses expired vtxos as arkoor inputs; they have to wait
 	// for a refresh.
@@ -276,10 +314,6 @@ pub(crate) async fn start_arkoor_send(
 		.context("selected inputs don't cover amount")?;
 
 	let id = new_action_id();
-	wallet.lock_vtxos(
-		inputs.iter(),
-		Some(VtxoLockHolder::Action { id: id.clone() }),
-	).await?;
 
 	Ok(ArkoorSend {
 		id,
@@ -305,23 +339,26 @@ async fn run_cosign(wallet: &Wallet, send: &ArkoorSend) -> Result<Progress, Adva
 	let _ = wallet.require_server().await?;
 
 	let inputs = wallet.inner.db.get_wallet_vtxos(&send.input_vtxo_ids).await?;
-	let change_keypair = wallet.peek_keypair(send.change_key_index).await
+	// The checkpoint exists before this lock. A crash cannot leave an orphaned
+	// reservation, and a restart must reacquire it before producing signatures.
+	wallet.lock_vtxos(
+		inputs.iter(),
+		Some(VtxoLockHolder::Action { id: send.id.clone() }),
+	).await?;
+	let change_key = wallet.peek_signing_key(send.change_key_index).await
 		.with_context(|| format!(
 			"action {}: stored change_key_index {} not in keystore",
 			send.id, send.change_key_index,
 		))?;
 
-	let dest = ArkoorDestination {
-		total_amount: send.amount,
-		policy: send.destination.policy().clone(),
-	};
 	let neg_amount = -send.amount.to_signed().context("amount out-of-range")?;
 
 	// `?` converts via `From<ArkoorCreateError>` below: a cosign failure
 	// becomes `AdvanceError::Server` so the executor can route a genuine
 	// rejection to on_rejection instead of retrying forever.
-	let arkoor = wallet.create_checkpointed_arkoor_with_vtxos(
-		dest, inputs, change_keypair, send.change_pieces.clone(),
+	let arkoor = wallet.create_checkpointed_arkoor_for_address(
+		&send.destination, send.amount, inputs, change_key.public_key(),
+		send.change_pieces.clone(),
 	).await?;
 
 	let initial_update = MovementUpdate::new()
@@ -378,6 +415,7 @@ async fn finalize_arkoor_send(
 	signed_change_vtxos: &[Vtxo<Full>],
 	delivery_succeeded: bool,
 ) -> Result<(), AdvanceError> {
+	wallet.ensure_program_recoveries(signed_change_vtxos).await?;
 	wallet.mark_vtxos_as_spent(input_vtxo_ids).await?;
 
 	if !signed_change_vtxos.is_empty() {

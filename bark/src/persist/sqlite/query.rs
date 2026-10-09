@@ -3,7 +3,7 @@ use std::iter;
 use std::str::FromStr;
 
 use anyhow::{Context, ensure};
-use bitcoin::{Amount, Network, SignedAmount, Txid};
+use bitcoin::{Amount, Network, OutPoint, SignedAmount, Txid};
 use bitcoin::consensus;
 use bitcoin::bip32::Fingerprint;
 use bitcoin::hashes::hex::DisplayHex;
@@ -22,7 +22,9 @@ use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::persist::{RoundStateId, StoredRoundState};
 use crate::persist::models::{
-	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
+	merge_program_recovery, recovery_action_key, recovery_round_key, recovery_vtxo_key,
+	PaidInvoice, ProgramRecoveryRecord, SerdeProgramKey, SerdeRoundState,
+	SettledLightningReceive, StoredExit, Unlocked,
 };
 use crate::persist::sqlite::convert::{row_to_movement, row_to_wallet_vtxo, rows_to_wallet_vtxos};
 use crate::round::RoundState;
@@ -276,15 +278,47 @@ pub fn store_vtxo_with_initial_state(
 	vtxo: &Vtxo<Full>,
 	state: &VtxoState,
 ) -> anyhow::Result<()> {
+	let live = matches!(state, VtxoState::Spendable | VtxoState::Locked { .. });
+	if live {
+		ensure!(!has_program_recovery_reservation(tx, &recovery_vtxo_key(vtxo.id()))?,
+			"vtxo {} is reserved for program recovery", vtxo.id());
+	}
+	let mut reserved_ancestor = if live {
+		Some(tx.prepare(
+			"SELECT EXISTS(
+				SELECT 1 FROM bark_program_recovery_reservation WHERE key = ?1
+				AND NOT EXISTS(
+					SELECT 1 FROM bark_vtxo v
+					JOIN most_recent_vtxo_state s ON s.vtxo_id = v.id
+					WHERE v.id = ?2 AND s.state_kind = 'Spent'
+				)
+			)",
+		)?)
+	} else {
+		None
+	};
 	// Split the vtxo into bare bytes + genesis bytes, and precompute the
 	// genesis-derived summaries that listings/refresh-strategy will need
 	// without loading the genesis again.
 	let raw_bare = vtxo.to_bare().serialize();
 	let raw_genesis = vtxo.serialize_genesis();
 	let exit_depth = vtxo.exit_depth() as i64;
-	let exit_tx_weight = vtxo.transactions()
-		.map(|t| t.tx.weight().to_wu())
-		.sum::<u64>() as i64;
+	let exit_tx_weight = vtxo.transactions().try_fold(0u64, |weight, item| -> anyhow::Result<u64> {
+		if let Some(statement) = reserved_ancestor.as_mut() {
+			for input in &item.tx.input {
+				let ancestor = VtxoId::from(input.previous_output);
+				// Completed historical spends may be shared by unrelated
+				// outputs; only an unspent/absent reserved predecessor blocks.
+				let reserved: bool = statement.query_row(
+					params![recovery_vtxo_key(ancestor), ancestor.to_string()],
+					|row| row.get(0),
+				)?;
+				ensure!(!reserved, "vtxo {} has an ancestor reserved for program recovery: {ancestor}",
+					vtxo.id());
+			}
+		}
+		Ok(weight + item.tx.weight().to_wu())
+	})? as i64;
 
 	// Store the vtxo, ignoring if it already exists (idempotent)
 	let q1 =
@@ -339,9 +373,11 @@ pub fn store_round_state(
 }
 
 pub fn update_round_state(
-	conn: &Connection,
+	conn: &Transaction,
 	state: &StoredRoundState,
 ) -> anyhow::Result<()> {
+	ensure!(!has_program_recovery_reservation(conn, &recovery_round_key(state.id()))?,
+		"round {} is reserved for program recovery", state.id());
 	let bytes = rmp_serde::to_vec(&SerdeRoundState::from(state.state())).expect("can serialize");
 	let mut stmt = conn.prepare(
 		"UPDATE bark_round_state SET state = :state WHERE id = :id",
@@ -354,9 +390,11 @@ pub fn update_round_state(
 }
 
 pub fn remove_round_state(
-	conn: &Connection,
+	conn: &Transaction,
 	id: RoundStateId,
 ) -> anyhow::Result<()> {
+	ensure!(!has_program_recovery_reservation(conn, &recovery_round_key(id))?,
+		"round {id} is reserved for program recovery");
 	let mut stmt = conn.prepare(
 		"DELETE FROM bark_round_state WHERE id = :id",
 	)?;
@@ -600,6 +638,58 @@ pub fn get_vtxo_state(
 	}
 }
 
+pub fn has_program_recovery_reservation(conn: &Connection, key: &str) -> anyhow::Result<bool> {
+	Ok(conn.query_row(
+		"SELECT EXISTS(SELECT 1 FROM bark_program_recovery_reservation WHERE key = ?1)",
+		[key], |row| row.get(0),
+	)?)
+}
+
+/// Compare every complete state (or absence) under the caller's immediate
+/// transaction before publishing permanent takeover keys and exit states.
+pub fn reserve_program_recovery(
+	conn: &Transaction,
+	inputs: &[(VtxoId, Option<VtxoState>)],
+	actors: &[String],
+) -> anyhow::Result<()> {
+	let mut current_state = conn.prepare(
+		"SELECT s.state FROM bark_vtxo v
+		LEFT JOIN most_recent_vtxo_state s ON s.vtxo_id = v.id
+		WHERE v.id = ?1",
+	)?;
+	for (id, expected) in inputs {
+		let state: Option<Vec<u8>> = current_state.query_row(
+			[id.to_string()], |row| row.get(0),
+		).optional()?;
+		let state = state.map(|bytes| serde_json::from_slice::<VtxoState>(&bytes)).transpose()?;
+		ensure!(&state == expected, "vtxo {id} changed before program recovery reservation");
+	}
+
+	let mut reserve = conn.prepare(
+		"INSERT INTO bark_program_recovery_reservation (key) VALUES (?1)
+		ON CONFLICT(key) DO NOTHING",
+	)?;
+	for (id, _) in inputs {
+		reserve.execute([recovery_vtxo_key(*id)])?;
+	}
+	for key in actors {
+		reserve.execute([key])?;
+	}
+
+	let exited = serde_json::to_vec(&VtxoState::Exited)?;
+	let mut exit = conn.prepare(
+		"INSERT INTO bark_vtxo_state (vtxo_id, state_kind, state)
+		SELECT ?1, ?2, ?3 FROM most_recent_vtxo_state
+		WHERE vtxo_id = ?1 AND state_kind IN ('Spendable', 'Locked')",
+	)?;
+	for (id, expected) in inputs {
+		if matches!(expected, Some(VtxoState::Spendable | VtxoState::Locked { .. })) {
+			exit.execute(params![id.to_string(), VtxoStateKind::Exited.as_str(), &exited])?;
+		}
+	}
+	Ok(())
+}
+
 /// Updates the state of a VTXO from one of the
 /// values in `old_state` to `new_state`.
 ///
@@ -624,7 +714,10 @@ pub fn update_vtxo_state_checked(
 		WHERE
 			vtxo_id = :vtxo_id AND
 			state_kind IN (SELECT atom FROM json_each(:old_states)) AND
-			state != :state";
+			state != :state AND
+			(:state_kind NOT IN ('Spendable', 'Locked') OR NOT EXISTS(
+				SELECT 1 FROM bark_program_recovery_reservation WHERE key = :recovery_key
+			))";
 
 	let new_state_blob = serde_json::to_vec(&new_state)?;
 	let mut statement = conn.prepare(query)?;
@@ -633,6 +726,7 @@ pub fn update_vtxo_state_checked(
 		":state_kind": new_state.kind().as_str(),
 		":state": &new_state_blob,
 		":old_states": &serde_json::to_string(old_states)?,
+		":recovery_key": recovery_vtxo_key(vtxo_id),
 	})?;
 
 	match nb_inserted {
@@ -669,7 +763,9 @@ pub fn release_vtxo_lock(
 		SELECT :vtxo_id, :spendable_kind, :spendable FROM most_recent_vtxo_state
 		WHERE
 			vtxo_id = :vtxo_id AND
-			state = :expected_state";
+			state = :expected_state AND NOT EXISTS(
+				SELECT 1 FROM bark_program_recovery_reservation WHERE key = :recovery_key
+			)";
 
 	let expected = VtxoState::Locked { holder: holder.cloned() };
 	let expected_blob = serde_json::to_vec(&expected)?;
@@ -680,6 +776,7 @@ pub fn release_vtxo_lock(
 		":spendable_kind": VtxoState::Spendable.kind().as_str(),
 		":spendable": &spendable_blob,
 		":expected_state": &expected_blob,
+		":recovery_key": recovery_vtxo_key(vtxo_id),
 	})?;
 	if nb_inserted > 1 {
 		bail!("Corrupted database: inserted {nb_inserted} state rows for a single vtxo");
@@ -758,7 +855,11 @@ pub fn store_vtxo_key(
 		return Ok(());
 	}
 
-	let query = "INSERT INTO bark_vtxo_key (idx, public_key) VALUES (?1, ?2) ON CONFLICT DO NOTHING;";
+	if let Some(existing) = get_public_key_idx(conn, &public_key)? {
+		ensure!(existing == index, "vtxo public key already stored under index {existing}");
+		return Ok(());
+	}
+	let query = "INSERT INTO bark_vtxo_key (idx, public_key) VALUES (?1, ?2)";
 	let mut statement = conn.prepare(query)?;
 	statement.execute([index.to_sql()?, public_key.to_string().to_sql()?])?;
 	Ok(())
@@ -787,6 +888,89 @@ pub fn get_last_vtxo_key_index(conn: &Connection) -> anyhow::Result<Option<u32>>
 	} else {
 		Ok(None)
 	}
+}
+
+pub fn store_program_key(conn: &Transaction, record: &SerdeProgramKey) -> anyhow::Result<()> {
+	let public_key = record.program.public_key()?;
+	if let Some(existing) = get_program_key(conn, &public_key)? {
+		ensure!(existing == *record, "conflicting program descriptor for {public_key}");
+	}
+	store_vtxo_key(conn, record.index, public_key)?;
+	conn.execute(
+		"INSERT INTO bark_program_key (public_key, descriptor) VALUES (?1, ?2)
+			ON CONFLICT (public_key) DO NOTHING",
+		params![public_key.to_string(), serde_json::to_vec(record)?],
+	)?;
+	Ok(())
+}
+
+pub fn get_program_key(
+	conn: &Connection,
+	public_key: &PublicKey,
+) -> anyhow::Result<Option<SerdeProgramKey>> {
+	let bytes = conn.query_row(
+		"SELECT descriptor FROM bark_program_key WHERE public_key = ?1",
+		[public_key.to_string()],
+		|row| row.get::<_, Vec<u8>>(0),
+	).optional()?;
+	bytes.map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)).transpose()
+}
+
+pub fn get_program_key_by_index(
+	conn: &Connection,
+	index: u32,
+) -> anyhow::Result<Option<SerdeProgramKey>> {
+	let bytes = conn.query_row(
+		"SELECT p.descriptor FROM bark_program_key p
+			JOIN bark_vtxo_key k ON k.public_key = p.public_key WHERE k.idx = ?1",
+		[index],
+		|row| row.get::<_, Vec<u8>>(0),
+	).optional()?;
+	bytes.map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)).transpose()
+}
+
+pub fn list_program_keys(conn: &Connection) -> anyhow::Result<Vec<SerdeProgramKey>> {
+	let mut statement = conn.prepare(
+		"SELECT descriptor FROM bark_program_key ORDER BY public_key",
+	)?;
+	let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+	rows.map(|row| Ok(serde_json::from_slice(&row?)?)).collect()
+}
+
+pub fn store_program_recoveries(
+	conn: &Transaction,
+	records: &[ProgramRecoveryRecord],
+) -> anyhow::Result<()> {
+	for record in records {
+		let stored = get_program_recovery(conn, record.controlled_outpoint)?;
+		let merged = merge_program_recovery(stored, record)?;
+		conn.execute(
+			"INSERT INTO bark_program_recovery (controlled_outpoint, record) VALUES (?1, ?2)
+				ON CONFLICT (controlled_outpoint) DO UPDATE SET record = excluded.record",
+			params![record.controlled_outpoint.to_string(), serde_json::to_vec(&merged)?],
+		)?;
+	}
+	Ok(())
+}
+
+pub fn get_program_recovery(
+	conn: &Connection,
+	outpoint: OutPoint,
+) -> anyhow::Result<Option<ProgramRecoveryRecord>> {
+	let bytes = conn.query_row(
+		"SELECT record FROM bark_program_recovery WHERE controlled_outpoint = ?1",
+		[outpoint.to_string()],
+		|row| row.get::<_, Vec<u8>>(0),
+	).optional()?;
+	bytes.map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)).transpose()
+}
+
+pub fn list_program_recoveries(conn: &Connection) -> anyhow::Result<Vec<ProgramRecoveryRecord>> {
+	let mut statement = conn.prepare(
+		"SELECT record FROM bark_program_recovery ORDER BY controlled_outpoint",
+	)?;
+	let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+	rows.map(|row| Ok(serde_json::from_slice(&row?)?)).collect()
 }
 
 pub fn get_mailbox_checkpoint(conn: &Connection) -> anyhow::Result<u64> {
@@ -962,10 +1146,12 @@ pub fn get_exit_child_tx(
 }
 
 pub fn upsert_wallet_action_checkpoint(
-	conn: &Connection,
+	conn: &Transaction,
 	id: &WalletActionId,
 	checkpoint: &WalletActionCheckpoint,
 ) -> anyhow::Result<()> {
+	ensure!(!has_program_recovery_reservation(conn, &recovery_action_key(id))?,
+		"wallet action {id} is reserved for program recovery");
 	let payload = serde_json::to_vec(checkpoint)
 		.context("failed to serialize wallet action checkpoint")?;
 	let query = "
@@ -1018,12 +1204,53 @@ pub fn get_all_wallet_action_checkpoints(
 }
 
 pub fn remove_wallet_action_checkpoint(
-	conn: &Connection,
+	conn: &Transaction,
 	id: &WalletActionId,
 ) -> anyhow::Result<()> {
+	ensure!(!has_program_recovery_reservation(conn, &recovery_action_key(id))?,
+		"wallet action {id} is reserved for program recovery");
 	let query = "DELETE FROM bark_wallet_action_checkpoint WHERE id = :id";
 	let mut statement = conn.prepare(query)?;
 	statement.execute(named_params! { ":id": id })?;
+	Ok(())
+}
+
+/// Complete an action inside the caller's immediate transaction. Matching the
+/// full serialized lock state follows [release_vtxo_lock] and leaves historical
+/// locks (including inputs now spent or exited) alone. Keep the checkpoint until
+/// the same commit that publishes every unlock; an orphan lock is not safe to
+/// release without the checkpoint that justified completion.
+pub fn finish_wallet_action(
+	conn: &Transaction,
+	id: &WalletActionId,
+) -> anyhow::Result<()> {
+	ensure!(!has_program_recovery_reservation(conn, &recovery_action_key(id))?,
+		"wallet action {id} is reserved for program recovery");
+	let expected = serde_json::to_vec(&VtxoState::Locked {
+		holder: Some(VtxoLockHolder::Action { id: id.clone() }),
+	})?;
+	let removed = conn.execute(
+		"DELETE FROM bark_wallet_action_checkpoint WHERE id = ?1", [id],
+	)?;
+	if removed == 0 {
+		let has_owned_locks: bool = conn.query_row(
+			"SELECT EXISTS(SELECT 1 FROM most_recent_vtxo_state WHERE state = ?1)",
+			[&expected], |row| row.get(0),
+		)?;
+		ensure!(!has_owned_locks, "wallet action {id} has locks but no checkpoint");
+		return Ok(());
+	}
+
+	conn.execute(
+		"INSERT INTO bark_vtxo_state (vtxo_id, state_kind, state)
+		SELECT vtxo_id, :spendable_kind, :spendable FROM most_recent_vtxo_state
+		WHERE state = :expected_state",
+		named_params! {
+			":spendable_kind": VtxoStateKind::Spendable.as_str(),
+			":spendable": serde_json::to_vec(&VtxoState::Spendable)?,
+			":expected_state": &expected,
+		},
+	)?;
 	Ok(())
 }
 

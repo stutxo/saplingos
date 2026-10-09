@@ -144,6 +144,13 @@ pub trait OnchainWalletTrait: std::any::Any + Send + Sync {
 	///
 	/// Wallets should apply all necessary signatures and finalize inputs according
 	/// to their internal key management and policies.
+	///
+	/// Reject inputs already consumed by another wallet-known transaction,
+	/// including locally signed transactions not yet broadcast. An unsigned
+	/// board checkpoint can be resumed after its original coin-selection lock
+	/// was lost. Re-signing the exact same transaction remains allowed.
+	/// Before returning, durably record the completed spend so subsequent coin
+	/// selection cannot reuse its inputs.
 	async fn finish_psbt(&mut self, psbt: Psbt) -> anyhow::Result<Psbt>;
 
 	/// Creates a signed Child Pays for Parent (CPFP) transaction using a Pay-to-Anchor (P2A) output

@@ -284,8 +284,10 @@ impl Wallet {
 				// A row from an earlier, failed recovery attempt is forced along.
 				self.store_vtxos([vtxo], &VtxoState::Exited).await?;
 				self.mark_vtxos_as_exited(&[vtxo.id()]).await?;
-				self.exit_mgr()
-					.start_exit_for_vtxos_including_non_standard(&[vtxo.to_bare()]).await?;
+				if self.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none() {
+					self.exit_mgr()
+						.start_exit_for_vtxos_including_non_standard(&[vtxo.to_bare()]).await?;
+				}
 				report.push_exited(vtxo);
 				debug!("Skipping recovery vtxo {}: confirmed on-chain at height {height} (exited)", vtxo.id());
 				Ok(true)
@@ -320,9 +322,9 @@ impl Wallet {
 			},
 		};
 
-		// [`Wallet::find_vtxo_keypairs`] persists the keys it reveals, so each
-		// match extends the window the next candidate is scanned against.
-		let keypairs = self.find_vtxo_keypairs([vtxo.user_pubkey()], gap_limit).await?;
+		// Native gap scanning persists revealed keys. Program positions require
+		// their independently backed-up descriptors and signed recovery records.
+		let keypairs = self.find_vtxo_signing_keys([vtxo.user_pubkey()], gap_limit).await?;
 		let Some(keypair) = keypairs.get(&vtxo.user_pubkey()) else {
 			report.push_foreign(&vtxo);
 			return Ok(());
@@ -336,13 +338,22 @@ impl Wallet {
 			return Ok(());
 		}
 
+		if let Err(e) = self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await {
+			warn!("Recovery vtxo {id} has no usable saved program recovery: {e:#}");
+			self.quarantine_program_receive(
+				&vtxo, &vtxo.serialize(), "program deposit has no verified complete recovery",
+			).await?;
+			report.push_failed(id, Some(vtxo.amount()));
+			return Ok(());
+		}
+
 		if self.check_vtxo_onchain_status(report, &vtxo).await? {
 			return Ok(());
 		}
 
 		// The server is the authority on whether it was spent elsewhere,
 		// and recovery has nothing else to go on.
-		let adoption = self.fetch_vtxo_spend_state(id, keypair).await
+		let adoption = self.fetch_vtxo_spend_state(&vtxo, keypair).await
 			.and_then(ServerStatusAdoption::from_spend_state);
 
 		// NB we don't use store_spendable_vtxos to avoid posting the vtxo again

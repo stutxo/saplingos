@@ -216,6 +216,10 @@ impl ExitInner {
 		if vtxos.is_empty() {
 			return Ok(());
 		}
+		for vtxo in vtxos {
+			ensure!(self.persister.get_program_key(&vtxo.borrow().user_pubkey()).await?.is_none(),
+				"program VTXOs have pre-bound recovery outputs; use Wallet::recover_program_vtxos");
+		}
 		let tip = self.chain_source.tip().await?;
 		let params = Params::new(self.chain_source.network());
 		for vtxo in vtxos {
@@ -327,6 +331,8 @@ impl ExitInner {
 			let vtxo = input.get_exit_claim_input();
 
 			if let Some(vtxo) = vtxo {
+				ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
+					"immutable program claims cannot be added to a dynamic PSBT; use Wallet::recover_program_vtxos");
 				let exit_vtxo = claimable.get(&vtxo.id()).context("vtxo is not claimable yet")?;
 
 				let witness = wallet.sign_input(&vtxo, i, &mut shc, &prevouts).await
@@ -963,6 +969,8 @@ impl Exit {
 	/// - `address`: Destination address for the claim.
 	/// - `fee_rate_override`: Optional fee rate to use.
 	///
+	/// Program-backed inputs are rejected: their saved DEFAULT claims cannot be redirected
+	/// or batched. Use [`Wallet::recover_program_vtxos`] with an ordinary fee wallet instead.
 	/// Returns a PSBT ready to be broadcast.
 	pub async fn drain_exits(
 		&self,
@@ -983,6 +991,13 @@ impl Exit {
 		for input in inputs {
 			let i = input.borrow();
 			let vtxo = i.get_full_vtxo(&*guard.persister).await?;
+			if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await
+				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?.is_some()
+			{
+				return Err(ExitError::ClaimSigningError {
+					error: "program recovery beneficiaries are pre-bound; use Wallet::recover_program_vtxos".into(),
+				});
+			}
 			vtxos.insert(i.id(), vtxo);
 		}
 

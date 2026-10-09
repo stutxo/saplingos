@@ -9,7 +9,7 @@ pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
 use log::{debug, error, info, trace, warn};
-use ark::{ProtocolEncoding, Vtxo, VtxoId};
+use ark::{Vtxo, VtxoId};
 use ark::vtxo::{Full, VtxoRef};
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::protos::VtxoSpendState;
@@ -344,12 +344,13 @@ impl Wallet {
 		state: &VtxoState,
 	) -> anyhow::Result<()> {
 		let vtxos = vtxos.into_iter().map(|v| (v, state)).collect::<Vec<_>>();
+		if state.kind() == VtxoStateKind::Spendable {
+			for (vtxo, _) in &vtxos {
+				self.ensure_program_recoveries(std::slice::from_ref(*vtxo)).await?;
+			}
+		}
 		if let Err(e) = self.inner.db.store_vtxos(&vtxos).await {
 			error!("An error occurred while storing {} VTXOs: {:#}", vtxos.len(), e);
-			error!("Raw VTXOs for debugging:");
-			for (vtxo, _) in vtxos {
-				error!(" - {}", vtxo.serialize_hex());
-			}
 			Err(e)
 		} else {
 			debug!("Stored {} VTXOs", vtxos.len());
@@ -381,10 +382,10 @@ impl Wallet {
 			return Ok(None);
 		}
 
-		let (_idx, keypair) = self.pubkey_keypair(&stored.vtxo.user_pubkey()).await?
+		let keypair = self.signing_key(&stored.vtxo.user_pubkey()).await?
 			.with_context(|| format!("no key for vtxo {vtxo_id} in this wallet"))?;
 
-		let spend_state = self.fetch_vtxo_spend_state(vtxo_id, &keypair).await?;
+		let spend_state = self.fetch_vtxo_spend_state(&stored.vtxo, &keypair).await?;
 		let adoption = ServerStatusAdoption::from_spend_state(spend_state)
 			.with_context(|| format!("cannot decide the state of vtxo {vtxo_id}"))?;
 

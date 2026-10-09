@@ -6,7 +6,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::persist::adaptor::{Query, QueryRange, Record, StorageAdaptor, StorageAdaptorWrapper};
+use crate::persist::adaptor::{
+	validate_record_updates, Query, QueryRange, Record, RecordUpdate, StorageAdaptor,
+	StorageAdaptorWrapper,
+};
 
 /// In-memory storage adaptor for testing and simple use cases.
 ///
@@ -64,6 +67,35 @@ impl StorageAdaptor for MemoryStorageAdaptor {
 	async fn put(&mut self, record: Record) -> anyhow::Result<()> {
 		let partition = self.partitions.entry(record.partition).or_default();
 		partition.insert(record.pk.clone(), record);
+		Ok(())
+	}
+
+	async fn put_batch_checked(
+		&mut self, updates: Vec<RecordUpdate>, absent: &[(u8, Vec<u8>)],
+	) -> anyhow::Result<()> {
+		validate_record_updates(&updates)?;
+		for (partition, pk) in absent {
+			anyhow::ensure!(self.partitions.get(partition).and_then(|p| p.get(pk)).is_none(),
+				"record inserted during atomic update");
+		}
+		for update in &updates {
+			let record = update.record()?;
+			anyhow::ensure!(
+				self.partitions.get(&record.partition)
+					.and_then(|partition| partition.get(&record.pk)) == update.previous.as_ref(),
+				"record changed during atomic update",
+			);
+		}
+		// No fallible operations remain after checking the complete batch.
+		for update in updates {
+			if let Some(record) = update.updated {
+				self.partitions.entry(record.partition).or_default().insert(record.pk.clone(), record);
+			} else if let Some(previous) = update.previous {
+				if let Some(partition) = self.partitions.get_mut(&previous.partition) {
+					partition.remove(&previous.pk);
+				}
+			}
+		}
 		Ok(())
 	}
 

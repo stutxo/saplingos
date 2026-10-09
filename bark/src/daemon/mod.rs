@@ -358,6 +358,9 @@ impl DaemonProcess {
 		loop {
 			if let Some(wallet) = self.wallet() {
 				if wallet.inner.onchain.is_some() {
+					if let Err(e) = wallet.continue_program_recovery().await {
+						warn!("An error occurred while continuing program recovery: {:#}", e);
+					}
 					if let Err(e) = wallet.exit_mgr().progress_exits_with_cpfp(&wallet, None).await {
 						warn!("An error occurred while progressing exits: {:#}", e);
 					}

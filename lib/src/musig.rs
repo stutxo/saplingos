@@ -1,4 +1,7 @@
 
+pub mod context;
+pub mod nested;
+
 use std::fmt;
 
 pub use secp256k1_musig as secpm;

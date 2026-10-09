@@ -8,6 +8,7 @@ pub mod onchain;
 pub mod boards;
 pub mod wallet;
 pub mod bitcoin;
+pub mod receive;
 
 use std::sync::Arc;
 

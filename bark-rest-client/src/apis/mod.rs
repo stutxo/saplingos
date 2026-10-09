@@ -121,6 +121,7 @@ pub mod lightning_api;
 pub mod message_api;
 pub mod notifications_api;
 pub mod onchain_api;
+pub mod program_receive_api;
 pub mod wallet_api;
 
 pub mod configuration;

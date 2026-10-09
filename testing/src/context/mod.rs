@@ -644,6 +644,8 @@ impl TestContext {
 			bitcoind_pass: None,
 			bitcoind_zmq_address: bitcoind.map(|b| b.zmq_url()),
 			socks5_proxy: None,
+			sapio: None,
+			sapio_witnesses: Default::default(),
 
 			vtxo_refresh_expiry_threshold: BlockDelta::new(24),
 			vtxo_exit_margin: BlockDelta::new(12),

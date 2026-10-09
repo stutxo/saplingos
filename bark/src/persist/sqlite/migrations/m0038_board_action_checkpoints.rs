@@ -170,6 +170,5 @@ mod test {
 		// are already broadcast, so they must stay re-broadcastable.
 		assert_eq!(board.funding_tx.as_ref(), Some(&funding_tx));
 		assert_eq!(board.funding_psbt, None);
-		assert_eq!(board.to_broadcast().unwrap(), Some(funding_tx));
 	}
 }

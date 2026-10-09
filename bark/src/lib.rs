@@ -387,6 +387,7 @@ pub mod onchain;
 pub mod payment_request;
 pub mod persist;
 pub mod round;
+pub mod sapio;
 pub mod subsystem;
 pub mod vtxo;
 
@@ -825,6 +826,9 @@ struct WalletInner {
 	/// Persistence backend for wallet state (keys metadata, VTXOs, movements, round state, etc.).
 	db: Arc<dyn BarkPersister>,
 
+	/// Lazily initialized bounded transport for enclave and coordinated receive RPCs.
+	program_transport: tokio::sync::OnceCell<sapio::client::ProgramTransport>,
+
 	/// Coordinates access to the wallet's protected resources. The caller
 	/// picks a backend whose enforcement scope matches how the wallet is
 	/// deployed; see [`crate::lock_manager`].
@@ -1108,7 +1112,13 @@ impl Wallet {
 	/// * `Err(anyhow::Error)` - If an error occurred related to the database query
 	pub async fn pubkey_keypair(&self, public_key: &PublicKey) -> anyhow::Result<Option<(u32, Keypair)>> {
 		if let Some(index) = self.inner.db.get_public_key_idx(&public_key).await? {
-			Ok(Some((index, self.inner.seed.derive_vtxo_keypair(index))))
+			let keypair = self.inner.seed.derive_vtxo_keypair(index);
+			if keypair.public_key() != *public_key {
+				ensure!(self.inner.db.get_program_key(public_key).await?.is_some(),
+					"stored VTXO key does not match its derivation index");
+				return Ok(None);
+			}
+			Ok(Some((index, keypair)))
 		} else {
 			Ok(None)
 		}
@@ -1134,7 +1144,10 @@ impl Wallet {
 			.pubkey();
 		let idx = self.inner.db.get_public_key_idx(&pubkey).await?
 			.context("VTXO key not found")?;
-		Ok(self.inner.seed.derive_vtxo_keypair(idx))
+		let keypair = self.inner.seed.derive_vtxo_keypair(idx);
+		ensure!(keypair.public_key() == pubkey,
+			"program-owned VTXO has no local group key; use its external signer or saved recovery");
+		Ok(keypair)
 	}
 
 	#[deprecated(note = "use peek_address instead")]
@@ -1148,9 +1161,15 @@ impl Wallet {
 	pub async fn peek_address(&self, index: u32) -> anyhow::Result<ark::Address> {
 		let properties = self.properties().await?;
 		let network = properties.network;
-		let keypair = self.peek_keypair(index).await?;
+		let key = self.peek_signing_key(index).await?;
+		if let Some(program) = key.program() {
+			let server_pubkey = match properties.server_pubkey {
+				Some(public) => public,
+				None => self.require_server().await?.1.server_pubkey,
+			};
+			return self.coordinated_address(program, network, server_pubkey);
+		}
 		let mailbox = self.mailbox_identifier();
-
 
 		let (server_pubkey, mailbox_pubkey) =
 			if let (Some(spk), Some(mpk)) = (properties.server_pubkey, properties.server_mailbox_pubkey) {
@@ -1159,6 +1178,8 @@ impl Wallet {
 				let (_, ark_info) = self.require_server().await?;
 				(ark_info.server_pubkey, ark_info.mailbox_pubkey)
 			};
+
+		let keypair = key.local_keypair().context("native address key unavailable")?;
 
 		Ok(ark::Address::builder()
 			.testnet(network != bitcoin::Network::Bitcoin)
@@ -1174,12 +1195,12 @@ impl Wallet {
 	///
 	/// This derives and stores the keypair directly after currently last revealed one.
 	pub async fn new_address_with_index(&self) -> anyhow::Result<(ark::Address, u32)> {
-		let (_, index) = self.derive_store_next_keypair().await?;
+		let (_, index) = self.derive_store_next_signing_key().await?;
 		let addr = self.peek_address(index).await?;
 		Ok((addr, index))
 	}
 
-	/// Generate a new mailbox [ark::Address].
+	/// Generate a new address using the configured ownership and delivery protocol.
 	pub async fn new_address(&self) -> anyhow::Result<ark::Address> {
 		let (addr, _) = self.new_address_with_index().await?;
 		Ok(addr)
@@ -1189,6 +1210,8 @@ impl Wallet {
 	///
 	/// Returns `Ok(None)` if the address is not one of this wallet's own
 	/// addresses or its key has not been derived yet.
+	/// Program-backed addresses reject this operation: their cosigner accepts
+	/// authenticated transaction contexts and fixed ownership domains only.
 	///
 	/// The resulting signature can be verified with
 	/// [ark::message::verify_for_address] against the address.
@@ -1198,6 +1221,8 @@ impl Wallet {
 		address: &ark::Address,
 	) -> anyhow::Result<Option<secp256k1::schnorr::Signature>> {
 		let pubkey = address.policy().user_pubkey();
+		ensure!(self.inner.db.get_program_key(&pubkey).await?.is_none(),
+			"program-backed addresses do not support arbitrary message signing");
 		let Some((_, keypair)) = self.pubkey_keypair(&pubkey).await? else {
 			return Ok(None);
 		};
@@ -1220,8 +1245,6 @@ impl Wallet {
 		lock_manager: &dyn LockManager,
 		allow_unreachable_server: bool,
 	) -> anyhow::Result<()> {
-		trace!("Config: {:?}", config);
-
 		let wallet_fingerprint = seed.fingerprint();
 
 		// Block concurrent creators against the same locking universe. A
@@ -1333,6 +1356,7 @@ impl Wallet {
 			bail!("wallet does not exist; use Wallet::create or \
 				set options.create_if_not_exists to true");
 		};
+		if let Some(sapio) = &config.sapio { sapio.validate()?; }
 
 		if properties.fingerprint != fingerprint {
 			bail!("incorrect mnemonic")
@@ -1381,6 +1405,7 @@ impl Wallet {
 		let ret = Wallet { inner: Arc::new(WalletInner {
 			config, db, lock_manager, seed, exit, movements, notifications, server, chain,
 			onchain,
+			program_transport: tokio::sync::OnceCell::new(),
 			daemon: parking_lot::Mutex::new(None),
 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 			round_secret_nonces: RoundSecretNonces::new(),
@@ -1591,16 +1616,28 @@ impl Wallet {
 		vtxo.validate(&tx).map_err(VtxoValidationError::Invalid)
 	}
 
-	/// Ask the server for `vtxo_id`'s spend state.
-	///
-	/// `keypair` must be the VTXO's private key so we can prove ownership.
+	/// Ask the server for the VTXO's spend state with its native ownership proof.
+	/// Program ownership requires both shares, but never an arbitrary digest RPC.
 	pub(crate) async fn fetch_vtxo_spend_state(
 		&self,
-		vtxo_id: VtxoId,
-		keypair: &Keypair,
+		vtxo: impl VtxoRef,
+		key: &sapio::VtxoSigningKey,
 	) -> anyhow::Result<VtxoSpendState> {
+		let vtxo_id = vtxo.vtxo_id();
+		let attestation = if let Some(local) = key.local_keypair() {
+			VtxoStatusAttestation::new(vtxo_id, local)
+		} else {
+			let input = match vtxo.as_full_vtxo() {
+				Some(full) => full.clone(),
+				None => self.get_full_vtxo(vtxo_id).await?,
+			};
+			let bare = input.to_bare();
+			let signature = self.sign_vtxo_ownership(key, ark::sapio::protocol::OwnershipRequest {
+				input, proof: ark::sapio::protocol::OwnershipProof::Status,
+			}).await?;
+			VtxoStatusAttestation::from_signature(&bare, signature)?
+		};
 		let (mut srv, _) = self.require_server().await?;
-		let attestation = VtxoStatusAttestation::new(vtxo_id, keypair);
 		let resp = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
 			vtxo_id: vtxo_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
@@ -2214,9 +2251,9 @@ impl Wallet {
 		info!("Refreshing {} VTXOs (total amount = {}, fee = {}, output = {}).",
 			vtxos.len(), total_amount, fee, output_amount,
 		);
-		let (user_keypair, _) = self.derive_store_next_keypair().await?;
+		let (user_key, _) = self.derive_store_next_signing_key().await?;
 		let req = VtxoRequest {
-			policy: VtxoPolicy::Pubkey(PubkeyVtxoPolicy { user_pubkey: user_keypair.public_key() }),
+			policy: VtxoPolicy::Pubkey(PubkeyVtxoPolicy { user_pubkey: user_key.public_key() }),
 			amount: output_amount,
 		};
 

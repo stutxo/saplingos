@@ -22,8 +22,8 @@ use bark::actions::lightning::receive::{
 use crate::cli::fees::FeeSchedule;
 use crate::exit::error::ExitError;
 use crate::exit::package::ExitTransactionPackage;
-use crate::exit::{ExitState, ExitStateKind};
-use crate::primitives::{TransactionInfo, VtxoStateInfo, WalletVtxoInfo};
+use crate::exit::ExitState;
+use crate::primitives::{TransactionInfo, WalletVtxoInfo};
 use crate::serde_utils;
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,6 +301,11 @@ pub struct Balance {
 	#[serde(default, rename = "pending_exit_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64, required))]
 	pub pending_exit: Amount,
+	/// Sats reserved for immutable program recovery whose selected Bitcoin payout
+	/// has not confirmed. Alternative hArk branches count the same value only once.
+	#[serde(default, rename = "pending_program_recovery_sat", with = "bitcoin::amount::serde::as_sat")]
+	#[cfg_attr(feature = "utoipa", schema(value_type = u64, required))]
+	pub pending_program_recovery: Amount,
 }
 
 impl From<bark::DebugInfo> for DebugInfo {
@@ -322,6 +327,7 @@ impl From<bark::Balance> for Balance {
 			pending_lightning_send: v.pending_lightning_send,
 			claimable_lightning_receive: v.claimable_lightning_receive,
 			pending_exit: v.pending_exit,
+			pending_program_recovery: v.pending_program_recovery,
 			pending_board: v.pending_board,
 			pending_arkoor_send: v.pending_arkoor_send,
 			pending_offboard: v.pending_offboard,
@@ -366,7 +372,8 @@ impl From<&Balance> for BalanceSummary {
 			+ v.pending_lightning_send
 			+ v.claimable_lightning_receive
 			+ v.pending_offboard
-			+ v.pending_exit;
+			+ v.pending_exit
+			+ v.pending_program_recovery;
 		BalanceSummary {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,

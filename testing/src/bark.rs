@@ -294,6 +294,7 @@ impl Bark {
 
 		let mut steps = checkpoints.into_iter().map(|cp| match cp {
 			Cp::Board(b) => format!("board.{}", match b.progress {
+				board::Progress::PreparingFunding { .. } => "PreparingFunding",
 				board::Progress::Broadcasting { .. } => "Broadcasting",
 				board::Progress::Confirming { .. } => "Confirming",
 			}),
@@ -306,10 +307,12 @@ impl Bark {
 			Cp::Offboard(o) => format!("offboard.{}", match o.progress {
 				offboard::Progress::Start => "Start",
 				offboard::Progress::SplitWithArkoor => "SplitWithArkoor",
+				offboard::Progress::ArkoorCreated { .. } => "ArkoorCreated",
 				offboard::Progress::ArkoorRegistrationRequired { .. } =>
 					"ArkoorRegistrationRequired",
 				offboard::Progress::ReadyForOffboard { .. } => "ReadyForOffboard",
 				offboard::Progress::OffboardTxPrepared { .. } => "OffboardTxPrepared",
+				offboard::Progress::ForfeitsPrepared { .. } => "ForfeitsPrepared",
 				offboard::Progress::ReadyForBroadcast { .. } => "ReadyForBroadcast",
 				offboard::Progress::AwaitingConfirmations { .. } => "AwaitingConfirmations",
 			}),
@@ -578,7 +581,8 @@ impl Bark {
 			self.name,
 		);
 		let summary = json::cli::BalanceSummary::from(&balance);
-		assert_eq!(summary.pending, pending_locked + balance.pending_exit,
+		assert_eq!(summary.pending,
+			pending_locked + balance.pending_exit + balance.pending_program_recovery,
 			"{}: the summary's pending must be the sum of the pending fields: {balance:?}", self.name,
 		);
 		assert_eq!(summary.total, balance.spendable + balance.needs_refresh + summary.pending,

@@ -18,9 +18,10 @@ use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::LightningReceiveAttestation;
 use ark::fees::validate_and_subtract_fee;
 use ark::lightning::{Bolt11InvoiceExt, PaymentHash, Preimage};
+use ark::sapio::protocol::{OwnershipProof, OwnershipRequest};
 use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy};
 use ark::vtxo::Full;
-use bitcoin_ext::BlockDelta;
+use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::protos;
 use server_rpc::protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos;
 
@@ -139,8 +140,7 @@ impl WalletAction for LightningReceive {
 				}
 
 				match claim_lightning_receive_htlcs(wallet, &self, &htlcs, &mut preimage_revealed).await {
-					Ok(None) => return Ok(Advance::Done),
-					Ok(Some(delivery)) => Progress::Delivering(delivery),
+					Ok(delivery) => Progress::Delivering(delivery),
 					Err(e) => {
 						if preimage_revealed {
 							// Preimage is out but a post-reveal step failed. Park
@@ -163,10 +163,9 @@ impl WalletAction for LightningReceive {
 				}
 			},
 			Progress::PreimageRevealed(htlcs) => {
-				match claim_lightning_receive_htlcs(wallet, &self, &htlcs, &mut preimage_revealed).await? {
-					None => return Ok(Advance::Done),
-					Some(delivery) => Progress::Delivering(delivery),
-				}
+				Progress::Delivering(
+					claim_lightning_receive_htlcs(wallet, &self, &htlcs, &mut preimage_revealed).await?,
+				)
 			},
 			Progress::Delivering(delivery) => {
 				deliver_lightning_receive(wallet, &self, &delivery).await?;
@@ -177,15 +176,14 @@ impl WalletAction for LightningReceive {
 		Ok(Advance::Next(LightningReceive { progress: new_progress, ..self }))
 	}
 
-	/// The HTLCs once the preimage has been revealed. Before that the payment
-	/// can still be cancelled, so the sats are not the wallet's yet, and claim
-	/// outputs being delivered belong to another wallet.
+	/// The HTLCs once the preimage has been revealed. Completed claim outputs
+	/// remain in the checkpoint until registration and local storage or delivery.
 	fn pending_balance_vtxo_ids(&self) -> Vec<VtxoId> {
 		match &self.progress {
 			Progress::PreimageRevealed(htlcs) => htlcs.vtxo_ids.clone(),
+			Progress::Delivering(delivery) => delivery.input_vtxo_ids.clone(),
 			Progress::AwaitingPayment
 				| Progress::HtlcsReady(_)
-				| Progress::Delivering(_)
 			=> Vec::new(),
 		}
 	}
@@ -219,14 +217,11 @@ impl WalletAction for LightningReceive {
 
 	async fn on_rejection(self, wallet: &Wallet, error: AdvanceError) -> anyhow::Result<Advance<Self>> {
 		match self.progress.clone() {
-			// Nothing committed server-side: drop the row ourselves and
-			// surface the original error to the caller.
+			// The executor removes the row under its existing action lock and
+			// surfaces the original error.
 			Progress::AwaitingPayment => {
 				let id = self.id();
 				error!("Could not start lightning receive {}: {:?}", id, error);
-				if let Err(e) = wallet.stop_wallet_action(&id).await {
-					warn!("could not cancel awaiting-payment lightning receive {}: {:#}", id, e);
-				}
 				Ok(Advance::Failed(error.into()))
 			},
 			// Preimage not revealed yet: abandon locally (the inbound HTLC
@@ -259,9 +254,8 @@ pub enum Progress {
 	/// the caller falls back to an on-chain exit via
 	/// `Wallet::attempt_lightning_receive_exit`.
 	PreimageRevealed(Htlcs),
-	/// The claim outputs are cosigned and held locked; they still need
-	/// to be forwarded to the claim destination's mailbox. Only entered
-	/// when the receive has a claim destination that isn't our own.
+	/// Exact signed claim outputs awaiting registration and local settlement or
+	/// coordinated/mailbox delivery. Retries reuse these checkpointed signatures.
 	Delivering(Delivery),
 }
 
@@ -283,15 +277,17 @@ pub(crate) enum Grant {
 	Rejected(anyhow::Error),
 }
 
-/// A handle for the cosigned claim outputs awaiting forwarding to the
-/// claim destination
+/// The exact cosigned claim outputs awaiting registration and settlement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delivery {
-	/// The VTXOs to be delivered to an external party.
+	/// Signed claim outputs, owned locally or by the requested destination.
 	#[serde(with = "ark::encode::serde::vec")]
 	pub vtxos: Vec<Vtxo<Full>>,
 	/// The ID of the ongoing movement
 	pub movement_id: MovementId,
+	/// HTLC inputs consumed only after this signed-output checkpoint is durable.
+	#[serde(default)]
+	pub input_vtxo_ids: Vec<VtxoId>,
 }
 
 /// Triage of a payment hash on the receive side, mirroring
@@ -357,6 +353,8 @@ pub(crate) async fn start_lightning_receive(
 		);
 	}
 
+	let (_, key_index) = wallet.derive_store_next_signing_key().await?;
+
 	let preimage = Preimage::random();
 	let payment_hash = preimage.compute_payment_hash();
 	info!("Start bolt11 receive with payment hash: {}", payment_hash);
@@ -378,8 +376,6 @@ pub(crate) async fn start_lightning_receive(
 	let invoice = Bolt11Invoice::from_str(&resp.bolt11)
 		.context("invalid bolt11 invoice returned by Ark server")?;
 	validate_bolt11_payment_hash(&invoice, payment_hash)?;
-
-	let (_, key_index) = wallet.derive_store_next_keypair().await?;
 
 	Ok(LightningReceive {
 		invoice,
@@ -411,9 +407,17 @@ pub(crate) async fn compute_lightning_receive_anti_dos(
 			.filter(|v| v.expiry_height() > tip + BlockDelta::new(2))
 			.choose(&mut rand::rng())
 			.context("have no spendable vtxo with sufficient expiry margin to prove ownership of")?;
-		let vtxo_keypair = wallet.get_vtxo_key(&vtxo).await
-			.expect("owned vtxo should be in database");
-		let attestation = LightningReceiveAttestation::new(payment_hash, vtxo.id(), &vtxo_keypair);
+		let input = wallet.inner.db.get_full_vtxo(vtxo.id()).await?
+			.context("owned proof vtxo is missing")?;
+		let key = wallet.vtxo_signing_key(&input).await?;
+		let proof_vtxo = input.to_bare();
+		let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
+			input,
+			proof: OwnershipProof::LightningReceive { payment_hash },
+		}).await?;
+		let attestation = LightningReceiveAttestation::from_signature(
+			payment_hash, &proof_vtxo, signature,
+		).context("invalid lightning receive ownership signature")?;
 		LightningReceiveAntiDos::InputVtxo(protos::InputVtxo {
 			vtxo_id: vtxo.id().to_bytes().to_vec(),
 			attestation: attestation.serialize(),
@@ -502,10 +506,10 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 	};
 
 	let htlc_recv_expiry = current_height + recv.htlc_recv_cltv_delta;
-	let keypair = wallet.peek_keypair(recv.key_index).await?;
+	let key = wallet.peek_signing_key(recv.key_index).await?;
 	let req = protos::PrepareLightningReceiveClaimRequest {
 		payment_hash: payment_hash.to_vec(),
-		user_pubkey: keypair.public_key().serialize().to_vec(),
+		user_pubkey: key.public_key().serialize().to_vec(),
 		htlc_recv_expiry: htlc_recv_expiry.into(),
 		lightning_receive_anti_dos,
 	};
@@ -529,7 +533,7 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 				return Err(anyhow!("invalid payment hash on HTLC VTXOs received from server: {}",
 					p.payment_hash).into());
 			}
-			if p.user_pubkey != keypair.public_key() {
+			if p.user_pubkey != key.public_key() {
 				return Err(anyhow!("invalid pubkey on HTLC VTXOs received from server: {}",
 					p.user_pubkey).into());
 			}
@@ -600,6 +604,16 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 		return Err(anyhow!("Server didn't return enough VTXOs to cover invoice amount").into());
 	}
 
+	// No preimage leaves the wallet until the native HTLC claim clause has
+	// a fully signed, program-authorized recovery on durable storage.
+	wallet.prepare_program_recoveries(&vtxos).await?;
+	wallet.ensure_program_recoveries(&vtxos).await?;
+	if htlc_claim_window_closed(wallet, &vtxos).await? {
+		return Ok(Grant::Rejected(anyhow!(
+			"saved HTLC recovery cannot confirm before the granted deadlines",
+		)));
+	}
+
 	let movement_id = wallet.inner.movements.get_or_create_movement_with_action(
 		Subsystem::LIGHTNING_RECEIVE,
 		LightningReceiveMovement::Receive.to_string(),
@@ -628,21 +642,22 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 	}))
 }
 
-/// Claiming -> done, or -> Delivering when the receive has a claim
-/// destination that isn't our own. Reveals the preimage to the server in
-/// exchange for a cosigned claim. Local receives finalise the movement
-/// and write the permanent settled record here; external destinations
-/// hold the outputs locked and hand off to [`deliver_lightning_receive`].
-///
-/// The server's `claim_lightning_receive` is idempotent on payment hash,
-/// so this is safe to re-drive after a crash: a fresh cosign is returned
-/// for the new nonces.
+/// Claim HTLCs without exporting the completed outputs. Recovery authorization
+/// and recipient preparation precede the preimage RPC; the action checkpoints
+/// its exact signed result before registration or delivery.
 async fn claim_lightning_receive_htlcs(
 	wallet: &Wallet,
 	recv: &LightningReceive,
 	htlcs: &Htlcs,
 	preimage_revealed: &mut bool,
-) -> Result<Option<Delivery>, AdvanceError> {
+) -> Result<Delivery, AdvanceError> {
+	if let Some(checkpoint) = wallet.inner.db.get_wallet_action_checkpoint(&recv.id()).await?
+		.and_then(|cp| cp.into_lightning_receive())
+	{
+		if let Progress::Delivering(delivery) = checkpoint.progress {
+			return Ok(delivery);
+		}
+	}
 	let (mut srv, _) = wallet.require_server().await?;
 
 	// Order inputs by vtxoid before generating nonces, then hydrate to
@@ -652,27 +667,46 @@ async fn claim_lightning_receive_htlcs(
 	let inputs = wallet.inner.db.get_full_vtxos(&input_ids).await
 		.context("failed to hydrate htlc input vtxos")?;
 
-	let mut keypairs = Vec::with_capacity(inputs.len());
-	for v in &inputs {
-		keypairs.push(wallet.get_vtxo_key(v).await?);
-	}
+	wallet.ensure_program_recoveries(&inputs).await?;
 
 	let receive_policy = if let Some(destination) = recv.claim_destination.as_ref() {
 		destination.policy().clone()
 	} else {
-		let claim_key = wallet.peek_keypair(recv.key_index).await?.public_key();
+		let claim_key = wallet.peek_signing_key(recv.key_index).await?.public_key();
 		VtxoPolicy::new_pubkey(claim_key)
 	};
 	trace!("ln claim arkoor params: inputs: {:?}; policy: {:?}", input_ids, receive_policy);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		inputs, receive_policy,
-	).context("creating claim arkoor builder failed")?
-		.generate_user_nonces(&keypairs)
-		.context("arkoor nonce generation for claim failed")?;
+	).context("creating claim arkoor builder failed")?;
+	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+	wallet.prepare_program_recoveries(&candidates).await?;
+	if let Some(destination) = recv.claim_destination.as_ref() {
+		wallet.prepare_program_receives(destination, &candidates).await?;
+	}
+	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+		part.iter().map(|signature| signature.public_nonce()).collect()
+	}).collect()).context("failed to install lightning receive nonces")?;
+	let package_cosign_request = protos::ArkoorPackageCosignRequest::from(
+		builder.cosign_request_with_attestations(attestations)
+			.context("invalid lightning receive attestations")?,
+	);
 
+	// Preparation may contact a program or recipient; recheck chain timing
+	// immediately before committing the payment.
+	if !matches!(&recv.progress, Progress::PreimageRevealed(_))
+		&& is_htlc_claim_window_closed(wallet, htlcs).await?
+	{
+		return Err(anyhow!("HTLC claim window closed before preimage disclosure").into());
+	}
+	let checkpoint = LightningReceive {
+		progress: Progress::PreimageRevealed(htlcs.clone()),
+		..recv.clone()
+	};
+	wallet.inner.db.upsert_wallet_action_checkpoint(&recv.id(), &checkpoint.into()).await?;
 	info!("Claiming arkoor against payment preimage for {}", recv.payment_hash);
 	*preimage_revealed = true;
-	let package_cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	let resp = srv.client.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: recv.payment_hash.to_byte_array().to_vec(),
 		payment_preimage: recv.payment_preimage.to_vec(),
@@ -680,92 +714,85 @@ async fn claim_lightning_receive_htlcs(
 	}).await.map_err(AdvanceError::Server)?.into_inner();
 	let cosign_resp = resp.try_into().context("invalid cosign response")?;
 
-	let mut outputs = builder.user_cosign(&keypairs, cosign_resp)
-		.context("claim arkoor cosign failed with user response")?
-		.build_signed_vtxos();
+	builder.verify_cosign_response(&cosign_resp)
+		.context("invalid lightning receive cosign response")?;
+	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_resp).await?;
+	let mut outputs = builder.finish_external(signatures)
+		.context("claim arkoor cosign failed with user response")?.build_signed_vtxos();
 
-	// Register the claim outputs so they are spendable for any later flow.
-	wallet.register_vtxo_transactions_with_server(&outputs).await?;
-
-	let mut effective_balance = Amount::ZERO;
 	for vtxo in &outputs {
-		// NB: bailing here results in vtxos not being registered despite the
-		// preimage being revealed. The server's claim_lightning_receive is
-		// idempotent, so bark can retry and obtain fresh cosign signatures.
 		trace!("Validating Lightning receive claim VTXO {}: {}", vtxo.id(), vtxo.serialize_hex());
 		wallet.validate_vtxo(vtxo).await
 			.context("invalid arkoor from lightning receive")?;
-		effective_balance += vtxo.amount();
 	}
 
 	info!("Got arkoors from lightning: {}",
 		outputs.iter().map(|v| v.id().to_string()).collect::<Vec<_>>().join(", "));
 
-	// A destination owned by this wallet needs no mailbox delivery: the
-	// outputs are already keyed to one of our pubkeys.
-	let external_destination = match recv.claim_destination.as_ref() {
-		Some(destination) => wallet.pubkey_keypair(&destination.policy().user_pubkey())
-			.await?.is_none(),
-		None => false,
+	outputs.sort_unstable();
+	let delivery = Delivery {
+		vtxos: outputs,
+		movement_id: htlcs.movement_id,
+		input_vtxo_ids: input_ids,
 	};
-
-	if external_destination {
-		wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await?;
-		outputs.sort_unstable();
-		return Ok(Some(Delivery {
-			vtxos: outputs,
-			movement_id: htlcs.movement_id,
-		}));
-	}
-
-	if let Err(e) = wallet.post_recovery_vtxo_ids(outputs.iter().map(|v| v.id())).await {
-		error!("Failed to post recovery vtxo IDs to server: {:#}", e);
-	}
-	// Spend the inputs first: these two writes can't be atomic, and counting
-	// the receive in neither balance for a moment beats counting it in both.
-	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await?;
-	wallet.store_vtxos(&outputs, &VtxoState::Spendable).await?;
-
-	wallet.inner.movements.finish_movement_with_update(
-		htlcs.movement_id,
-		MovementStatus::Successful,
-		MovementUpdate::new()
-			.effective_balance(effective_balance.to_signed().context("effective balance out of range")?)
-			.produced_vtxos(&outputs),
-	).await.context("failed to finish lightning receive movement")?;
-
-	let amount = recv.invoice.get_payment_amount(None).unwrap_or(effective_balance);
-	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
-	).await?;
-
-	Ok(None)
+	let checkpoint = LightningReceive {
+		progress: Progress::Delivering(delivery.clone()),
+		..recv.clone()
+	};
+	wallet.inner.db.upsert_wallet_action_checkpoint(&recv.id(), &checkpoint.into()).await?;
+	Ok(delivery)
 }
 
-/// Delivering -> done. Forwards the locked claim outputs to the claim
-/// destination's mailbox, then finalises the movement and writes the
-/// permanent settled record. Re-driving after a crash at most posts the
-/// same vtxos to the mailbox again.
+/// Delivering -> done. Only checkpointed signed outputs reach registration,
+/// coordinated recipients or mailboxes. Local claims are stored as spendable.
 async fn deliver_lightning_receive(
 	wallet: &Wallet,
 	recv: &LightningReceive,
 	delivery: &Delivery,
 ) -> Result<(), AdvanceError> {
-	let destination = recv.claim_destination.as_ref()
-		.context("delivering receive has no claim destination")?;
-	deliver_vtxos_to_address(wallet, destination, &delivery.vtxos).await
-		.context("failed to deliver lightning receive claim output to destination mailbox")?;
+	for vtxo in &delivery.vtxos {
+		if wallet.inner.db.get_wallet_vtxo(vtxo.id()).await?
+			.is_some_and(|v| v.state.kind() == crate::vtxo::VtxoStateKind::Exited)
+		{
+			wallet.exit_lightning_receive_with_guard(recv).await?;
+			return Ok(());
+		}
+	}
+	wallet.ensure_program_recoveries(&delivery.vtxos).await?;
+	let external_destination = match recv.claim_destination.as_ref() {
+		Some(destination) => wallet.signing_key(&destination.policy().user_pubkey())
+			.await?.is_none(),
+		None => false,
+	};
+	if let Some(destination) = recv.claim_destination.as_ref() {
+		wallet.commit_program_receives(destination, &delivery.vtxos).await?;
+	}
+	wallet.register_vtxo_transactions_with_server(&delivery.vtxos).await?;
+	wallet.mark_vtxos_as_spent(&delivery.input_vtxo_ids).await?;
 
-	let delivered = delivery.vtxos.iter().map(|v| v.amount()).sum();
-	wallet.inner.movements.finish_movement_with_update(
-		delivery.movement_id,
-		MovementStatus::Successful,
+	let received = delivery.vtxos.iter().map(|v| v.amount()).sum();
+	let update = if external_destination {
+		let destination = recv.claim_destination.as_ref()
+			.context("external receive has no claim destination")?;
+		deliver_vtxos_to_address(wallet, destination, &delivery.vtxos).await
+			.context("failed to deliver lightning receive claim outputs")?;
 		MovementUpdate::new()
 			.effective_balance(SignedAmount::ZERO)
-			.sent_to([MovementDestination::ark(destination.clone(), delivered)]),
+			.sent_to([MovementDestination::ark(destination.clone(), received)])
+	} else {
+		if let Err(e) = wallet.post_recovery_vtxo_ids(delivery.vtxos.iter().map(|v| v.id())).await {
+			error!("Failed to post recovery vtxo IDs to server: {:#}", e);
+		}
+		wallet.store_vtxos(&delivery.vtxos, &VtxoState::Spendable).await?;
+		MovementUpdate::new()
+			.effective_balance(received.to_signed().context("received amount out of range")?)
+			.produced_vtxos(&delivery.vtxos)
+	};
+	wallet.inner.movements.finish_movement_with_update(
+		delivery.movement_id, MovementStatus::Successful, update,
 	).await.context("failed to finish lightning receive movement")?;
 
-	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
+	let amount = recv.invoice.get_payment_amount(None).unwrap_or(received);
 	wallet.inner.db.record_settled_lightning_receive(
 		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
 	).await?;
@@ -778,6 +805,10 @@ async fn deliver_vtxos_to_address(
 	destination: &ark::Address,
 	vtxos: &[Vtxo<ark::vtxo::Full>],
 ) -> anyhow::Result<()> {
+	if crate::sapio::receive::is_coordinated_address(destination)? {
+		// The checkpointed outputs were committed through the coordinator.
+		return Ok(());
+	}
 	let (mut srv, _) = wallet.require_server().await?;
 
 	match post_arkoor_to_mailboxes(&mut srv, destination.delivery(), vtxos).await {
@@ -819,35 +850,107 @@ pub(crate) async fn is_htlc_claim_window_closed(
 ) -> anyhow::Result<bool> {
 	ensure!(!htlcs.vtxo_ids.is_empty(), "no HTLC vtxos on receive");
 
-	let config = wallet.config();
-	let tip = wallet.inner.chain.tip().await?;
+	// Revalidate the exact persisted claims, not the current configuration.
 	// Bails if any id is missing, so every granted vtxo is checked.
 	let vtxos = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await
 		.context("failed to hydrate htlc vtxos")?;
-	for vtxo in &vtxos {
+	wallet.ensure_program_recoveries(&vtxos).await?;
+	htlc_claim_window_closed(wallet, &vtxos).await
+}
+
+async fn htlc_claim_window_closed(wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> anyhow::Result<bool> {
+	let config = wallet.config();
+	let tip = wallet.inner.chain.tip().await?;
+	let mut median_time = None;
+	for vtxo in vtxos {
 		let p = match vtxo.policy() {
 			VtxoPolicy::ServerHtlcRecv(p) => p,
 			other => bail!("HTLC receive vtxo has unexpected policy: {:?}", other),
 		};
 
-		let claim_by = htlc_recv_exit_blocks_needed(
+		let claim_by = tip.checked_add(htlc_recv_exit_blocks_needed(
 			vtxo.exit_delta(), p.htlc_expiry_delta, config,
-		).map(|blocks| tip + blocks)?;
+		)?).context("HTLC claim deadline overflows")?;
 		if claim_by > p.htlc_expiry {
 			debug!("HTLC vtxo {} needs until height {} to claim, but the server \
 				can claim it from height {}", vtxo.id(), claim_by, p.htlc_expiry);
 			return Ok(true);
 		}
 
-		let tree_expiry_by = tip + htlc_recv_tree_blocks_needed(config);
+		let tree_expiry_by = tip.checked_add(htlc_recv_tree_blocks_needed(config))
+			.context("HTLC tree deadline overflows")?;
 		if tree_expiry_by > vtxo.expiry_height() {
 			debug!("HTLC vtxo {} needs its backing tree until height {}, but it \
 				expires at height {}", vtxo.id(), tree_expiry_by, vtxo.expiry_height());
 			return Ok(true);
 		}
+
+		if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_some() {
+			let record = wallet.inner.db.get_program_recovery(vtxo.point()).await?
+				.context("missing persisted HTLC recovery claim")?;
+			if !record.claim.lock_time.is_block_height() && median_time.is_none() {
+				// Timestamp locks use Bitcoin's previous-block median time, not
+				// wall clock. Do not predict its growth against a height deadline.
+				let mut times = [0u32; 11];
+				let mut count = 0;
+				for height in tip.to_u32().saturating_sub(10)..=tip.to_u32() {
+					let block_ref = wallet.inner.chain.block_ref(BlockHeight::new(height)).await?;
+					let block = wallet.inner.chain.block(block_ref.hash).await?
+						.context("missing block for HTLC recovery median time")?;
+					times[count] = block.header.time;
+					count += 1;
+				}
+				times[..count].sort_unstable();
+				median_time = Some(times[count / 2]);
+			}
+			if !program_htlc_recovery_fits(
+				&record.claim, record.ancestors.len(), tip, p.htlc_expiry,
+				vtxo.expiry_height(), config, median_time,
+			)? {
+				return Ok(true);
+			}
+		}
 	}
 
 	Ok(false)
+}
+
+/// Bound the exact immutable recovery's parent publication, CSV, absolute
+/// locktime and claim confirmations. Tree expiry only races the ancestry;
+/// HTLC expiry races the claim itself.
+fn program_htlc_recovery_fits(
+	claim: &bitcoin::Transaction,
+	ancestor_count: usize,
+	tip: BlockHeight,
+	htlc_expiry: BlockHeight,
+	tree_expiry: BlockHeight,
+	config: &Config,
+	median_time: Option<u32>,
+) -> anyhow::Result<bool> {
+	ensure!(claim.input.len() == 1, "HTLC recovery must have one input");
+	let sequence = claim.input[0].sequence.to_consensus_u32();
+	ensure!(sequence <= u16::MAX as u32, "HTLC recovery requires block-based CSV");
+	// Recovery publishes v3 ancestors one at a time. Include a potentially
+	// unconfirmed root, even when the ordinary native margin is too small.
+	let ancestry_blocks = u32::try_from(ancestor_count)?.checked_add(1)
+		.context("HTLC recovery ancestry budget overflows")?
+		.max(config.vtxo_exit_margin.to_u32());
+	let parent_by = tip.to_u32().checked_add(ancestry_blocks)
+		.context("HTLC recovery parent deadline overflows")?;
+	if parent_by >= tree_expiry.to_u32() { return Ok(false); }
+	let mut maturity = parent_by.checked_add(sequence)
+		.context("HTLC recovery relative maturity overflows")?;
+	let locktime = claim.lock_time.to_consensus_u32();
+	if claim.lock_time.is_block_height() {
+		maturity = maturity.max(locktime.checked_add(1).context("HTLC recovery locktime overflows")?);
+	} else if median_time.context("missing HTLC recovery median time")? <= locktime {
+		// Future timestamp plans cannot promise maturity before a block height.
+		// Reject them rather than modifying or re-signing an authorized claim.
+		return Ok(false);
+	}
+	let claim_by = maturity.checked_add(config.htlc_recv_claim_delta.to_u32().max(1))
+		.context("HTLC recovery confirmation deadline overflows")?;
+	Ok(claim_by < htlc_expiry.to_u32())
 }
 
 /// Whether an unpaid invoice has passed its bolt11 expiry plus a grace
@@ -866,6 +969,64 @@ mod tests {
 	use super::*;
 
 	const TEST_INVOICE_STR: &str = "lntbs100u1p5j0x82sp5d0rwfh7tgrrlwsegy9rx3tzpt36cqwjqza5x4wvcjxjzscfaf6jspp5d8q7354dg3p8h0kywhqq5dq984r8f5en98hf9ln85ug0w8fx6hhsdqqcqzpc9qyysgqyk54v7tpzprxll7e0jyvtxcpgwttzk84wqsfjsqvcdtq47zt2wssxsmtjhz8dka62mdnf9jafhu3l4cpyfnsx449v4wstrwzzql2w5qqs8uh7p";
+
+	#[test]
+	fn program_htlc_recovery_rejects_late_fixed_locktime_without_modifying_claim() {
+		let mut config = Config::network_default(bitcoin::Network::Bitcoin);
+		config.vtxo_exit_margin = BlockDelta::new(3);
+		config.htlc_recv_claim_delta = BlockDelta::new(2);
+		let mut claim = bitcoin::Transaction {
+			version: bitcoin::transaction::Version(3),
+			lock_time: bitcoin::absolute::LockTime::from_height(120).unwrap(),
+			input: vec![bitcoin::TxIn {
+				sequence: bitcoin::Sequence::from_height(5),
+				..Default::default()
+			}],
+			output: vec![],
+		};
+		let saved = claim.clone();
+		let fits = |claim: &bitcoin::Transaction, tip, expiry, tree, ancestors, mtp| {
+			program_htlc_recovery_fits(
+				claim, ancestors, BlockHeight::new(tip), BlockHeight::new(expiry),
+				BlockHeight::new(tree), &config, mtp,
+			).unwrap()
+		};
+		// Native CSV could finish by 110, but the saved absolute lock cannot.
+		assert!(!fits(&claim, 100, 120, 110, 2, None));
+		assert!(!fits(&claim, 100, 123, 110, 2, None));
+		assert!(fits(&claim, 100, 124, 110, 2, None));
+		assert_eq!(claim, saved);
+		claim.lock_time = bitcoin::absolute::LockTime::ZERO;
+		assert!(fits(&claim, 100, 111, 110, 2, None));
+		// Recheck immediately before disclosure: one block consumes the budget.
+		assert!(!fits(&claim, 101, 111, 110, 2, None));
+		assert!(!fits(&claim, 100, 140, 110, 9, None));
+		claim.input[0].sequence = bitcoin::Sequence::from_height(35);
+		assert!(!fits(&claim, 100, 140, 150, 2, None));
+	}
+
+	#[test]
+	fn program_htlc_recovery_rejects_future_timestamp_even_with_height_headroom() {
+		let mut config = Config::network_default(bitcoin::Network::Bitcoin);
+		config.vtxo_exit_margin = BlockDelta::new(3);
+		config.htlc_recv_claim_delta = BlockDelta::new(2);
+		let claim = bitcoin::Transaction {
+			version: bitcoin::transaction::Version(3),
+			lock_time: bitcoin::absolute::LockTime::from_time(1_800_000_000).unwrap(),
+			input: vec![bitcoin::TxIn {
+				sequence: bitcoin::Sequence::from_height(5),
+				..Default::default()
+			}],
+			output: vec![],
+		};
+		for median in [1_799_999_999, 1_800_000_000, 1_800_000_001] {
+			assert_eq!(program_htlc_recovery_fits(
+				&claim, 2, BlockHeight::new(100), BlockHeight::new(1_000),
+				BlockHeight::new(1_000), &config, Some(median),
+			).unwrap(), median > 1_800_000_000);
+		}
+		assert_eq!(claim.lock_time.to_consensus_u32(), 1_800_000_000);
+	}
 
 	fn test_bolt11() -> Bolt11Invoice {
 		Bolt11Invoice::from_str(TEST_INVOICE_STR).expect("valid test invoice")

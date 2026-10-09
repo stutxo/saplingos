@@ -28,6 +28,7 @@ use bitcoin_ext::{fee, BlockDelta, BlockHeight, KeypairExt, NonStandardOutput, T
 
 use crate::{musig, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, SECP};
 use crate::connectors::construct_multi_connector_fanout_tx;
+use crate::musig::context::{SigningContextError, SigningInput};
 use crate::vtxo::{Bare, Full};
 
 
@@ -133,6 +134,8 @@ pub enum OffboardForfeitError {
 	MissingConnectorOutput,
 	#[error(transparent)]
 	InvalidUserPartialSignature(#[from] InvalidUserPartialSignatureError),
+	#[error(transparent)]
+	InvalidSigningContext(#[from] SigningContextError),
 }
 
 impl OffboardForfeitError {
@@ -254,6 +257,80 @@ impl<'a, V> OffboardForfeitContext<'a, V>
 where
 	V: AsRef<Vtxo<Full>>,
 {
+	/// Build one authenticated external-signing context per input VTXO, in input order.
+	///
+	/// Call [Self::validate_offboard_tx] first to bind the server's transaction to
+	/// the requested destination and amount. Both forfeit prevouts are included;
+	/// multi-input offboards use the actual fanout outputs, not its combined input.
+	pub fn signing_inputs(&self) -> Result<Vec<SigningInput>, OffboardForfeitError> {
+		let connector_out = self.offboard_tx.output.get(OFFBOARD_TX_CONNECTOR_VOUT)
+			.ok_or(OffboardForfeitError::MissingConnectorOutput)?;
+		let connector_root = OutPoint::new(
+			self.offboard_tx.compute_txid(), OFFBOARD_TX_CONNECTOR_VOUT as u32,
+		);
+		let fanout = if self.input_vtxos.len() > 1 {
+			Some(construct_multi_connector_fanout_tx(
+				connector_root, self.input_vtxos.len(), &connector_out.script_pubkey,
+			))
+		} else {
+			None
+		};
+		let connector_parent = fanout.as_ref().unwrap_or(self.offboard_tx);
+		let connector_txid = connector_parent.compute_txid();
+		let mut ret = Vec::with_capacity(self.input_vtxos.len());
+		for (i, vtxo) in self.input_vtxos.iter().enumerate() {
+			let vtxo = vtxo.as_ref();
+			let connector_index = if fanout.is_some() { i } else { OFFBOARD_TX_CONNECTOR_VOUT };
+			let connector_txout = connector_parent.output.get(connector_index)
+				.ok_or(SigningContextError::InvalidContext("missing connector fanout output"))?;
+			let connector = OutPoint::new(connector_txid, u32::try_from(connector_index)
+				.map_err(|_| SigningContextError::InvalidContext("connector index exceeds u32"))?);
+			let tx = create_offboard_forfeit_tx(vtxo, connector, None, None);
+			let mut input = SigningInput::key_spend(
+				tx, 0, vec![vtxo.txout(), connector_txout.clone()],
+				&vtxo.output_taproot(), vec![vtxo.user_pubkey(), vtxo.server_pubkey()],
+			)?;
+			input.psbt.inputs[1].non_witness_utxo = Some(connector_parent.clone());
+			ret.push(input);
+		}
+		Ok(ret)
+	}
+
+	/// Validate external aggregate user nonces and shares for the exact forfeits.
+	///
+	/// The returned object has the same wire contents as [Self::user_sign_forfeits].
+	/// No aggregate ownership private key or server private key is required.
+	pub fn assemble_external_forfeits(
+		&self,
+		server_nonces: &[musig::PublicNonce],
+		user_nonces: Vec<musig::PublicNonce>,
+		user_shares: Vec<musig::PartialSignature>,
+	) -> Result<OffboardForfeitSignatures, OffboardForfeitError> {
+		let count = self.input_vtxos.len();
+		OffboardForfeitError::check_count("forfeit cosign nonces", count, server_nonces.len())?;
+		OffboardForfeitError::check_count("user public nonces", count, user_nonces.len())?;
+		OffboardForfeitError::check_count("user partial signatures", count, user_shares.len())?;
+		let contexts = self.signing_inputs()?;
+		for (i, input) in contexts.iter().enumerate() {
+			let vtxo = self.input_vtxos[i].as_ref();
+			let tweak = input.tweak
+				.ok_or(SigningContextError::InvalidContext("missing offboard forfeit tweak"))?;
+			let (key_agg, _) = musig::tweaked_key_agg(input.participants.iter().copied(), tweak);
+			let session = musig::Session::new(
+				&key_agg, musig::nonce_agg(&[&user_nonces[i], &server_nonces[i]]),
+				&input.sighash()?,
+			);
+			if !session.partial_verify(
+				&key_agg, &user_shares[i], &user_nonces[i], musig::pubkey_to(vtxo.user_pubkey()),
+			) {
+				return Err(InvalidUserPartialSignatureError { vtxo: vtxo.id() }.into());
+			}
+		}
+		Ok(OffboardForfeitSignatures {
+			public_nonces: user_nonces, partial_signatures: user_shares,
+		})
+	}
+
 	/// Sign forfeit transactions for all input VTXOs
 	///
 	/// Provide the keys for the VTXO pubkeys in order of the input VTXOs.
@@ -801,6 +878,39 @@ mod test {
 		);
 
 		let user_sigs = ctx.user_sign_forfeits(&keys, &server_pub_nonces).unwrap();
+		let signing_inputs = ctx.signing_inputs().unwrap();
+		assert_eq!(signing_inputs.len(), inputs.len());
+		let assembled = ctx.assemble_external_forfeits(
+			&server_pub_nonces, user_sigs.public_nonces.clone(), user_sigs.partial_signatures.clone(),
+		).unwrap();
+		assert_eq!(assembled.public_nonces, user_sigs.public_nonces);
+		assert_eq!(assembled.partial_signatures, user_sigs.partial_signatures);
+		let mut wrong_server_nonces = server_pub_nonces.clone();
+		wrong_server_nonces.reverse();
+		assert!(ctx.assemble_external_forfeits(
+			&wrong_server_nonces, user_sigs.public_nonces.clone(), user_sigs.partial_signatures.clone(),
+		).is_err());
+		assert!(ctx.assemble_external_forfeits(
+			&server_pub_nonces, vec![], user_sigs.partial_signatures.clone(),
+		).is_err());
+
+		let mut single_offboard = offboard_tx.clone();
+		single_offboard.output[OFFBOARD_TX_CONNECTOR_VOUT].value = P2TR_DUST;
+		let single = OffboardForfeitContext::new(&inputs[..1], &single_offboard).unwrap();
+		let single_contexts = single.signing_inputs().unwrap();
+		assert_eq!(
+			single_contexts[0].psbt.unsigned_tx.input[1].previous_output,
+			OutPoint::new(single_offboard.compute_txid(), OFFBOARD_TX_CONNECTOR_VOUT as u32),
+		);
+		assert_eq!(
+			single_contexts[0].psbt.inputs[1].witness_utxo,
+			Some(single_offboard.output[OFFBOARD_TX_CONNECTOR_VOUT].clone()),
+		);
+		let (_, single_server_nonce) = musig::nonce_pair(&server_key);
+		let single_sigs = single.user_sign_forfeits(&keys[..1], &[single_server_nonce]).unwrap();
+		single.assemble_external_forfeits(
+			&[single_server_nonce], single_sigs.public_nonces, single_sigs.partial_signatures,
+		).unwrap();
 
 		// Same in the other direction: a user sending the wrong number of
 		// partial signatures must not be able to take the server down.
@@ -843,6 +953,11 @@ mod test {
 				"forfeit tx {} doesn't spend its fanout connector", i,
 			);
 			let real_prevouts = [vtxo.txout(), connector_tx.output[i].clone()];
+			assert_eq!(signing_inputs[i].psbt.inputs[1].witness_utxo, Some(real_prevouts[1].clone()));
+			let signature = schnorr::Signature::from_slice(
+				forfeit_tx.input[0].witness.iter().next().unwrap(),
+			).unwrap();
+			signing_inputs[i].verify_signature(&signature).unwrap();
 			crate::test_util::verify_tx(&real_prevouts, 0, forfeit_tx)
 				.expect(&format!("forfeit tx {} vtxo input invalid against real connector prevout", i));
 			crate::test_util::verify_tx(&real_prevouts, 1, forfeit_tx)

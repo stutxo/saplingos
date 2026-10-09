@@ -1,12 +1,12 @@
 //! Board wallet action.
 //!
-//! Boarding moves on-chain BTC into the Ark/VTXO world. Server cosign and
-//! vtxo construction need the user keypair and the on-chain wallet, neither of
-//! which is reachable from [`WalletAction::advance`], so those happen
-//! synchronously in [`crate::Wallet::board_psbt`]. This action takes over at the
-//! first point funds become committed (broadcast) and owns the durable part of
-//! the lifecycle: broadcast -> confirm -> register, plus the near-expiry exit
-//! salvage path. Identity (the funding tx, `id`, `vtxo_id`, `amount`,
+//! Boarding moves on-chain BTC into the Ark/VTXO world. Server cosign and exact
+//! recovery preparation happen in [`crate::Wallet::board_psbt`] before funding
+//! signatures are released. This action rechecks durable recovery on restart,
+//! including externally funded detection, export and rebroadcast, then owns the
+//! broadcast -> confirm -> register lifecycle and near-expiry salvage. Program
+//! boards hand off durably to saved recovery; only native boards use native exit.
+//! Identity (the funding tx, `id`, `vtxo_id`, `amount`,
 //! `movement_id`) lives on [`Board`] as top-level fields; the mutable bit is the
 //! [`Progress`] enum.
 
@@ -24,6 +24,8 @@ use crate::actions::{Advance, AdvanceError, WalletAction, WalletActionId};
 use crate::chain::BroadcastError;
 use crate::movement::{MovementId, MovementStatus};
 use crate::movement::update::MovementUpdate;
+use crate::onchain::OnchainWalletTrait;
+use crate::persist::models::recovery_action_key;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 /// Whether every input has a final witness or scriptSig.
@@ -86,9 +88,89 @@ impl Board {
 		Ok(self.funding()?.compute_txid())
 	}
 
-	/// The funding transaction, but only if we hold the signatures for it. The only
-	/// route from a [Board] to the chain source.
-	pub fn to_broadcast(&self) -> anyhow::Result<Option<Transaction>> {
+	/// Export signed funding only after verifying durable recovery for the exact
+	/// completed board. This barrier also applies to externally finalized PSBTs.
+	pub async fn to_broadcast(&self, wallet: &Wallet) -> anyhow::Result<Option<Transaction>> {
+		self.ensure_recovery(wallet).await?;
+		self.extract_finalized_funding()
+	}
+
+	async fn ensure_recovery(&self, wallet: &Wallet) -> anyhow::Result<()> {
+		let stored;
+		let vtxo = match &self.progress {
+			Progress::PreparingFunding { signed_vtxo, .. }
+				| Progress::Broadcasting { signed_vtxo } => signed_vtxo,
+			Progress::Confirming { .. } => {
+				stored = wallet.get_full_vtxo(self.vtxo_id).await?;
+				&stored
+			},
+		};
+		ensure!(vtxo.id() == self.vtxo_id, "board checkpoint VTXO id mismatch");
+		ensure!(vtxo.chain_anchor().txid == self.funding_txid()?,
+			"funding transaction does not match the completed board");
+		wallet.ensure_program_recoveries(std::slice::from_ref(vtxo)).await
+	}
+
+	/// Finish funding and its initial network handoff under the original
+	/// coin-selection lock, or under a fresh lock on restart. A restarted signer
+	/// must reject inputs already consumed by another wallet transaction, while
+	/// allowing replay of this exact tx. Checkpoint network visibility before
+	/// releasing the lock so the next send can safely spend the board's change.
+	pub(crate) async fn complete_funding(
+		&mut self,
+		wallet: &Wallet,
+		onchain: Option<&mut dyn OnchainWalletTrait>,
+	) -> anyhow::Result<()> {
+		let Progress::PreparingFunding { signed_vtxo, sign_funding } = &self.progress else {
+			return Ok(());
+		};
+		self.ensure_recovery(wallet).await?;
+		let sign_funding = *sign_funding;
+		if sign_funding {
+			let psbt = self.funding_psbt.take()
+				.context("board awaiting funding has no PSBT")?;
+			let txid = psbt.unsigned_tx.compute_txid();
+			let signed = onchain.context("no onchain wallet configured")?
+				.finish_psbt(psbt).await?;
+			ensure!(signed.unsigned_tx.compute_txid() == txid,
+				"funding signer changed the board transaction");
+			ensure!(psbt_is_finalized(&signed), "funding signer did not finalize the PSBT");
+			self.funding_psbt = Some(signed);
+		}
+		let seen = if sign_funding {
+			// Persist the signed funding before network I/O. A failed handoff
+			// must retain its inputs without making unpublished change spendable.
+			wallet.inner.db.upsert_wallet_action_checkpoint(&self.id, &self.clone().into()).await?;
+			matches!(run_broadcast(wallet, self, signed_vtxo).await?, BroadcastOutcome::Seen)
+		} else {
+			false
+		};
+		self.progress = if seen {
+			Progress::Confirming { last_park_error: None }
+		} else {
+			Progress::Broadcasting { signed_vtxo: signed_vtxo.clone() }
+		};
+		if sign_funding {
+			wallet.inner.db.upsert_wallet_action_checkpoint(&self.id, &self.clone().into()).await?;
+		}
+		Ok(())
+	}
+
+	/// Recovery owns the checkpoint permanently after takeover. Finish the
+	/// movement idempotently without deleting the recovery continuation state.
+	pub(crate) async fn record_recovery_handoff(&self, wallet: &Wallet) -> anyhow::Result<()> {
+		if wallet.inner.db.get_movement_by_id(self.movement_id).await?.status == MovementStatus::Failed {
+			return Ok(());
+		}
+		wallet.inner.movements.finish_movement_with_update(
+			self.movement_id, MovementStatus::Failed,
+			MovementUpdate::new().exited_vtxo(self.vtxo_id),
+		).await.context("failed to finalize recovering board movement")
+	}
+
+	/// Raw PSBT extraction is private: every production caller must first pass
+	/// through `to_broadcast` and its recovery readiness check.
+	fn extract_finalized_funding(&self) -> anyhow::Result<Option<Transaction>> {
 		if let Some(tx) = &self.funding_tx {
 			return Ok(Some(tx.clone()));
 		}
@@ -99,13 +181,24 @@ impl Board {
 		}
 		// `extract_tx` fee-checks, so it needs each input's value; a stored proposal
 		// always carries `witness_utxo`.
-		Ok(Some(psbt.clone().extract_tx().context("failed to extract board funding tx")?))
+		let tx = psbt.clone().extract_tx().context("failed to extract board funding tx")?;
+		ensure!(tx.compute_txid() == psbt.unsigned_tx.compute_txid(),
+			"finalized funding changes the board transaction id");
+		Ok(Some(tx))
 	}
 }
 
 /// The phases of an in-flight board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Progress {
+	/// Exact completed output saved before recovery merges signed ancestors or
+	/// the on-chain wallet releases funding signatures. Reuse these bytes after
+	/// any interruption; never re-enter the board signer.
+	PreparingFunding {
+		#[serde(with = "ark::encode::serde")]
+		signed_vtxo: Vtxo<Full>,
+		sign_funding: bool,
+	},
 	/// Vtxo cosigned and built but not yet persisted, and the funding tx not yet
 	/// seen on the network. Store the vtxo (locked under the action id), broadcast
 	/// the funding tx if it is ours to broadcast, and stay here until it shows up.
@@ -143,8 +236,25 @@ impl WalletAction for Board {
 
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
 		match self.progress.clone() {
+			Progress::PreparingFunding { sign_funding, .. } => {
+				let mut board = self;
+				if sign_funding {
+					let onchain = wallet.inner.onchain.as_ref()
+						.context("no onchain wallet configured")?;
+					let mut onchain = onchain.write().await;
+					board.complete_funding(wallet, Some(&mut *onchain)).await?;
+					if matches!(board.progress, Progress::Broadcasting { .. }) {
+						// The initial handoff was attempted under the funding
+						// lock. Leave further broadcasting to the next drive.
+						return Ok(Advance::Park { state: board, wake_after: None, error: None });
+					}
+				} else {
+					board.complete_funding(wallet, None).await?;
+				}
+				Ok(Advance::Next(board))
+			},
 			Progress::Broadcasting { signed_vtxo } => {
-				match run_broadcast(wallet, &self, signed_vtxo).await? {
+				match run_broadcast(wallet, &self, &signed_vtxo).await? {
 					BroadcastOutcome::Seen => Ok(Advance::Next(Board {
 						progress: Progress::Confirming { last_park_error: None },
 						..self
@@ -163,7 +273,7 @@ impl WalletAction for Board {
 	/// network; nothing has moved before that.
 	fn pending_balance_vtxo_ids(&self) -> Vec<VtxoId> {
 		match &self.progress {
-			Progress::Broadcasting { .. } => Vec::new(),
+			Progress::PreparingFunding { .. } | Progress::Broadcasting { .. } => Vec::new(),
 			Progress::Confirming { .. } => vec![self.vtxo_id],
 		}
 	}
@@ -181,6 +291,7 @@ impl WalletAction for Board {
 		warn!("board {} hit an unexpected rejection, re-evaluating: {:#}", self.id, error);
 		// Keep `Broadcasting` so its `signed_vtxo` survives for the next drive.
 		let progress = match self.progress {
+			preparing @ Progress::PreparingFunding { .. } => preparing,
 			broadcasting @ Progress::Broadcasting { .. } => broadcasting,
 			Progress::Confirming { .. } => Progress::Confirming { last_park_error: None },
 		};
@@ -208,13 +319,16 @@ enum BroadcastOutcome {
 async fn run_broadcast(
 	wallet: &Wallet,
 	board: &Board,
-	signed_vtxo: Vtxo<Full>,
+	signed_vtxo: &Vtxo<Full>,
 ) -> Result<BroadcastOutcome, AdvanceError> {
+	// Do not bypass readiness merely because another party already funded the
+	// board. Such a deposit is not retroactively made safe by observing it.
+	board.ensure_recovery(wallet).await?;
 	// The server doesn't know this vtxo until `register_board`, so skip the
 	// recovery-mailbox post `store_locked_vtxos` would do (it would fail the
 	// mailbox FK to `vtxo`); `register_board` posts it once accepted.
 	wallet.store_vtxos(
-		[&signed_vtxo],
+		[signed_vtxo],
 		&VtxoState::Locked {
 			holder: Some(crate::vtxo::VtxoLockHolder::Movement { id: board.movement_id }),
 		},
@@ -287,6 +401,8 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 		return Ok(Advance::Done);
 	}
 
+	board.ensure_recovery(wallet).await?;
+
 	let mut last_park_error = None;
 	let anchor = vtxo.chain_anchor();
 	let confs = match wallet.inner.chain.tx_status(anchor.txid).await {
@@ -346,6 +462,25 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	// I know this if is collapsible, but it reads better like this...
 	let exit_margin = wallet.config().vtxo_exit_margin;
 	if vtxo.expiry_height() <= current_height + exit_margin {
+		if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_some() {
+			// The normal driver already holds this board's action guard. Recovery
+			// tombstones it before chain I/O; no later registration may race the
+			// saved recovery, even if this first ancestor cannot be broadcast.
+			let result = wallet.recover_program_vtxos_with_action_guard(
+				&[vtxo.id().to_point()], None, &board.id,
+			).await;
+			if wallet.inner.db.has_program_recovery_reservation(
+				&recovery_action_key(&board.id),
+			).await? {
+				board.record_recovery_handoff(wallet).await?;
+				if let Err(e) = result {
+					warn!("Board {} recovery handed off; continuation will retry: {:#}", board.id, e);
+				}
+				return Ok(Advance::Park { state: board, wake_after: None, error: None });
+			}
+			result?;
+			return Err(anyhow!("program board recovery did not reserve its action").into());
+		}
 		if !wallet.exit_mgr().is_exiting(vtxo.id()).await {
 			warn!("Board {} expired before confirmation, marking VTXO for exit", board.id);
 			wallet.inner.exit.start_exit_for_vtxos(&[vtxo.vtxo.clone()]).await?;
@@ -374,6 +509,7 @@ async fn run_register(wallet: &Wallet, board: &Board) -> anyhow::Result<()> {
 	// serialized bytes to the server.
 	let vtxo = wallet.get_full_vtxo(board.vtxo_id).await
 		.with_context(|| format!("board vtxo doesn't exist: {}", board.vtxo_id))?;
+	wallet.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await?;
 
 	srv.client.register_board_vtxo(protos::BoardVtxoRequest {
 		board_vtxo: vtxo.serialize(),
@@ -458,7 +594,7 @@ async fn funding_conflict(wallet: &Wallet, board: &Board) -> anyhow::Result<Fund
 		}
 	}
 
-	let Some(tx) = board.to_broadcast()? else {
+	let Some(tx) = board.to_broadcast(wallet).await? else {
 		// Without the signatures there is nothing to probe with: a transaction we
 		// cannot complete would be rejected on its own merits and tell us nothing
 		// about its inputs. No input is spent by a confirmed tx, so the outcome is
@@ -528,18 +664,28 @@ mod test {
 		}
 	}
 
-	/// A board is broadcastable exactly when its proposal is finalised.
+	/// Finalized witness-only funding retains the board's committed txid.
 	#[test]
 	fn broadcast_follows_psbt_finalisation() {
 		let unfinalized = board(None, Some(psbt()));
-		assert!(unfinalized.to_broadcast().unwrap().is_none());
+		assert!(unfinalized.extract_finalized_funding().unwrap().is_none());
 		// Still knows which transaction to watch for.
 		assert_eq!(unfinalized.funding_txid().unwrap(), psbt().unsigned_tx.compute_txid());
 
 		let finalized = board(None, Some(finalized_psbt()));
-		let tx = finalized.to_broadcast().unwrap().expect("finalised proposal is ours to send");
+		let tx = finalized.extract_finalized_funding().unwrap()
+			.expect("finalised proposal is ours to send");
 		assert_eq!(tx.compute_txid(), finalized.funding_txid().unwrap());
 		assert!(!tx.input[0].witness.is_empty(), "extracted tx must carry the witness");
+	}
+
+	#[test]
+	fn finalization_must_not_change_board_funding_txid() {
+		let mut proposal = finalized_psbt();
+		proposal.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
+		let board = board(None, Some(proposal));
+		let error = board.extract_finalized_funding().unwrap_err();
+		assert!(error.to_string().contains("changes the board transaction id"));
 	}
 
 	/// A checkpoint with neither field has no funding transaction, so it errors
@@ -549,7 +695,7 @@ mod test {
 		let board = board(None, None);
 		assert!(board.funding().is_err());
 		assert!(board.funding_txid().is_err());
-		assert!(board.to_broadcast().is_err());
+		assert!(board.extract_finalized_funding().is_err());
 	}
 
 	/// A checkpoint predating `funding_psbt` stays readable and re-broadcastable.
@@ -571,7 +717,7 @@ mod test {
 		let board: Board = serde_json::from_value(legacy).unwrap();
 		assert_eq!(board.funding_tx.as_ref(), Some(&tx));
 		assert_eq!(board.funding_psbt, None);
-		assert_eq!(board.to_broadcast().unwrap(), Some(tx));
+		assert_eq!(board.extract_finalized_funding().unwrap(), Some(tx));
 	}
 
 	/// Boards are written with `funding_psbt` only, as BIP-174 hex.

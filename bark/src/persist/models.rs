@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use bitcoin::{Amount, Transaction};
+use bitcoin::{Amount, OutPoint, Transaction, TxOut};
 use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin_ext::BlockHeight;
 use lightning_invoice::Bolt11Invoice;
@@ -94,6 +94,159 @@ pub struct SerdeVtxoKey {
 	pub index: u32,
 	pub public_key: PublicKey,
 }
+
+/// Immutable descriptor for a program-backed VTXO key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerdeProgramKey {
+	pub index: u32,
+	pub program: ark::sapio::program::ProgramKey,
+	pub endpoint: String,
+	pub recovery: ProgramRecoveryTemplate,
+}
+
+/// Construction data for recovery claims, not an enforcement policy.
+///
+/// The wallet must authorize the actual claim through the exact generic program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRecoveryTemplate {
+	#[serde(with = "bitcoin_ext::serde::encodable::vec")]
+	pub outputs: Vec<TxOut>,
+	pub remainder_output: Option<usize>,
+	pub lock_time: bitcoin::absolute::LockTime,
+	pub witness: Vec<u8>,
+}
+
+/// A recovery claim verified by the wallet before storage.
+///
+/// Persistence preserves these bytes; existence alone does not establish that a
+/// claim is valid or ready to broadcast.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRecoveryRecord {
+	pub controlled_outpoint: OutPoint,
+	pub program_key: PublicKey,
+	#[serde(with = "bitcoin_ext::serde::encodable")]
+	pub claim: Transaction,
+	#[serde(with = "bitcoin_ext::serde::encodable")]
+	pub prevout: TxOut,
+	pub chain_anchor: OutPoint,
+	#[serde(with = "bitcoin_ext::serde::encodable")]
+	pub chain_anchor_prevout: TxOut,
+	#[serde(with = "bitcoin_ext::serde::encodable::vec")]
+	pub ancestors: Vec<Transaction>,
+	/// Signed hashlocked ancestors and the exact forfeit outputs which disclose
+	/// their missing preimages. These are not yet broadcastable witnesses.
+	#[serde(default)]
+	pub unlocks: Vec<ProgramRecoveryUnlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRecoveryUnlock {
+	pub ancestor: bitcoin::Txid,
+	pub hash: bitcoin::hashes::sha256::Hash,
+	#[serde(with = "bitcoin_ext::serde::encodable")]
+	pub witness: bitcoin::Witness,
+	pub disclosures: Vec<ProgramRecoveryDisclosure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRecoveryDisclosure {
+	pub outpoint: OutPoint,
+	#[serde(with = "bitcoin_ext::serde::encodable")]
+	pub prevout: TxOut,
+	/// The committed hashlock script and its control block (no signature).
+	#[serde(with = "bitcoin_ext::serde::encodable")]
+	pub hashlock: bitcoin::Witness,
+}
+
+/// Merge only additional, compatible ancestor witnesses. The caller stages the
+/// result before committing its entire batch.
+pub(crate) fn merge_program_recovery(
+	existing: Option<ProgramRecoveryRecord>,
+	incoming: &ProgramRecoveryRecord,
+) -> anyhow::Result<ProgramRecoveryRecord> {
+	let mut merged = match existing {
+		Some(record) => {
+			anyhow::ensure!(
+				record.controlled_outpoint == incoming.controlled_outpoint
+					&& record.program_key == incoming.program_key
+					&& record.claim == incoming.claim
+					&& record.prevout == incoming.prevout
+					&& record.chain_anchor == incoming.chain_anchor
+					&& record.chain_anchor_prevout == incoming.chain_anchor_prevout,
+				"conflicting recovery claim for {}", incoming.controlled_outpoint,
+			);
+			record
+		},
+		None => ProgramRecoveryRecord {
+			controlled_outpoint: incoming.controlled_outpoint,
+			program_key: incoming.program_key,
+			claim: incoming.claim.clone(),
+			prevout: incoming.prevout.clone(),
+			chain_anchor: incoming.chain_anchor,
+			chain_anchor_prevout: incoming.chain_anchor_prevout.clone(),
+			ancestors: Vec::new(),
+			unlocks: Vec::new(),
+		},
+	};
+	let mut positions = merged.ancestors.iter().enumerate()
+		.map(|(i, tx)| (tx.compute_txid(), i))
+		.collect::<std::collections::HashMap<_, _>>();
+	for ancestor in &incoming.ancestors {
+		let txid = ancestor.compute_txid();
+		if let Some(&position) = positions.get(&txid) {
+			let stored = &mut merged.ancestors[position];
+			anyhow::ensure!(
+				stored.version == ancestor.version
+					&& stored.lock_time == ancestor.lock_time
+					&& stored.output == ancestor.output
+					&& stored.input.len() == ancestor.input.len(),
+				"conflicting recovery ancestor {txid}",
+			);
+			for (old, new) in stored.input.iter_mut().zip(&ancestor.input) {
+				anyhow::ensure!(
+					old.previous_output == new.previous_output
+						&& old.script_sig == new.script_sig
+						&& old.sequence == new.sequence
+						&& (old.witness.is_empty() || new.witness.is_empty()
+							|| old.witness == new.witness),
+					"conflicting recovery ancestor witness for {txid}",
+				);
+				if old.witness.is_empty() {
+					old.witness = new.witness.clone();
+				}
+			}
+		} else {
+			positions.insert(txid, merged.ancestors.len());
+			merged.ancestors.push(ancestor.clone());
+		}
+	}
+	for unlock in &incoming.unlocks {
+		if let Some(saved) = merged.unlocks.iter_mut().find(|saved| saved.ancestor == unlock.ancestor) {
+			anyhow::ensure!(saved.hash == unlock.hash && saved.witness == unlock.witness,
+				"conflicting signed recovery unlock");
+			for disclosure in &unlock.disclosures {
+				if let Some(old) = saved.disclosures.iter().find(|old| old.outpoint == disclosure.outpoint) {
+					anyhow::ensure!(old == disclosure, "conflicting recovery disclosure prevout");
+				} else {
+					saved.disclosures.push(disclosure.clone());
+				}
+			}
+		} else {
+			merged.unlocks.push(unlock.clone());
+		}
+	}
+	Ok(merged)
+}
+
+/// Durable takeover keys are distinct from the process/file lock names.
+pub fn recovery_action_key(id: &str) -> String { format!("action/{id}") }
+pub fn recovery_round_key(id: RoundStateId) -> String { format!("round/{id}") }
+/// Deliberately selected actor positions, distinct from shared ancestor guards.
+pub fn recovery_target_key(id: ark::VtxoId) -> String { format!("target/{id}") }
+pub fn recovery_vtxo_key(id: ark::VtxoId) -> String { format!("vtxo/{id}") }
+/// An actor's fully signed successor supersedes this old recovery position,
+/// even when the successor is rooted in a different round funding transaction.
+pub fn recovery_superseded_key(id: ark::VtxoId) -> String { format!("superseded/{id}") }
 
 /// Identifier for a stored [RoundState].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -492,6 +645,8 @@ pub struct SerdeRoundState<'a> {
 	#[serde(with = "ark::encode::serde::cow::vec")]
 	new_vtxos: Cow<'a, [Vtxo<Full>]>,
 	sent_forfeit_sigs: bool,
+	#[serde(default)]
+	forfeit_bundles: Option<Cow<'a, [Vec<u8>]>>,
 }
 
 impl<'a> From<&'a RoundState> for SerdeRoundState<'a> {
@@ -503,6 +658,7 @@ impl<'a> From<&'a RoundState> for SerdeRoundState<'a> {
 			flow: (&state.flow).into(),
 			new_vtxos: Cow::Borrowed(&state.new_vtxos),
 			sent_forfeit_sigs: state.sent_forfeit_sigs,
+			forfeit_bundles: state.forfeit_bundles.as_deref().map(Cow::Borrowed),
 		}
 	}
 }
@@ -516,6 +672,7 @@ impl<'a> From<SerdeRoundState<'a>> for RoundState {
 			flow: state.flow.into(),
 			new_vtxos: state.new_vtxos.into_owned(),
 			sent_forfeit_sigs: state.sent_forfeit_sigs,
+			forfeit_bundles: state.forfeit_bundles.map(Cow::into_owned),
 		}
 	}
 }

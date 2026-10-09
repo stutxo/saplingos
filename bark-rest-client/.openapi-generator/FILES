@@ -162,6 +162,8 @@ docs/PaymentMethod.md
 docs/PendingBoardInfo.md
 docs/PendingRoundInfo.md
 docs/PpmExpiryFeeEntry.md
+docs/ProgramReceiveApi.md
+docs/ReceiveRequest.md
 docs/RefreshFees.md
 docs/RefreshRequest.md
 docs/RoundFlowState.md
@@ -217,6 +219,7 @@ src/apis/message_api.rs
 src/apis/mod.rs
 src/apis/notifications_api.rs
 src/apis/onchain_api.rs
+src/apis/program_receive_api.rs
 src/apis/wallet_api.rs
 src/lib.rs
 src/models/address.rs
@@ -369,6 +372,7 @@ src/models/payment_method.rs
 src/models/pending_board_info.rs
 src/models/pending_round_info.rs
 src/models/ppm_expiry_fee_entry.rs
+src/models/receive_request.rs
 src/models/refresh_fees.rs
 src/models/refresh_request.rs
 src/models/round_flow_state.rs

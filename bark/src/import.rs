@@ -9,7 +9,6 @@
 //! since it is part of the wallet's history.
 
 use anyhow::Context;
-use bitcoin::secp256k1::Keypair;
 use log::{info, warn};
 
 use ark::{Vtxo, VtxoId};
@@ -17,6 +16,7 @@ use ark::vtxo::Full;
 use server_rpc::protos::VtxoSpendState;
 
 use crate::Wallet;
+use crate::sapio::VtxoSigningKey;
 use crate::vtxo::{ServerStatusAdoption, VtxoState, VtxoValidationError};
 
 /// Why a VTXO could not be imported.
@@ -107,7 +107,7 @@ impl Wallet {
 		// Collected before the await: a closure over `&&Vtxo` held across it is not
 		// general enough over lifetimes for the axum handler's Send bound.
 		let user_pubkeys = pending.iter().map(|v| v.user_pubkey()).collect::<Vec<_>>();
-		let keypairs = self.find_vtxo_keypairs(user_pubkeys, gap_limit).await
+		let keypairs = self.find_vtxo_signing_keys(user_pubkeys, gap_limit).await
 			.context("error scanning the vtxo key space")?;
 
 		let mut to_store = Vec::with_capacity(pending.len());
@@ -146,20 +146,21 @@ impl Wallet {
 	/// The state to store `vtxo` in, which the server decides unless the caller
 	/// opted out of the query.
 	///
-	/// `keypair` must be `vtxo`'s user keypair: it signs the attestation the
-	/// query needs.
+	/// `keypair` must be `vtxo`'s ownership key. Program inputs require their
+	/// saved, complete recovery even when the server status check is skipped.
 	async fn import_vtxo_state(
 		&self,
 		vtxo: &Vtxo<Full>,
-		keypair: &Keypair,
+		keypair: &VtxoSigningKey,
 		args: &ImportVtxoArgs,
 	) -> Result<VtxoState, ImportVtxoError> {
+		self.ensure_program_recoveries(std::slice::from_ref(vtxo)).await?;
 		if args.skip_status_check {
 			return Ok(VtxoState::Spendable);
 		}
 
 		let id = vtxo.id();
-		let spend_state = self.fetch_vtxo_spend_state(id, keypair).await?;
+		let spend_state = self.fetch_vtxo_spend_state(vtxo, keypair).await?;
 		let adoption = ServerStatusAdoption::from_spend_state(spend_state)
 			.with_context(|| format!("cannot decide the state of vtxo {id}"))?;
 		Ok(match adoption {
