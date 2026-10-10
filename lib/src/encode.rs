@@ -742,11 +742,44 @@ mod test {
 			}
 		}
 
-		let result = EmptyEncoding::deserialize(&[1]);
-		assert!(
-			result.is_err(),
-			"zero-size element encoding was accepted"
-		);
+		let result = LengthPrefixedVector::<EmptyEncoding>::deserialize(&[1]);
+		assert!(matches!(result, Err(ProtocolDecodingError::OversizedVector(
+			OversizedVectorError { requested: 1, max: 0 },
+		))));
+		assert!(LengthPrefixedVector::<EmptyEncoding>::deserialize(&[0])
+			.unwrap().into_inner().is_empty());
+	}
+
+	#[test]
+	fn length_prefixed_vector_rejects_oversized_count_before_reading_elements() {
+		let max = MAX_VEC_SIZE / mem::size_of::<sha256::Hash>();
+		let mut encoded = Vec::new();
+		encoded.emit_compact_size((max + 1) as u64).unwrap();
+		// There are no element bytes: the allocation guard, not EOF, must reject it.
+		let result = LengthPrefixedVector::<sha256::Hash>::deserialize(&encoded);
+		assert!(matches!(result, Err(ProtocolDecodingError::OversizedVector(error))
+			if error.requested == max + 1 && error.max == max));
+	}
+
+	#[test]
+	fn length_prefixed_vector_rejects_noncanonical_and_truncated_encodings() {
+		let mut encoded = vec![1];
+		encoded.extend_from_slice(&[0x42; 32]);
+		let decoded = LengthPrefixedVector::<sha256::Hash>::deserialize(&encoded).unwrap();
+		assert_eq!(decoded.into_inner(), vec![sha256::Hash::from_byte_array([0x42; 32])]);
+
+		let noncanonical: [&[u8]; 3] = [
+			&[0xfd, 1, 0],
+			&[0xfe, 1, 0, 0, 0],
+			&[0xff, 1, 0, 0, 0, 0, 0, 0, 0],
+		];
+		for prefix in noncanonical {
+			let mut malformed = prefix.to_vec();
+			malformed.extend_from_slice(&encoded[1..]);
+			assert!(LengthPrefixedVector::<sha256::Hash>::deserialize(&malformed).is_err());
+		}
+		assert!(LengthPrefixedVector::<sha256::Hash>::deserialize(&[0xfd, 1]).is_err());
+		assert!(LengthPrefixedVector::<sha256::Hash>::deserialize(&encoded[..32]).is_err());
 	}
 
 

@@ -46,6 +46,9 @@ For setup and usage instructions, see the [Getting Started guide](https://docs.s
 
 ## Sapio-backed VTXOs
 
+Sapio defines the spend rules. The TEE checks these rules and co-signs with
+the wallet. Saved recovery transactions support an on-chain exit.
+
 A configured wallet uses a joint user and program key:
 
 ```text
