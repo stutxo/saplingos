@@ -1,14 +1,16 @@
-# Database Schema
+# Database schema
 
-When you need the full DDL (table definitions, indexes, constraints) for the
-server or bark database, read the corresponding `schema.sql` file:
+For the wallet's complete SQLite DDL, read `sdk/schema.sql`. Do not reconstruct
+the schema by aggregating incremental migrations.
 
-- **Server**: `server/schema.sql`
-- **Bark**: `bark/schema.sql`
+After changing migrations, run the existing schema dumper:
 
-These files contain the complete, up-to-date schema in a single place.
+```sh
+cargo run --locked -p sapling-sdk --example dump-sqlite-schema
+```
 
-**Do not** aggregate or piece together the migration files in
-`server/src/database/migrations/` (or the bark equivalent) to reconstruct the
-schema. The migrations are incremental changes and reading them all is slow,
-error-prone, and unnecessary.
+Review stdout before updating the tracked schema. Preserve program descriptors,
+recovery records, and cross-process restart semantics.
+
+Server PostgreSQL schema and migrations belong to the pinned upstream Bark
+fixtures, not this client SDK repository.

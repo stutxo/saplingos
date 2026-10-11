@@ -90,12 +90,12 @@ Delivery has two stages:
    recovery and do not create another payment.
 
 This is not an ordinary mailbox delivery. An unsolicited raw deposit cannot
-establish that preparation occurred before the sender committed. Bark retains
+establish that preparation occurred before the sender committed. Sapling retains
 rejected wire bytes as quarantine metadata, without inserting a canonical VTXO
 row. A forged genesis for an outpoint cannot replace a later valid, prepared
 payment at that outpoint.
 
 Legacy clients do not implement this handshake. Do not remove the delivery
 metadata or claim that a legacy client provides the same recovery guarantee.
-See [Sapio-backed VTXOs](../bark/README.md#sapio-backed-vtxos) for configuration
+See [Sapio-backed VTXOs](../sdk/README.md#sapio-backed-vtxos) for configuration
 and emergency recovery.

@@ -1,0 +1,1006 @@
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bitcoin::hashes::Hash;
+use tokio_stream::StreamExt;
+
+use ark::VtxoId;
+use ark::fees::RefreshFees;
+use ark::rounds::RoundEvent;
+use sapling::movement::MovementStatus;
+use sapling::round::RoundFlowKind;
+use sapling::subsystem::RoundMovement;
+use sapling::vtxo::{VtxoLockHolder, VtxoState};
+use bitcoin_ext::{BlockDelta, BlockHeight};
+use server_log::{NoRoundPayments, RoundFinished, RoundParticipationRejected};
+use server_rpc::protos;
+
+use sapling_testing::{btc, sat, secs, TestContext};
+use sapling_testing::constants::ROUND_CONFIRMATIONS;
+use sapling_testing::daemon::captaind::{self, ArkClient, Captaind};
+use sapling_testing::util::{FutureExt, poll_interval};
+
+/// A captaind proxy that rejects any round submission — interactive
+/// (`submit_payment`) or delegated (`submit_round_participation`) — whose inputs
+/// include one of the armed `bad` vtxos, mimicking the real server:
+/// `InvalidArgument` carrying every offending id in the `identifiers` metadata.
+/// The list is shared and set *after* boarding (boards flow through while it's
+/// empty), so we can board through the proxy and only then poison inputs.
+#[derive(Clone)]
+struct RejectVtxoProxy {
+	bad: Arc<Mutex<Vec<VtxoId>>>,
+}
+
+impl RejectVtxoProxy {
+	/// The rejection the real server returns, naming every unusable input in the
+	/// `identifiers` metadata (comma-separated).
+	fn rejection(bad: &[VtxoId]) -> tonic::Status {
+		let ids = bad.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+		let mut status = tonic::Status::invalid_argument(
+			format!("input vtxo(s) not spendable: [{}]", ids),
+		);
+		status.metadata_mut().insert("identifiers", ids.parse().unwrap());
+		status
+	}
+
+	/// The armed bad vtxos that appear in `inputs`.
+	fn rejected(&self, inputs: &[protos::InputVtxo]) -> Vec<VtxoId> {
+		self.bad.lock().unwrap().iter().copied()
+			.filter(|bad| inputs.iter().any(|i| i.vtxo_id == bad.to_bytes().to_vec()))
+			.collect()
+	}
+}
+
+#[async_trait::async_trait]
+impl captaind::proxy::ArkRpcProxy for RejectVtxoProxy {
+	async fn submit_payment(
+		&self, upstream: &mut ArkClient, req: protos::SubmitPaymentRequest,
+	) -> Result<protos::SubmitPaymentResponse, tonic::Status> {
+		let bad = self.rejected(&req.input_vtxos);
+		if !bad.is_empty() {
+			return Err(Self::rejection(&bad));
+		}
+		Ok(upstream.submit_payment(req).await?.into_inner())
+	}
+
+	async fn submit_round_participation(
+		&self, upstream: &mut ArkClient, req: protos::RoundParticipationRequest,
+	) -> Result<protos::RoundParticipationResponse, tonic::Status> {
+		let bad = self.rejected(&req.input_vtxos);
+		if !bad.is_empty() {
+			return Err(Self::rejection(&bad));
+		}
+		Ok(upstream.submit_round_participation(req).await?.into_inner())
+	}
+}
+
+/// Board two independent vtxos into an in-process SDK [`sapling::Wallet`] that talks
+/// to the server through a [RejectVtxoProxy], then arm the proxy to reject the
+/// smaller one as unusable. Returns `(wallet, proxy, bad_id, good_id)`; keep
+/// `proxy` alive (dropping it shuts it down).
+///
+/// The wallet runs in `daemon_manual_sync` mode: the background daemon's
+/// round-event process is disabled so it can't race the test's own refresh
+/// calls to join the same attempt for the same vtxos.
+async fn setup_sdk_with_rejected_vtxo(
+	ctx: &TestContext,
+	srv: &Captaind,
+) -> (sapling::Wallet, captaind::proxy::ArkRpcProxyServer, VtxoId, VtxoId) {
+	let bad = Arc::new(Mutex::new(Vec::<VtxoId>::new()));
+	let proxy = srv.start_proxy_no_mailbox(RejectVtxoProxy { bad: bad.clone() }).await;
+
+	let wallet = ctx.sdk("bark", &proxy)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(300_000))
+		.boarded(sat(400_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 2, "expected two boarded vtxos");
+	let bad_id = vtxos.iter().min_by_key(|v| v.amount()).unwrap().id();
+	let good_id = vtxos.iter().max_by_key(|v| v.amount()).unwrap().id();
+
+	*bad.lock().unwrap() = vec![bad_id];
+	(wallet, proxy, bad_id, good_id)
+}
+
+/// Assert the drop-and-retry recovery is recorded as two distinct refresh
+/// movements: a failed one that attempted both `bad` and `good`, and a successful
+/// one that dropped `bad` and kept `good`.
+async fn assert_dropped_and_retried_movements(
+	wallet: &sapling::Wallet,
+	bad_id: VtxoId,
+	good_id: VtxoId,
+) {
+	let refreshes = wallet.history().await.expect("list movements").into_iter()
+		.filter(|m| m.subsystem.name == "bark.round" && m.subsystem.kind == "refresh")
+		.collect::<Vec<_>>();
+
+	// Match by inputs, not just status: a retry that re-submits and is rejected again can
+	// leave extra failed refresh movements around.
+	let failed = refreshes.iter()
+		.find(|m| m.status == MovementStatus::Failed
+			&& m.input_vtxos.contains(&bad_id) && m.input_vtxos.contains(&good_id))
+		.expect("expected a failed refresh movement that attempted both the rejected and healthy inputs");
+
+	let succeeded = refreshes.iter()
+		.find(|m| m.status == MovementStatus::Successful
+			&& m.input_vtxos.contains(&good_id) && !m.input_vtxos.contains(&bad_id))
+		.expect("expected a successful refresh movement that dropped the rejected input");
+
+	assert_ne!(failed.id, succeeded.id, "the two refreshes should be distinct movements");
+}
+
+/// An explicit, developer-chosen delegated refresh must fail wholesale when the
+/// server rejects an input, rather than silently dropping the caller's selection.
+/// Only maintenance is allowed to drop-and-retry.
+#[tokio::test]
+async fn manual_refresh_delegated_does_not_drop_rejected_vtxo() {
+	let ctx = TestContext::new("sapling_sdk/manual_refresh_delegated_does_not_drop_rejected_vtxo").await;
+	let srv = ctx.captaind("server").funded(btc(1)).create().await;
+	let (wallet, _proxy, bad_id, good_id) = setup_sdk_with_rejected_vtxo(&ctx, &srv).await;
+
+	// An explicit delegated refresh of BOTH vtxos must error out, not silently drop the
+	// rejected input and submit the rest.
+	let res = wallet.refresh_vtxos_delegated(vec![bad_id, good_id]).await;
+	assert!(
+		res.is_err(),
+		"explicit delegated refresh including a server-rejected vtxo must fail wholesale",
+	);
+
+	let ids = wallet.spendable_vtxos().await.expect("list vtxos")
+		.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+	assert!(
+		ids.contains(&bad_id) && ids.contains(&good_id),
+		"neither vtxo should be refreshed when an explicit delegated refresh fails; got {ids:?}",
+	);
+}
+
+/// The blocking interactive maintenance entry point [`sapling::Wallet::maintenance_refresh`]
+/// must make forward progress around a VTXO the server rejects as unusable: it
+/// joins the round, drops the rejected input and re-submits the rest to the
+/// *same* attempt, rather than letting one bad VTXO block the healthy ones until
+/// they expire.
+#[tokio::test]
+async fn manual_maintenance_refresh_drops_server_rejected_vtxo() {
+	let ctx = TestContext::new("sapling_sdk/manual_maintenance_refresh_drops_server_rejected_vtxo").await;
+	let srv = ctx.captaind("server").funded(btc(1)).create().await;
+	let (wallet, _proxy, bad_id, good_id) = setup_sdk_with_rejected_vtxo(&ctx, &srv).await;
+
+	// Age both vtxos so they are due for refresh.
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32()).await;
+
+	// `maintenance_refresh` blocks until the round it joins finishes, so trigger a round
+	// alongside it (after a short delay so it subscribes first). It should submit
+	// [bad, good], have `bad` rejected, then re-submit just [good] to the same attempt.
+	let (res, _) = tokio::join!(
+		wallet.maintenance_refresh(),
+		async {
+			tokio::time::sleep(Duration::from_secs(2)).await;
+			srv.trigger_round().await;
+		},
+	);
+	let status = res.expect("maintenance refresh must not fail wholesale around a rejected input");
+	assert!(status.is_some(), "maintenance refresh should have refreshed the healthy vtxo");
+
+	// Confirm the round and sync until the refresh settles: `good` is forfeited and replaced
+	// by the round output (back to two spendable vtxos), while `bad` is left untouched. We
+	// wait for the output to actually appear — `good` disappearing alone is too early, the
+	// round tx may not have confirmed yet.
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	let mut refreshed = false;
+	for _ in 0..30 {
+		wallet.sync().await;
+		let ids = wallet.spendable_vtxos().await.expect("list vtxos")
+			.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+		if ids.contains(&bad_id) && !ids.contains(&good_id) && ids.len() == 2 {
+			refreshed = true;
+			break;
+		}
+		ctx.generate_blocks(1).await;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+
+	let final_ids = wallet.spendable_vtxos().await.expect("list vtxos")
+		.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+	assert!(refreshed,
+		"healthy vtxo {good_id} should be refreshed while rejected vtxo {bad_id} is left \
+		untouched; final vtxos: {final_ids:?}");
+
+	assert_dropped_and_retried_movements(&wallet, bad_id, good_id).await;
+}
+
+async fn participation_status(srv: &Captaind, unlock_hash: Vec<u8>) -> i32 {
+	srv.get_public_rpc().await
+		.round_participation_status(protos::RoundParticipationStatusRequest { unlock_hash })
+		.await.expect("status request failed").into_inner().status
+}
+
+/// An interactive participation beats a delegated one on the same input: the
+/// server registers delegated participations only after the interactive sign-ups,
+/// so the delegated one finds the input taken and is dropped.
+#[tokio::test]
+async fn interactive_participation_wins_over_delegated() {
+	let ctx = TestContext::new("sapling_sdk/interactive_participation_wins_over_delegated").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+
+	let wallet = ctx.sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(800_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 1, "expected one boarded vtxo");
+	let id = vtxos[0].id();
+
+	// A delegated participation waits on the server for a round to pick it up, and
+	// bark doesn't hold its inputs meanwhile, so the same vtxo can still be signed
+	// up interactively.
+	wallet.refresh_vtxos_delegated(vec![id]).await
+		.expect("submit the delegated participation");
+
+	let mut log_rejected = srv.subscribe_log::<RoundParticipationRejected>();
+	let mut log_finished = srv.subscribe_log::<RoundFinished>();
+
+	// `refresh_vtxos` blocks until the round it joins finishes, so trigger a round
+	// alongside it, after a short delay so it subscribes first.
+	let (res, _) = tokio::join!(
+		wallet.refresh_vtxos(vec![id]),
+		async {
+			tokio::time::sleep(Duration::from_secs(2)).await;
+			srv.trigger_round().await;
+		},
+	);
+	res.expect("the interactive refresh must succeed");
+
+	let rejected = log_rejected.recv().wait(Duration::from_secs(30)).await
+		.expect("the delegated participation must be rejected");
+	assert!(rejected.reason.contains(&id.to_string()),
+		"the rejection must name the contested input: {}", rejected.reason,
+	);
+	// The flux lock rejects it first; the already-registered check behind it
+	// would catch it otherwise.
+	assert!(
+		rejected.reason.contains("already in use by another process")
+			|| rejected.reason.contains("already registered"),
+		"unexpected rejection reason: {}", rejected.reason,
+	);
+
+	let finished = log_finished.recv().wait(Duration::from_secs(30)).await
+		.expect("the round must finish");
+	assert_eq!(finished.nb_input_vtxos, 1,
+		"only the interactive participation should have been included",
+	);
+}
+
+/// A round that finishes supersedes every pending participation over one of its
+/// inputs, deleting it along with its inputs and outputs. A participation
+/// scheduled beyond the tip is never offered to the round, so it is still pending
+/// when the round finishes and takes that path.
+///
+/// The delete has to take the whole participation: leaving the input and output
+/// rows behind trips their foreign key, which aborts the round transaction and
+/// takes the round coordinator down with it.
+#[tokio::test]
+async fn finished_round_supersedes_pending_delegated_participation() {
+	let ctx = TestContext::new("sapling_sdk/finished_round_supersedes_pending_delegated_participation").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+
+	let wallet = ctx.sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(800_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 1, "expected one boarded vtxo");
+	let id = vtxos[0].id();
+
+	// Far enough ahead that the rounds below leave it pending, but well within the
+	// vtxo's lifetime, which the server checks against the scheduled height.
+	let scheduled_height = BlockHeight::new(srv.bitcoind().get_block_count().await as u32 + 100);
+	wallet.refresh_vtxos_scheduled(vec![id], scheduled_height).await
+		.expect("submit the scheduled delegated participation");
+
+	let mut log_finished = srv.subscribe_log::<RoundFinished>();
+
+	// `refresh_vtxos` blocks until the round it joins finishes, so trigger a round
+	// alongside it, after a short delay so it subscribes first.
+	let (res, _) = tokio::join!(
+		wallet.refresh_vtxos(vec![id]),
+		async {
+			tokio::time::sleep(Duration::from_secs(2)).await;
+			srv.trigger_round().await;
+		},
+	);
+	res.expect("the interactive refresh must succeed");
+	log_finished.recv().wait(Duration::from_secs(30)).await
+		.expect("the round must finish, not abort on the superseded participation");
+
+	// A failed store is fatal to the round coordinator, so the surest sign it went
+	// through is that the server still produces rounds.
+	let mut log_no_payments = srv.subscribe_log::<NoRoundPayments>();
+	srv.trigger_round().await;
+	log_no_payments.recv().wait(Duration::from_secs(30)).await
+		.expect("the server must still produce rounds");
+}
+
+/// A delegated refresh scheduled at a future block height must sit out rounds
+/// until the chain tip reaches that height, and be included in the first round
+/// after it does.
+#[tokio::test]
+async fn scheduled_delegated_refresh_waits_for_height() {
+	let ctx = TestContext::new("sapling_sdk/scheduled_delegated_refresh_waits_for_height").await;
+	let srv = ctx.captaind("server").funded(btc(1)).create().await;
+
+	let wallet = ctx.sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(300_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 1, "expected one boarded vtxo");
+	let vtxo_id = vtxos[0].id();
+
+	// Schedule the refresh a few blocks past the round we're about to trigger.
+	let tip = srv.bitcoind().get_block_count().await as u32;
+	let scheduled_height = tip + 10;
+
+	let round = wallet.refresh_vtxos_scheduled(vec![vtxo_id], BlockHeight::new(scheduled_height)).await
+		.expect("submit delegated refresh")
+		.expect("a participation should have been submitted");
+	let unlock_hash = round.state().unlock_hash()
+		.expect("delegated participation carries an unlock hash")
+		.to_byte_array().to_vec();
+
+	// A round before the scheduled height must sit out the participation.
+	let mut log_no_payments = srv.subscribe_log::<NoRoundPayments>();
+	srv.trigger_round().await;
+	log_no_payments.recv().wait(Duration::from_secs(60)).await
+		.expect("round before the scheduled height should have no payments");
+	assert_eq!(
+		participation_status(&srv, unlock_hash.clone()).await,
+		protos::RoundParticipationStatus::RoundPartPending as i32,
+		"participation should still be pending before the scheduled height",
+	);
+
+	// Once the tip reaches the scheduled height, the next round includes it.
+	let tip = srv.bitcoind().get_block_count().await as u32;
+	ctx.generate_blocks(scheduled_height - tip).await;
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	let finished = log_round_finished.recv().wait(Duration::from_secs(60)).await
+		.expect("round at the scheduled height should include the refresh");
+	assert!(finished.nb_input_vtxos >= 1, "round should have refreshed the input vtxo");
+	assert_ne!(
+		participation_status(&srv, unlock_hash).await,
+		protos::RoundParticipationStatus::RoundPartPending as i32,
+		"participation should be processed once the scheduled height is reached",
+	);
+}
+
+/// A delegated refresh whose replacement VTXOs no longer leave room for a
+/// unilateral exit by the time we get to complete it must be refused: the
+/// server may already have swept the replacement tree through its expiry
+/// path, so sending our forfeits would trade the inputs for worthless
+/// replacements. The wallet must keep the round pending and, crucially, never
+/// release its forfeits.
+#[tokio::test]
+async fn scheduled_delegated_refresh_refuses_unexitable_replacements() {
+	// Pin the vtxo lifetime: the test walks the chain right up to the
+	// input's expiry, so its timeline shouldn't silently depend on the
+	// test context default.
+	const VTXO_LIFETIME: u16 = 432;
+
+	let ctx = TestContext::new("sapling_sdk/scheduled_delegated_refresh_refuses_unexitable_replacements").await;
+	let srv = ctx.captaind("server").funded(btc(1))
+		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(VTXO_LIFETIME))
+		.create().await;
+
+	let wallet = ctx.sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(300_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 1, "expected one boarded vtxo");
+	let vtxo_id = vtxos[0].id();
+	let input_expiry = vtxos[0].expiry_height();
+
+	let tip = srv.bitcoind().get_block_count().await as u32;
+	let round = wallet.refresh_vtxos_scheduled(vec![vtxo_id], BlockHeight::new(tip + 1)).await
+		.expect("submit delegated refresh")
+		.expect("a participation should have been submitted");
+	let unlock_hash = round.state().unlock_hash()
+		.expect("delegated participation carries an unlock hash")
+		.to_byte_array().to_vec();
+
+	// Let the server perform the round while the wallet is not looking.
+	ctx.generate_blocks(1).await;
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	log_round_finished.recv().wait(Duration::from_secs(60)).await
+		.expect("round at the scheduled height should include the refresh");
+
+	// Advance to the last block on which our input is still alive. The
+	// replacements were created a few blocks after the input, but far less
+	// than the required exit headroom (twice the exit margin plus the
+	// input's exit delta), so by now they no longer leave room for a
+	// unilateral exit while the input is still worth protecting.
+	//
+	// Stopping one block short of the input's expiry is what keeps this test
+	// meaningful: past it the input is worthless too, and the wallet then
+	// deliberately goes through with the swap. That is the case covered by
+	// [delegated_refresh_completes_with_expired_inputs].
+	let tip = srv.bitcoind().get_block_count().await as u32;
+	ctx.generate_blocks(input_expiry.to_u32() - 1 - tip).await;
+	let tip = srv.bitcoind().get_block_count().await as u32;
+	assert!(input_expiry.to_u32() > tip,
+		"the input must still be unexpired for the exit margin check to apply, \
+		expires at {input_expiry} (tip {tip})",
+	);
+	wallet.sync_pending_rounds().await.expect("sync pending rounds");
+
+	assert_ne!(
+		participation_status(&srv, unlock_hash).await,
+		protos::RoundParticipationStatus::RoundPartReleased as i32,
+		"the wallet must not have sent forfeits for unexitable replacements",
+	);
+	let pending = wallet.pending_round_states().await.expect("pending round states");
+	assert!(pending.iter().any(|s| s.id() == round.id()),
+		"the refused refresh must stay pending rather than be recorded as successful",
+	);
+}
+
+/// The mirror image of
+/// [scheduled_delegated_refresh_refuses_unexitable_replacements]: when the
+/// inputs have expired along with the replacements, there is nothing left to
+/// protect. The server can already claim those inputs through their own
+/// expiry path, so withholding the forfeits only strands the replacements as
+/// well. The wallet must complete the swap and record the refresh as
+/// successful.
+#[tokio::test]
+async fn delegated_refresh_completes_with_expired_inputs() {
+	// Pin the vtxo lifetime: the block math below expires both the input
+	// and the replacements, so it shouldn't silently depend on the test
+	// context default.
+	const VTXO_LIFETIME: u16 = 432;
+
+	let ctx = TestContext::new("sapling_sdk/delegated_refresh_completes_with_expired_inputs").await;
+	let srv = ctx.captaind("server").funded(btc(1))
+		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(VTXO_LIFETIME))
+		.create().await;
+
+	let wallet = ctx.sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(300_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 1, "expected one boarded vtxo");
+	let input_id = vtxos[0].id();
+	let input_expiry = vtxos[0].expiry_height();
+
+	let round = wallet.refresh_vtxos_delegated(vec![input_id]).await
+		.expect("submit delegated refresh")
+		.expect("a participation should have been submitted");
+	let unlock_hash = round.state().unlock_hash()
+		.expect("delegated participation carries an unlock hash")
+		.to_byte_array().to_vec();
+
+	// Let the server perform the round while the wallet is not looking.
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	log_round_finished.recv().wait(Duration::from_secs(60)).await
+		.expect("round should include the delegated refresh");
+
+	// Then stay away long enough for both the input and the replacements to
+	// pass their expiry height. The input was created before the round, so
+	// clearing the replacements' expiry clears the input's too.
+	ctx.generate_blocks(ROUND_CONFIRMATIONS + VTXO_LIFETIME as u32).await;
+	let tip = srv.bitcoind().get_block_count().await as u32;
+	assert!(input_expiry.to_u32() <= tip,
+		"the input should be expired by now, expires at {input_expiry} (tip {tip})",
+	);
+
+	let statuses = wallet.sync_pending_rounds().await.expect("sync pending rounds");
+	// A refusal surfaces as a missing entry: `sync_pending_rounds` swallows a
+	// sync error into a log warning, so check the wallet log if this trips.
+	let status = statuses.get(&round.id())
+		.expect("the pending round should have been synced without error");
+	assert!(status.is_success(),
+		"a refresh whose inputs expired must still complete, got {status:?}",
+	);
+
+	// The forfeits went out and the server released the preimage.
+	assert_eq!(
+		participation_status(&srv, unlock_hash).await,
+		protos::RoundParticipationStatus::RoundPartReleased as i32,
+		"the wallet should have sent its forfeits",
+	);
+	let pending = wallet.pending_round_states().await.expect("pending round states");
+	assert!(!pending.iter().any(|s| s.id() == round.id()),
+		"the completed refresh should no longer be pending",
+	);
+
+	// And the movement records the swap: input forfeited, replacement stored,
+	// even though the replacement is past its own expiry.
+	let refresh = wallet.history().await.expect("list movements").into_iter()
+		.filter(|m| m.subsystem.name == "bark.round" && m.subsystem.kind == "refresh")
+		.find(|m| m.input_vtxos.contains(&input_id))
+		.expect("expected a refresh movement for the boarded vtxo");
+	assert_eq!(refresh.status, MovementStatus::Successful,
+		"the refresh of expired inputs should be recorded as successful",
+	);
+	assert_eq!(
+		wallet.get_vtxo_by_id(input_id).await.expect("input vtxo").state,
+		VtxoState::Spent,
+		"the forfeited input should be marked spent",
+	);
+
+	let output_id = *refresh.output_vtxos.first().expect("the refresh produced a vtxo");
+	let output = wallet.get_vtxo_by_id(output_id).await.expect("output vtxo");
+	assert!(output.expiry_height().to_u32() <= tip,
+		"the replacement should be expired too, expires at {} (tip {})",
+		output.expiry_height(), tip,
+	);
+}
+
+/// When *every* VTXO due for refresh is rejected by the server as unusable, the
+/// delegated maintenance retry loop drops them all and is left with an empty
+/// batch. It must surface that as an error rather than silently reporting
+/// success (`Ok(None)`), so an operator whose wallet only holds unspendable
+/// inputs finds out instead of seeing maintenance quietly no-op forever.
+#[tokio::test]
+async fn maintenance_refresh_delegated_errors_when_all_inputs_unspendable() {
+	let ctx = TestContext::new("sapling_sdk/maintenance_refresh_delegated_errors_when_all_inputs_unspendable").await;
+	let srv = ctx.captaind("server").funded(btc(1)).create().await;
+
+	let bad = Arc::new(Mutex::new(Vec::<VtxoId>::new()));
+	let proxy = srv.start_proxy_no_mailbox(RejectVtxoProxy { bad: bad.clone() }).await;
+
+	let wallet = ctx.sdk("bark", &proxy)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(300_000))
+		.boarded(sat(400_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.len(), 2, "expected two boarded vtxos");
+
+	// Age both vtxos so they are due for refresh, then poison the whole batch.
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32()).await;
+	*bad.lock().unwrap() = vtxos.iter().map(|v| v.id()).collect();
+
+	// The batch is submitted, every input is rejected and excluded, and the loop
+	// then finds nothing left to refresh — which must be an error, not `Ok(None)`.
+	let res = wallet.maybe_schedule_maintenance_refresh_delegated().await;
+	assert!(
+		res.is_err(),
+		"delegated maintenance must error when every input is rejected as unusable; got {res:?}",
+	);
+}
+
+/// A delegated maintenance refresh batch that includes a VTXO the server rejects
+/// as unusable must not fail wholesale: it drops exactly the rejected input and
+/// refreshes the rest, so one bad VTXO can no longer block refreshing healthy
+/// ones until they expire.
+#[tokio::test]
+async fn maintenance_refresh_delegated_drops_server_rejected_vtxo() {
+	let ctx = TestContext::new("sapling_sdk/maintenance_refresh_delegated_drops_server_rejected_vtxo").await;
+	let srv = ctx.captaind("server").funded(btc(1)).create().await;
+	let (wallet, _proxy, bad_id, good_id) = setup_sdk_with_rejected_vtxo(&ctx, &srv).await;
+
+	ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32()).await;
+	wallet.maybe_schedule_maintenance_refresh_delegated().await
+		.expect("delegated maintenance should schedule a refresh, dropping the rejected input");
+	srv.trigger_round().await;
+
+	// Confirm the round and sync until the refresh settles: `good` is forfeited and replaced
+	// by the round output (back to two spendable vtxos), while `bad` is left untouched.
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	let mut refreshed = false;
+	for _ in 0..100 {
+		wallet.sync().await;
+		let ids = wallet.spendable_vtxos().await.expect("list vtxos")
+			.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+		if ids.contains(&bad_id) && !ids.contains(&good_id) && ids.len() == 2 {
+			refreshed = true;
+			break;
+		}
+		ctx.generate_blocks(1).await;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+
+	let final_ids = wallet.spendable_vtxos().await.expect("list vtxos")
+		.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+	assert!(refreshed,
+		"healthy vtxo {good_id} should have been refreshed while rejected vtxo \
+		{bad_id} was skipped; final vtxos: {final_ids:?}",
+	);
+
+	assert_dropped_and_retried_movements(&wallet, bad_id, good_id).await;
+}
+
+/// A delegated participation the server has not picked up yet leaves its inputs
+/// spendable. Once the server has issued the round and its funding tx is in the
+/// mempool, a sync locks the inputs under the refresh movement, and the round
+/// subsystem reports them as its pending inputs. When the round confirms the
+#[tokio::test]
+async fn delegated_round_locks_inputs_once_issued() {
+	let ctx = TestContext::new("sapling_sdk/delegated_round_locks_inputs_once_issued").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+
+	let wallet = ctx.sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true)
+		.boarded(sat(800_000))
+		.create().await;
+
+	let ids = wallet.spendable_vtxos().await.expect("list vtxos")
+		.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+	wallet.refresh_vtxos_delegated(ids.clone()).await
+		.expect("submit the delegated participation")
+		.expect("a participation was submitted");
+
+	wallet.sync().await;
+	let vtxos = wallet.spendable_vtxos().await.expect("list vtxos");
+	assert_eq!(vtxos.iter().map(|v| v.id()).collect::<Vec<_>>(), ids,
+		"the inputs stay spendable until the server issues the round",
+	);
+	assert!(wallet.pending_round_input_vtxos().await.expect("round inputs").is_empty(),
+		"an unissued participation holds no inputs",
+	);
+
+	let mut log_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	let finished = log_finished.recv().wait(Duration::from_secs(30)).await
+		.expect("the round must finish");
+	ctx.await_transaction(finished.txid).await;
+	wallet.chain().invalidate_caches().await;
+	wallet.sync().await;
+
+	assert_eq!(wallet.pending_round_states().await.expect("round states").len(), 1,
+		"the participation is still pending",
+	);
+	for id in &ids {
+		let v = wallet.get_vtxo_by_id(*id).await.expect("input vtxo");
+		assert!(
+			matches!(&v.state, VtxoState::Locked { holder: Some(VtxoLockHolder::Movement { .. }) }),
+			"issued round input {id} must be locked by the refresh movement: {:?}", v.state,
+		);
+	}
+	assert!(wallet.spendable_vtxos().await.expect("list vtxos").is_empty(),
+		"nothing is spendable while the round is unconfirmed",
+	);
+	let inround = wallet.pending_round_input_vtxos().await.expect("round inputs")
+		.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+	assert_eq!(inround, ids, "the round reports its locked inputs");
+
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	for _ in 0..30 {
+		wallet.chain().invalidate_caches().await;
+		wallet.sync().await;
+		if wallet.pending_round_states().await.expect("round states").is_empty() {
+			break;
+		}
+		tokio::time::sleep(poll_interval()).await;
+	}
+	assert!(wallet.pending_round_states().await.expect("round states").is_empty(),
+		"the delegated participation must be finished",
+	);
+	let new_ids = wallet.spendable_vtxos().await.expect("list vtxos")
+		.into_iter().map(|v| v.id()).collect::<Vec<_>>();
+	assert_eq!(new_ids.len(), ids.len(), "one output per input: {new_ids:?}");
+	assert!(new_ids.iter().all(|id| !ids.contains(id)),
+		"the inputs must be replaced by the round outputs: {ids:?} -> {new_ids:?}",
+	);
+}
+
+#[tokio::test]
+async fn round_inputs_locked_only_from_attempt_start() {
+	//! Joining the next round only records intent: the input VTXOs stay
+	//! spendable while waiting for a round and only get locked once a round
+	//! without ever having locked anything.
+
+	let ctx = TestContext::new("sapling_sdk/round_inputs_locked_only_from_attempt_start").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let wallet = ctx.sdk("bark", &srv).funded(sat(1_000_000))
+		.boarded(sat(800_000))
+		.create().await;
+
+	let [vtxo] = wallet.spendable_vtxos().await.unwrap()
+		.try_into().expect("should have exactly one spendable vtxo");
+	let vtxo_id = vtxo.vtxo.id();
+
+	let participation = wallet.build_refresh_participation(vec![vtxo_id]).await
+		.unwrap().expect("should build participation");
+	let state_id = wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await
+		.unwrap().id();
+	assert_eq!(
+		wallet.get_vtxo_by_id(vtxo_id).await.unwrap().state, VtxoState::Spendable,
+		"input should stay spendable while waiting for a round",
+	);
+
+	// An abandoned participation cancels cleanly: nothing was ever locked.
+	wallet.cancel_pending_round(state_id).await.unwrap();
+	assert!(wallet.pending_round_states().await.unwrap().is_empty());
+	assert_eq!(wallet.get_vtxo_by_id(vtxo_id).await.unwrap().state, VtxoState::Spendable);
+
+	// Join again and drive the round stepwise: the input must be locked
+	// from the moment the attempt starts.
+	let participation = wallet.build_refresh_participation(vec![vtxo_id]).await
+		.unwrap().expect("should build participation");
+	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await
+		.unwrap().id();
+
+	let mut rpc = srv.get_public_rpc().await;
+	let mut events = rpc.subscribe_rounds(protos::Empty {}).await.unwrap().into_inner();
+	srv.trigger_round().await;
+
+	let mut saw_locked = false;
+	while let Some(item) = events.next().await {
+		let event = RoundEvent::try_from(item.unwrap()).unwrap();
+		wallet.progress_pending_rounds(Some(&event)).await.unwrap();
+
+		if let RoundEvent::Attempt(a) = &event && a.attempt_seq == 0 {
+			let state = wallet.get_vtxo_by_id(vtxo_id).await.unwrap().state;
+			assert!(matches!(state, VtxoState::Locked { .. }),
+				"input should be locked once the attempt started, got {:?}", state,
+			);
+			saw_locked = true;
+		}
+
+		if let RoundEvent::Finished(_) = &event {
+			break;
+		}
+	}
+	assert!(saw_locked, "never observed the round attempt start");
+
+	// The round finishes with the input consumed as usual.
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	wallet.sync().await;
+	assert_eq!(wallet.get_vtxo_by_id(vtxo_id).await.unwrap().state, VtxoState::Spent);
+}
+
+#[tokio::test]
+async fn round_participation_shrinks_when_inputs_are_taken() {
+	//! While a participation waits for a round, another operation can take
+	//! some of its inputs. When the attempt starts, the participation
+	//! shrinks to the inputs still available instead of failing outright;
+	//! when nothing usable is left, it fails without locking anything.
+
+	let ctx = TestContext::new("sapling_sdk/round_participation_shrinks_when_inputs_are_taken").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let wallet = ctx.sdk("bark", &srv).funded(sat(1_000_000))
+		.boarded(sat(400_000))
+		.boarded(sat(300_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.unwrap();
+	assert_eq!(vtxos.len(), 2, "should have two spendable vtxos");
+	let taken = vtxos.iter().find(|v| v.vtxo.amount() == sat(400_000)).unwrap().vtxo.id();
+	let kept = vtxos.iter().find(|v| v.vtxo.amount() == sat(300_000)).unwrap().vtxo.id();
+
+	let participation = wallet.build_refresh_participation(vec![taken, kept]).await
+		.unwrap().expect("should build participation");
+	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
+
+	// Another operation takes one input while the participation waits.
+	let holder = VtxoLockHolder::Action { id: "other-op-test-action".to_string() };
+	wallet.lock_vtxos(vec![taken], Some(holder.clone())).await.unwrap();
+
+	// The attempt starts: the participation shrinks to the remaining input.
+	let (_, res) = tokio::join!(
+		srv.trigger_round(),
+		wallet.participate_ongoing_rounds().wait_millis(30_000),
+	);
+	res.unwrap();
+
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	wallet.sync().await;
+
+	// The taken input is untouched, the remaining one was refreshed.
+	assert_eq!(
+		wallet.get_vtxo_by_id(taken).await.unwrap().state,
+		VtxoState::Locked { holder: Some(holder.clone()) },
+		"the input held by the other operation must not be touched",
+	);
+	assert_eq!(wallet.get_vtxo_by_id(kept).await.unwrap().state, VtxoState::Spent);
+	let [new_vtxo] = wallet.spendable_vtxos().await.unwrap()
+		.try_into().expect("should have exactly one spendable vtxo");
+	assert_ne!(new_vtxo.vtxo.id(), kept);
+	assert!(wallet.pending_round_states().await.unwrap().is_empty());
+
+	// Check round movement in history
+	let movements = wallet.history().await.unwrap();
+	assert_eq!(movements[0].subsystem.name, "bark.round");
+	assert_eq!(movements[0].subsystem.kind, "refresh");
+	assert_eq!(movements[0].input_vtxos.len(), 1);
+	assert_eq!(movements[0].input_vtxos[0], kept);
+	assert_eq!(movements[0].output_vtxos.len(), 1);
+	assert_eq!(movements[0].output_vtxos[0], new_vtxo.vtxo.id());
+
+	// Now the all-inputs-taken case: the participation fails cleanly.
+	wallet.unlock_vtxos(vec![taken], Some(holder.clone())).await.unwrap();
+	let participation = wallet.build_refresh_participation(vec![taken]).await
+		.unwrap().expect("should build participation");
+	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
+	wallet.lock_vtxos(vec![taken], Some(holder.clone())).await.unwrap();
+
+	let (_, res) = tokio::join!(
+		srv.trigger_round(),
+		wallet.participate_ongoing_rounds().wait_millis(30_000),
+	);
+	res.unwrap();
+
+	assert!(wallet.pending_round_states().await.unwrap().is_empty(),
+		"a participation with no usable inputs left should fail and be removed");
+	assert_eq!(
+		wallet.get_vtxo_by_id(taken).await.unwrap().state,
+		VtxoState::Locked { holder: Some(holder) },
+		"the input held by the other operation must not be touched",
+	);
+}
+
+#[tokio::test]
+async fn pending_participation_drops_consumed_inputs_on_sync() {
+	//! A pending participation doesn't lock its inputs, so another operation
+	//! can consume one while it waits for a round. Syncing the pending
+	//! participations is what makes it notice: it shrinks to the inputs it
+	//! still has, and is canceled once nothing usable is left.
+
+	let ctx = TestContext::new("sapling_sdk/pending_participation_drops_consumed_inputs_on_sync").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let wallet = ctx.sdk("bark", &srv).funded(sat(1_000_000))
+		.boarded(sat(400_000))
+		.boarded(sat(300_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.unwrap();
+	assert_eq!(vtxos.len(), 2, "should have two spendable vtxos");
+	let a = vtxos.iter().find(|v| v.vtxo.amount() == sat(400_000)).unwrap().vtxo.id();
+	let b = vtxos.iter().find(|v| v.vtxo.amount() == sat(300_000)).unwrap().vtxo.id();
+
+	let participation = wallet.build_refresh_participation(vec![a, b]).await
+		.unwrap().expect("should build participation");
+	let state_id = wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await
+		.unwrap().id();
+
+	// A concurrent operation consumes one input: lock, then mark spent —
+	// the sequence every spend path follows. Marking it spent is not what
+	// updates the participation; the sync that every such operation ends
+	// with is.
+	let holder = VtxoLockHolder::Action { id: "other-op-test-action".to_string() };
+	wallet.lock_vtxos(vec![a], Some(holder.clone())).await.unwrap();
+	wallet.mark_vtxos_as_spent(vec![a]).await.unwrap();
+	wallet.sync().await;
+
+	let pending = wallet.pending_round_states().await.unwrap();
+	assert_eq!(pending.len(), 1);
+	assert_eq!(pending[0].id(), state_id);
+	let inputs = pending[0].state().participation().inputs.iter()
+		.map(|v| v.id()).collect::<Vec<_>>();
+	assert_eq!(inputs, vec![b], "the participation should shrink to the unspent input");
+
+	// The other input gets consumed too: nothing remains, so the
+	// participation is canceled.
+	wallet.lock_vtxos(vec![b], Some(holder)).await.unwrap();
+	wallet.mark_vtxos_as_spent(vec![b]).await.unwrap();
+	wallet.sync().await;
+	assert!(wallet.pending_round_states().await.unwrap().is_empty(),
+		"a participation with all inputs spent should be canceled");
+}
+
+#[tokio::test]
+async fn participation_is_canceled_when_the_remainder_cannot_stand_alone() {
+	//! A participation can only shrink to a remainder that could be refreshed
+	//! on its own. Losing the big input here leaves one that is above dust but
+	//! cannot pay the refresh fee and still produce a non-dust output, so the
+	//! participation is canceled rather than left pending forever.
+
+	let ctx = TestContext::new("sapling_sdk/participation_is_canceled_when_the_remainder_cannot_stand_alone").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+		cfg.fees.refresh = RefreshFees {
+			base_fee: sat(150),
+			ppm_expiry_table: vec![],
+		};
+	}).funded(btc(10)).create().await;
+	let wallet = ctx.sdk("bark", &srv).funded(sat(1_000_000))
+		.boarded(sat(100_000))
+		.create().await;
+	let sender = ctx.sdk("sender", &srv).funded(sat(1_000_000))
+		.boarded(sat(100_000))
+		.create().await;
+
+	// A board can not go below the server minimum, so the small input comes
+	// in over arkoor: 400 sat is above the 330 sat dust limit, but the refresh
+	// fee on it leaves less than dust behind.
+	let address = wallet.new_address().await.unwrap();
+	sender.send_arkoor_payment(&address, sat(400)).await.expect("arkoor send");
+	wallet.sync().await;
+
+	let vtxos = wallet.spendable_vtxos().await.unwrap();
+	let a = vtxos.iter().find(|v| v.vtxo.amount() == sat(100_000))
+		.expect("the boarded input").vtxo.id();
+	let b = vtxos.iter().find(|v| v.vtxo.amount() == sat(400))
+		.expect("the arkoor input").vtxo.id();
+
+	let participation = wallet.build_refresh_participation(vec![a, b]).await
+		.unwrap().expect("should build participation");
+	wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
+
+	// The big input is consumed while the participation waits.
+	let holder = VtxoLockHolder::Action { id: "other-op-test-action".to_string() };
+	wallet.lock_vtxos(vec![a], Some(holder)).await.unwrap();
+	wallet.mark_vtxos_as_spent(vec![a]).await.unwrap();
+	wallet.sync().await;
+
+	assert!(wallet.pending_round_states().await.unwrap().is_empty(),
+		"a participation whose remainder cannot be refreshed should be canceled");
+	assert_eq!(wallet.get_vtxo_by_id(b).await.unwrap().state, VtxoState::Spendable,
+		"the remaining input should be left spendable");
+}
+
+#[tokio::test]
+async fn delegated_participation_is_redelegated_when_input_consumed() {
+	//! When some (but not all) inputs of a pending delegated participation
+	//! get consumed by another operation, syncing it re-delegates the
+	//! remaining inputs under a fresh submission — the server drops a
+	//! pending participation wholesale once one of its inputs is gone —
+	//! keeping the scheduled height.
+
+	let ctx = TestContext::new("sapling_sdk/delegated_participation_is_redelegated_when_input_consumed").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let wallet = ctx.sdk("bark", &srv).funded(sat(1_000_000))
+		.boarded(sat(400_000))
+		.boarded(sat(300_000))
+		.create().await;
+
+	let vtxos = wallet.spendable_vtxos().await.unwrap();
+	assert_eq!(vtxos.len(), 2, "should have two spendable vtxos");
+	let a = vtxos.iter().find(|v| v.vtxo.amount() == sat(400_000)).unwrap().vtxo.id();
+	let b = vtxos.iter().find(|v| v.vtxo.amount() == sat(300_000)).unwrap().vtxo.id();
+
+	let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32 + 10);
+	wallet.refresh_vtxos_scheduled(vec![a, b], height).await.unwrap()
+		.expect("delegated refresh should register");
+
+	// A concurrent operation consumes one input.
+	let holder = VtxoLockHolder::Action { id: "other-op-test-action".to_string() };
+	wallet.lock_vtxos(vec![a], Some(holder)).await.unwrap();
+	wallet.mark_vtxos_as_spent(vec![a]).await.unwrap();
+
+	// Two ticks: the first records the re-delegation, the second carries it
+	// out. The decision is persisted in between so a crash can resume it.
+	wallet.sync().await;
+	wallet.sync().await;
+
+	// The participation was re-delegated with the remaining input and the
+	// same schedule.
+	let pending = wallet.pending_round_states().await.unwrap();
+	assert_eq!(pending.len(), 1);
+	assert_eq!(pending[0].state().flow_kind(), RoundFlowKind::DelegatedPending);
+	let inputs = pending[0].state().participation().inputs.iter()
+		.map(|v| v.id()).collect::<Vec<_>>();
+	assert_eq!(inputs, vec![b], "the re-delegated participation should keep the other input");
+	assert_eq!(pending[0].state().scheduled_height(), Some(height),
+		"the scheduled height should carry over to the resubmission");
+
+	// Once the scheduled height is reached, the re-delegated participation
+	// executes.
+	ctx.generate_blocks(10).await;
+	let mut log_round_finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	let finished = log_round_finished.recv().wait(secs(30)).await
+		.expect("the re-delegated refresh should execute in the round");
+	assert_eq!(finished.nb_input_vtxos, 1,
+		"exactly the re-delegated input should have been forfeited");
+}

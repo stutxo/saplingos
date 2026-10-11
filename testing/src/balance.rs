@@ -1,10 +1,10 @@
-//! Consistency checks for the [bark::Balance] of an in-process SDK wallet.
+//! Consistency checks for the [sapling::Balance] of an in-process SDK wallet.
 
 use bitcoin::Amount;
 
 use ark::VtxoId;
-use bark::actions::WalletAction;
-use bark::vtxo::VtxoState;
+use sapling::actions::WalletAction;
+use sapling::vtxo::VtxoState;
 
 /// Fetch the balance, syncing first when `sync` is set, and assert that it
 /// agrees with the wallet's VTXOs and operations: the spendable sats are the
@@ -12,7 +12,7 @@ use bark::vtxo::VtxoState;
 /// VTXOs its operations report, no locked VTXO is counted twice and the
 /// totals include native exits and selected program recoveries. Returns the
 /// balance so callers can assert individual amounts and recovery branches.
-pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bark::Balance {
+pub async fn assert_balance_consistent(wallet: &sapling::Wallet, sync: bool) -> sapling::Balance {
 	if sync {
 		wallet.sync().await;
 	}

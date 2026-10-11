@@ -1,141 +1,100 @@
-# SaplingOS
+# Sapling SDK
 
-SaplingOS is a fork of [Bark](https://gitlab.com/ark-bitcoin/bark) with
-program-controlled Ark wallets. It retains Bark's wallet, server and protocol
-libraries. The server protocol and native VTXO policies remain unchanged.
+Sapling is a Rust client SDK for program-controlled Ark wallets, derived from
+[Second's Bark wallet](https://gitlab.com/ark-bitcoin/bark). Applications use
+`sapling::Wallet`; this repository no longer ships an Ark server, a wallet CLI,
+or a REST application.
 
-- **This repository:** the Bark wallet, CLI, REST API and integration tests.
-- **[sapio_tee](https://github.com/stutxo/sapio_tee):** program evaluation and the
-  enclave's share of the nested MuSig signature.
-- **[Sapio](https://github.com/sapio-lang/sapio):** the unchanged upstream program
-  identities and bounded WASM runtime.
+Sapio evaluates the exact configured program and co-signs with the wallet.
+Before committing funds, the wallet saves and verifies the program-authorized
+recovery transactions. A separate on-chain wallet pays recovery mining fees;
+saved beneficiary outputs cannot be redirected later.
 
-See [the wallet guide](bark/README.md#sapio-backed-vtxos) for
-configuration, coordinated receive and recovery commands. Recovery pays the
-output scripts approved by the program before the wallet commits. A saved claim
-cannot be redirected later. A separate fee wallet pays the mining fees.
-
-This integration is experimental. Local verification does not establish a
+This integration is experimental. Local verification does not establish
 production Nitro attestation or replace an independent cryptographic review.
-Report fork-specific issues in [SaplingOS](https://github.com/stutxo/saplingos/issues).
-The Bark information and project links below describe the upstream project.
+See [the SDK guide](sdk/README.md) for configuration, coordinated receiving,
+and recovery APIs.
 
-## Upstream Bark
+## Use the SDK
 
-![bark: Ark on bitcoin](assets/bark-header-white.jpg)
+For a checkout next to your application:
 
-<div align="center">
-<h1>Bark: Ark on bitcoin</h1>
-<p>Fast, low-cost, self-custodial payments on bitcoin.</p>
-</div>
+```toml
+[dependencies]
+sapling-sdk = { path = "../Sapling/sdk" }
+```
 
-<p align="center">
-  <br />
-  <a href="https://docs.second.tech">Docs</a> ·
-  <a href="https://gitlab.com/ark-bitcoin/bark/issues">Issues</a> ·
-  <a href="https://second.tech">Website</a> ·
-  <a href="https://blog.second.tech">Blog</a> ·
-  <a href="https://www.youtube.com/@2ndbtc">YouTube</a>
-</p>
+The Cargo package is `sapling-sdk`; its Rust crate is `sapling`. The package is
+source-only, not published on crates.io. A Git dependency must select a commit
+containing this SDK extraction. Consumers do not need workspace patches.
+Enable `onchain-bdk` to use the supplied on-chain wallet implementation, or
+implement `sapling::onchain::OnchainWalletTrait` in the application.
 
-<div align="center">
+The application owns seed storage, configuration, database location, and wallet
+lifecycle. `Config::load` reads `SAPLING_` environment variables, then a config
+file, then network defaults. There is no `BARK_` environment compatibility alias.
 
-[![Release](https://img.shields.io/gitlab/pipeline-status/ark-bitcoin/bark?branch=master&gitlab_url=https%3A%2F%2Fgitlab.com)](https://gitlab.com/ark-bitcoin/bark/tags)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?logo=git)](CONTRIBUTING.md)
-[![Community](https://img.shields.io/badge/community-forum-blue?logo=discourse)](https://community.second.tech)
+## Repository boundary
 
-</div>
+| Directory | Package | Responsibility |
+|---|---|---|
+| `sdk/` | `sapling-sdk` | Wallet API, persistence, external signing, coordinated receive, and recovery |
+| `protocol/` | `ark-lib` | Client protocol primitives, including Sapling's program keys and nested signing |
+| `rpc/` | `bark-server-rpc` | Wire schemas and RPC bindings using those protocol types; not a server application |
+| `testing/` | `sapling-testing` | Opt-in SDK regressions using external upstream service fixtures |
 
-<br />
+This is an extraction of the modified client, not a thin wrapper around an
+unmodified Bark release. The wallet and protocol changes are needed to preserve
+program ownership and recovery across every commitment point. The support
+packages retain their upstream Cargo names so the integration fixtures share
+the same protocol types.
 
-Bark is an implementation of the Ark protocol on bitcoin, led by [Second](https://second.tech). The Ark protocol is a bitcoin layer 2 for making fast, low-cost, self-custodial payments at scale. Ark uses a client-server model to enable users to transact off-chain while still being able to "exit" their balances on-chain at any time.
+Unchanged `bark-common`, `bark-runtime`, `bark-bitcoin-ext`, and `bip321` come from
+GitLab, pinned to upstream commit
+[`626c9b241dd25d73212915d8fca959ab5e3b8f1f`](https://gitlab.com/ark-bitcoin/bark/-/tree/626c9b241dd25d73212915d8fca959ab5e3b8f1f).
+There is no floating upstream branch. The optional integration harness also
+fetches upstream server/test helpers at that revision. Its dependencies are
+absent from the default build and from SDK consumers, though Cargo records
+optional dependencies in the workspace lockfile.
 
-The project consists of:
+The root Cargo patches apply only when building the optional upstream fixtures
+inside this workspace. The SDK declares its local support dependencies directly.
 
-- The Ark wallet: **bark**
-- The Ark server: **captaind**
-- A set of libraries containing all protocol primitives
+## Develop
 
-## Get started
+```sh
+nix develop
+just checks
+just unit
+just test-doc
+just rustdocs
+```
 
-- [**Make your first Ark transactions**](https://docs.second.tech/getting-started/): Step-by-step guide to set up a CLI wallet, get sats from [our faucet](https://signet.2nd.dev), and buy some treats from [our test store](https://signet.2nd.dev/store).
-- [**Compile from source**](https://docs.second.tech/getting-started/optional/compile-from-source/)
-- [**Set up an Ark server**](https://docs.second.tech/run-ark-server/): For patient folks looking to do more in-depth testing!
+The default workspace contains only the SDK, protocol, and RPC libraries.
+The Nix shell does not build or install server applications. See
+[BUILDING.md](BUILDING.md) for prerequisites and opt-in integration tests, and
+[CONTRIBUTING.md](CONTRIBUTING.md) for contribution conventions.
 
-## What if I don't speak Rust?
+## Migration from the monorepo
 
-No Rust, no problem!
+- Depend on `sapling-sdk` and import `sapling`, not `bark-wallet` / `bark`.
+- Use `WalletPersister`, `WalletNetwork`, `WalletBip321Uri`,
+  `WalletBip321UriBuilder`, and `WalletExtension` in place of their `Bark*` names.
+- Use the wallet and recovery APIs instead of invoking a bundled CLI or REST API.
+- Supply server binaries externally for integration tests; no `BARK_EXEC` is needed.
+- Wallet derivation paths, persisted state, protocol encodings, and authenticated
+  domain separators have not been renamed. Existing `bark.*` movement subsystem
+  identifiers remain stable data, not new application branding.
 
-**barkd** is an Ark wallet that runs as a daemon and exposes a REST API over HTTP. It's well suited for power users and great for automation—think web shops, Telegram/Discord bots, and similar use cases. The [barkd-clients repository](https://gitlab.com/ark-bitcoin/barkd-clients) provides clients in TypeScript and C#.
+## Related projects
 
-barkd serves plaintext HTTP and binds loopback by default. A bearer token holding full wallet access travels in every request, so exposing the port beyond loopback requires a reverse proxy that terminates TLS: barkd has no TLS of its own, and the token is readable by anyone on the path. `--no-auth` removes the token requirement entirely, and refuses to start on a non-loopback bind; `--dangerously-allow-remote-no-auth` is the flag that does both, disabling auth on a bind address anyone can reach.
+- [sapio_tee](https://github.com/stutxo/sapio_tee): program evaluation and the
+  enclave's share of the nested MuSig signature.
+- [Sapio](https://github.com/sapio-lang/sapio): program identities and bounded WASM runtime.
+- [Upstream Bark](https://gitlab.com/ark-bitcoin/bark): server applications,
+  unchanged support crates, and upstream release history.
+- [Sapling issues](https://github.com/stutxo/saplingos/issues): non-sensitive
+  fork-specific issues. See [SECURITY.md](SECURITY.md) for security reporting.
 
-**uniffi-bindings** are the better choice if you're building a native desktop or mobile application. The bindings are available in the [bark-ffi repository](https://gitlab.com/ark-bitcoin/bark-ffi) and power the published Bark SDK packages.
-
-## Why Ark?
-
-As bitcoin adoption grows, on-chain fees spike during busy periods, making everyday transactions impractical. While Lightning has been revolutionary for bitcoin scaling, it's beginning to show its limitations-channel management and liquidity requirements create complexity for developers and users.
-
-Ark offers a complementary scaling solution that simplifies bitcoin self-custody:
-
-🏃‍♂️ **Smooth onboarding**: No channels to open, no on-chain setup required-create a wallet and start transacting  
-🤌 **Simplified UX**: Send and receive without managing channels, liquidity, or routing  
-🌐 **Universal payments**: Send Ark, Lightning, and on-chain payments from a single off-chain balance  
-🔌 **Easier integration**: Client-server architecture reduces complexity compared to P2P protocols  
-💸 **Lower costs**: Instant payments at a fraction of on-chain fees  
-🔒 **Self-custodial**: Users maintain full control of their funds at all times
-
-Perfect for users who want self-custody without the hassle, and developers who want to build bitcoin apps without the complexity.
-
-[Learn more about Ark's benefits →](https://second.tech)
-
-## How does Ark work?
-
-The Ark protocol enables multiple users to share control of a single bitcoin UTXO through a tree of pre-signed, off-chain transactions. This allows instant, off-chain payments while maintaining self-custody-users can always withdraw their bitcoin either cooperatively with the Ark server or unilaterally on-chain.
-
-For a detailed technical explanation, see our [protocol documentation](https://second.tech/docs/learn/intro).
-
-![An example of an Ark transaction tree from a refresh](assets/tx-tree-refresh.jpg)
-_A transaction tree showing how Ark enables multiple users to share control of a single UTXO through pre-signed transactions._
-
-## Building Bark
-
-Both bark's client and server binaries can be built with either cargo or nix.
-Nix builds are reproducible and are used for official releases.
-For more info, see the [`BUILDING.md`](BUILDING.md) file.
-
-## Minimum supported Rust version (MSRV)
-
-Most of our crates do not yet specify a MSRV, but we will commit to one once we make an official release.
-
-The `ark-lib` crate (and by extension the `bark-bitcoin-ext` crate) have a MSRV of v1.74.0.
-
-## Contributing
-
-Thinking of opening a pull request? See our [contribution guide](CONTRIBUTING.md) for dependencies, style guidelines, and code hygiene expectations.
-
-### Security
-
-Please report any vulnerability or any bug that could potentially affect the
-security of users' funds by e-mail to [`security@second.tech`](mailto:security@second.tech).
-
-You may use the following PGP keys to encrypt your e-mail:
-
-- `8CC974D9CFD034DCEED213B02A57E0A610D7F19C` (Steven Roose)
-- `011E7F59B45397C4654D81298F44B2DD98E18528` (Erik De Smedt)
-
-Both keys can be found on the [keys.openpgp.org](https://keys.openpgp.org/) keyserver.
-
-
-## Questions or issues
-
-If you run into any issues at all, let us know:
-
-- [Community forum](https://community.second.tech)
-- [Community chat](https://chat.second.tech)
-- [Issue tracker](https://gitlab.com/ark-bitcoin/bark/issues)
-
-## License
-
-Released under the **MIT** license-see the [LICENSE](LICENSE) file for details.
+Released under the [MIT license](LICENSE). Original upstream attribution and
+Git history are retained.

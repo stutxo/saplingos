@@ -1,126 +1,62 @@
-
 [workspace]
-members = [
-  "bitcoin-ext",
-  "lib",
-  "bark",
-  "bark-common",
-  "bark-runtime",
-  "bark-cli",
-  "bark-json",
-  "bark-rest",
-  "server",
-  "server-log",
-  "server-rpc",
-  "testing",
-  "cln-rpc",
-  "bark-rest-client",
-  "bip321",
-  "wasm-testing"
-]
-
+members = ["sdk", "protocol", "rpc", "testing"]
+default-members = ["sdk", "protocol", "rpc"]
 resolver = "2"
 
-# CI profile: reduces binary size so that nextest archives are small enough
-# for gitlab to handle as artifacts.
-[profile.ci]
-inherits = "dev"
-debug = 0
-strip = "symbols"
-opt-level = "z"
-
-# build dependencies for tests with cheap optimizations to reduce CI runtime
 [profile.dev.package."*"]
 opt-level = 2
-
-# Profile for a fast bark and barkd that still have full debug info
-[profile.barkdebug]
-inherits = "release"
-debug = true
-strip = "none"
-debug-assertions = true
 
 [profile.release]
 overflow-checks = true
 lto = true
 
-# TODO(stevenroose) at some point probably move these inline
+# The optional integration fixtures use these same protocol types. The SDK's
+# own path dependencies do not require downstream consumers to add patches.
+[patch."https://gitlab.com/ark-bitcoin/bark.git"]
+ark-lib = { path = "protocol" }
+bark-server-rpc = { path = "rpc" }
+
 [workspace.dependencies]
+# Unmodified upstream libraries, pinned to the base of the Sapling client fork.
+bark-common = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f" }
+bark-runtime = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f" }
+bark-bitcoin-ext = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f", default-features = false }
+bip321 = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f" }
 
-#
-# * EXPORTED (ECOSYSTEM)
-
-bitcoin = { version = "0.32.7", features = [ "serde", "rand", "rand-std" ] }
-lightning-invoice = { version = "0.34.0", features = [ "std", "serde" ] }
-lightning = { version = "0.2.0", default-features = false, features = [ "std" ] }
-lnurl-rs = { version = "0.10.0", features = [ "async", "async-https-rustls" ], default-features = false }
-anyhow = { version = "1.0", features = [ "backtrace" ] }
-thiserror = { version = "2.0.12" }
-log = { version = "0.4.27", features = [ "kv", "kv_serde" ] }
-serde = { version = "1.0.219" }
-# grpc clients
-tonic = { version = "0.14.2", features = [ "tls-webpki-roots", "gzip", "zstd" ] }
-tower = "0.5.2"
-hyper = "1.6.0"
-hyper-socks2 = { version = "0.9.1", default-features = false }
-hyper-util = { version = "0.1.20", features = ["tokio", "client-legacy"] }
-http = "1.2.0"
-http-body = "1.0.1"
-
-#
-# * INTERNAL
-
-# rust stack
+bitcoin = { version = "0.32.7", features = ["serde", "rand", "rand-std"] }
+lightning-invoice = { version = "0.34.0", features = ["std", "serde"] }
+lightning = { version = "0.2.0", default-features = false, features = ["std"] }
+lnurl-rs = { version = "0.10.0", features = ["async", "async-https-rustls"], default-features = false }
+anyhow = { version = "1.0", features = ["backtrace"] }
+thiserror = "2.0.12"
+log = { version = "0.4.27", features = ["kv", "kv_serde"] }
+serde = "1.0.219"
+serde_json = { version = "1", features = ["raw_value"] }
 lazy_static = "=1.5.0"
-env_logger = "0.11.8"
-clap = { version = "4.4.18", features = [ "derive", "env" ] }
-chrono = { version = "0.4", features = [ "serde" ] }
-serde_json = { version = "1", features = [ "raw_value" ] }
-toml = "1.1.2"
+chrono = { version = "0.4", features = ["serde"] }
 rmp-serde = "1.3.0"
 config = "0.15.6"
-humantime = "2.1.0"
-base64 = "0.22"
-semver = "1.0.26"
-subtle = "2.6.1"
-# async + gRPC stack
 parking_lot = "0.12.4"
+async-trait = "0.1.83"
+futures = "0.3.30"
+
+tonic = { version = "0.14.2", features = ["tls-webpki-roots", "gzip", "zstd"] }
 prost = "0.14.1"
 prost-types = "0.14.1"
 tonic-prost = "0.14.2"
 tonic-prost-build = "0.14.2"
-tonic-health = "0.14.2"
-tonic-web = "0.14.2"
+http = "1.2.0"
+hyper-socks2 = { version = "0.9.1", default-features = false }
+hyper-util = { version = "0.1.20", features = ["tokio", "client-legacy"] }
 tokio = { version = "1.35", default-features = false }
 tokio-util = { version = "0.7.14", default-features = false }
-tokio-stream = { version = "0.1.14", features = [ "sync" ], default-features = false }
-tokio-postgres = "0.7.12"
-bb8 = "0.9.0"
-bb8-postgres = "0.9.0"
-postgres-types = { version = "0.2.9", features = [ "derive", "with-chrono-0_4" ] }
-futures = {version = "0.3.30"}
-async-trait = "0.1.83"
-async-stream = "0.3.6"
-pin-project = "1.1.10"
-# bitcoin
-bip39 = { version = "2.0.0", features = [ "rand" ] }
-rand = { version = "0.10.1", features = [ "std", "std_rng" ] }
-bdk_wallet = { version = "3.1.0" }
+tokio-stream = { version = "0.1.14", features = ["sync"], default-features = false }
+
+bip39 = { version = "2.0.0", features = ["rand"] }
+rand = { version = "0.10.1", features = ["std", "std_rng"] }
+bdk_wallet = "3.1.0"
 bdk_core = { version = "0.6.1", default-features = false }
-bdk_esplora = { version = "0.22.1", features = [ "std", "async-https-rustls", "tokio" ], default-features = false }
-# crate used by bdk_esplora, first version with submit_package
+bdk_esplora = { version = "0.22.1", features = ["std", "async-https-rustls", "tokio"], default-features = false }
 esplora-client = { version = "0.12.3", default-features = false, features = ["async", "async-https-rustls", "tokio"] }
-bdk_bitcoind_rpc = { version = "0.22.0" }
-bitcoind-async-client = { version = "0.15.0", features = [ "raw_rpc" ] }
-# tracing and monitoring
-opentelemetry = "0.30.0"
-opentelemetry_sdk = { version = "0.30.0", features = [ "trace", "rt-tokio" ] }
-opentelemetry-otlp = { version = "0.30.0", features = [ "trace", "grpc-tonic", "gzip-tonic" ] }
-opentelemetry-semantic-conventions = { version = "0.30.0", features = [ "semconv_experimental" ] }
-tonic-tracing-opentelemetry = "0.30.0"
-json-subscriber = { version = "0.2.6", features = [ "tracing-opentelemetry-0-31", "opentelemetry-0-30" ] }
-tracing = { version = "0.1.43", features = [ "std", "attributes" ] }
-tracing-core = { version = "0.1.35" }
-tracing-opentelemetry = "0.31.0"
-tracing-subscriber = { version = "0.3.22", features = [ "std", "registry", "ansi", "fmt", "json", "env-filter" ] }
-tracing-attributes = "0.1.31"
+bdk_bitcoind_rpc = "0.22.0"
+bitcoind-async-client = { version = "0.15.0", features = ["raw_rpc"] }

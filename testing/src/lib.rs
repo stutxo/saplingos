@@ -1,163 +1,19 @@
-#[macro_use]
-extern crate anyhow;
-#[macro_use]
-extern crate async_trait;
-#[macro_use]
-extern crate lazy_static;
+//! Opt-in SDK regression support. Server processes and their fixtures are upstream.
+#![cfg(feature = "integration")]
 
 pub mod balance;
 pub mod context;
-pub mod constants;
 pub mod daemon;
-pub mod lightning;
-pub mod ports;
-pub mod util;
-pub mod bark;
-pub mod postgres;
-pub mod exit;
-pub mod control_server;
 
 pub use context::TestContext;
-pub use daemon::{Daemon, DaemonHelper};
-pub use daemon::bitcoind::{Bitcoind, BitcoindConfig};
-pub use daemon::electrs::{Electrs, ElectrsConfig};
-pub use daemon::captaind::Captaind;
-pub use daemon::barkd::Barkd;
-pub use daemon::lightningd::{Lightningd, LightningdConfig};
-pub use daemon::tor::{Tor, TorConfig, HiddenServiceConfig};
-pub use bark::Bark;
+pub use ark_testing::{btc, sat, secs, signed_btc, signed_sat, Lightningd};
+pub use ark_testing::constants;
 
+pub mod util {
+	pub use ark_testing::util::{FutureExt, ToAltString, poll_interval};
 
-use std::fmt;
-use std::str::FromStr;
-use std::time::Duration;
-
-use bitcoin::{Amount, SignedAmount};
-
-#[macro_export]
-macro_rules! assert_eq {
-	($left:expr, $right:expr $(,)?) => { std::assert_eq!($left, $right) };
-	($left:expr, $right:expr, $($arg:tt)+) => { std::assert_eq!($left, $right, $($arg)+) };
-
-	// USAGE: when a test fails and you want to see all failed assertions in one go,
-	// comment out the two above lines so that the below lines will match.
-
-	($left:expr, $right:expr $(,)?) => {
-		match (&$left, &$right) {
-			(left_val, right_val) => {
-				if !(*left_val == *right_val) {
-					println!("ASSERT FAILED: {:?} != {:?} ({}:{})",
-						left_val, right_val, file!(), line!(),
-					);
-				}
-			}
-		}
-	};
-	($left:expr, $right:expr, $($arg:tt)+) => {
-		match (&$left, &$right) {
-			(left_val, right_val) => {
-				if !(*left_val == *right_val) {
-					println!("ASSERT FAILED: {:?} != {:?} ({}:{}): {}",
-						left_val, right_val, file!(), line!(), format_args!($($arg)+),
-					);
-				}
-			}
-		}
-	};
-}
-
-/// Check if the bark binary version satisfies the requirement.
-///
-/// Usage:
-/// ```ignore
-/// is_bark_version!(>= "0.1.0-beta.8");
-/// ```
-///
-#[macro_export]
-macro_rules! is_bark_version {
-	($op:tt $version:expr) => {{
-		let actual = $crate::bark::Bark::version().await;
-		let actual = $crate::util::BarkVersion::parse(&actual);
-		let required = $crate::util::BarkVersion::parse($version);
-		actual $op required
-	}};
-}
-
-/// Skip the current test if the bark binary version doesn't satisfy the requirement.
-///
-/// Usage (as the first line in an async test):
-/// ```ignore
-/// require_bark_version!(>= "0.1.0-beta.8");
-/// ```
-///
-/// Dev builds always satisfy `>=` and `>` checks (dev is greater than any release).
-#[macro_export]
-macro_rules! require_bark_version {
-	($op:tt $version:literal) => {
-		if !$crate::is_bark_version!($op $version) {
-			let actual = $crate::bark::Bark::version().await;
-			log::info!(
-				"skipping test: bark {} does not satisfy {} {}",
-				actual, stringify!($op), $version,
-			);
-			return;
-		}
-	};
-}
-
-/// Skip the test unless it is running against the bitcoind chain source.
-///
-/// Some test helpers — notably [`Bark::full_clone`](Bark::full_clone) - only work with the
-/// bitcoind harness, since the esplora/mempool chain source leaves the per-wallet bitcoind
-/// handle unset. Use this at the top of such a test so it is skipped (not failed) under
-/// `CHAIN_SOURCE=esplora`/`mempool`.
-#[macro_export]
-macro_rules! require_bitcoind_chain_source {
-	() => {
-		{
-			let chain_source = $crate::util::get_bark_chain_source_from_env();
-			if !matches!(chain_source, $crate::util::TestContextChainSource::BitcoinCore) {
-				log::info!(
-					"skipping test: requires the bitcoind chain source, but CHAIN_SOURCE is {}",
-					chain_source.as_str(),
-				);
-				return;
-			}
-		}
-	};
-}
-
-/// Shorthand for Amount from sats
-pub fn sat<V>(sats: V) -> Amount
-where
-	V: TryInto<u64>,
-	V::Error: fmt::Debug,
-{
-	Amount::from_sat(sats.try_into().expect("invalid interger"))
-}
-
-/// Shorthand for SignedAmount from sats
-pub fn signed_sat<V>(sats: V) -> SignedAmount
-where
-	V: TryInto<i64>,
-	V::Error: fmt::Debug,
-{
-	SignedAmount::from_sat(sats.try_into().expect("invalid signed integer"))
-}
-
-/// Shorthand for Amount from BTC
-pub fn btc(btc: impl fmt::Display) -> Amount {
-	Amount::from_str(&format!("{} btc", btc))
-		.expect(&format!("invalid btc amount: {}", btc))
-}
-
-/// Shorthand for SignedAmount from BTC
-pub fn signed_btc(btc: impl fmt::Display) -> SignedAmount {
-	SignedAmount::from_str(&format!("{} btc", btc))
-		.expect(&format!("invalid btc amount: {}", btc))
-}
-
-/// Shorthand for Duration in seconds.
-pub fn secs(seconds: u64) -> Duration {
-	Duration::from_secs(seconds)
+	/// Match the SDK executor's debug-only reentrancy mode.
+	pub fn action_drive_factor() -> usize {
+		if std::env::var_os("SAPLING_DOUBLE_DRIVE_ACTIONS").is_some() { 2 } else { 1 }
+	}
 }

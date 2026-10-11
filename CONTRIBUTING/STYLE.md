@@ -59,7 +59,7 @@ following order:
    - internal deps (our own crates)
    - crate deps (same crate)
 
-Here's an example for a source file in the `bark` crate, the comments are for
+Here's an example for a source file in the `sapling-sdk` crate, the comments are for
 illustrative purposes only so you don't need to add them in real code:
 ```rust
 pub mod network;

@@ -2,7 +2,7 @@
 
 **Check the nix flake is loaded before writing any code.**
 
-Run `which captaind` or `echo $IN_NIX_SHELL`. If the flake isn't loaded, remind the user:
+Run `printenv IN_NIX_SHELL`. If the flake isn't loaded, remind the user:
 
 > "Please restart in a shell with the nix flake loaded (`nix develop` or direnv)."
 
@@ -17,14 +17,11 @@ Use the skills in `contrib/agents/skills/` extensively:
 | `running-and-debugging-tests.md` | Running tests and investigating failures |
 | `writing-tests.md` | Test patterns and conventions |
 | `review.md` | Reviewing branches (with or without fix-ups) |
-| `changelog.md` | Writing changelog entries |
-| `missing-changelogs.md` | Finding MRs without changelog entries |
 | `protocol-encoding.md` | Working with ProtocolEncoding (backward compat, no panics, DoS protection) |
 | `documentation.md` | Documentation conventions (vocabulary is in CONTRIBUTING/style_guide.md) |
 | `database-schema.md` | Finding the full database DDL (use schema.sql, not migrations) |
 | `prompts.md` | Managing prompts and research |
 | `corrections.md` | When corrected, encode the fix into skill files |
-| `debug-ci.md` | Debugging CI failures — `debug <url to failed pipeline>` |
 
 ## Testing
 
@@ -37,6 +34,10 @@ just unit <name> # Specific unit test
 just int         # Integration tests (bitcoind backend)
 just int <name>  # Specific integration test
 ```
+
+The default shell and checks cover only the client SDK and protocol/RPC libraries.
+Integration fixtures are external and opt-in; see `BUILDING.md`. Historical
+changelog and GitLab CI skills describe upstream workflows, not this extraction.
 
 ## Code Style
 
@@ -60,7 +61,7 @@ changelogs, commit messages, and user-facing strings.
 
 ## Commit Hygiene
 
-- Prefix with subsystem: `bark:`, `server:`, `lib:`, `ci:`, `testing:`
+- Prefix with subsystem: `sdk:`, `protocol:`, `rpc:`, `ci:`, `testing:`
 - Focus on **why**, not what - help reviewers understand context
 - Small, logical commits that individually compile (`just check`)
 - Squash fixups into original commits (reviewers use `git range-diff`)
@@ -68,16 +69,12 @@ changelogs, commit messages, and user-facing strings.
 ## Error Handling
 
 - `ark-lib`: Use `thiserror` - errors are part of the API
-- `bark`/`captaind`: Use `anyhow` - propagate errors upstream
+- `sapling-sdk`: Use `anyhow` - propagate errors to the application
 - Use `thiserror` elsewhere when you need to handle errors differently
 - Avoid creating too many error types - be pragmatic
 
-## Database (Postgres)
+## Database
 
-See `CONTRIBUTING/postgres.md` for guidelines:
-
-- Singular table names (`round` not `rounds`)
-- Primary keys named `id`
-- Store pubkeys/hashes as hex
-- Avoid wildcards: `SELECT (id, created_at)` not `SELECT *`
-- Use `RETURNING` on inserts/updates
+Use `sdk/schema.sql` for the wallet's complete SQLite DDL. Database migrations
+must preserve program descriptors, saved recoveries, and restart safety.
+Server PostgreSQL schema and migrations belong to the pinned upstream fixtures.

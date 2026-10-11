@@ -1,7 +1,10 @@
 # Movement System Documentation
 
-The movement system tracks all balance and VTXO changes within bark. Each movement represents a distinct action that
-the wallet performs.
+The movement system tracks all balance and VTXO changes within Sapling. Each
+movement represents a distinct action that the wallet performs.
+
+The persisted `bark.*` subsystem names remain unchanged from upstream. They are
+stable data identifiers, not references to a bundled Bark application.
 
 ## Table of Contents
 

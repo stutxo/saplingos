@@ -6,10 +6,11 @@
 //! is ephemeral.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, ensure};
+use anyhow::{anyhow, Context, ensure};
+use async_trait::async_trait;
 use bitcoin::bip32::Xpub;
 use serde::Deserialize;
 use tokio::process::Command;
@@ -19,13 +20,21 @@ use crate::TestContext;
 
 pub const ENDPOINT: &str = "http://127.0.0.1:8000";
 
-pub type SapioTee = Daemon<SapioTeeHelper>;
+pub struct SapioTee {
+	daemon: Daemon<SapioTeeHelper>,
+	root: Arc<OnceLock<Xpub>>,
+}
+
+impl std::ops::Deref for SapioTee {
+	type Target = Daemon<SapioTeeHelper>;
+	fn deref(&self) -> &Self::Target { &self.daemon }
+}
 
 pub struct SapioTeeHelper {
 	name: String,
 	datadir: PathBuf,
 	executable: PathBuf,
-	root: OnceLock<Xpub>,
+	root: Arc<OnceLock<Xpub>>,
 	_exclusive_ports: std::fs::File,
 }
 
@@ -52,17 +61,18 @@ impl SapioTee {
 			.expect("Sapio tests require exclusive port 8000 in a private network namespace");
 		let oracle = std::net::TcpListener::bind("127.0.0.1:8367")
 			.expect("Sapio tests require exclusive port 8367 in a private network namespace");
-		let daemon = Self::wrap(SapioTeeHelper {
+		let root = Arc::new(OnceLock::new());
+		let daemon = Daemon::wrap(SapioTeeHelper {
 			name: "sapio-tee".into(), datadir: ctx.datadir.join("sapio-tee"),
-			executable, root: OnceLock::new(), _exclusive_ports: exclusive_ports,
+			executable, root: root.clone(), _exclusive_ports: exclusive_ports,
 		});
 		drop((api, oracle));
 		daemon.start().await.expect("start real Sapio TEE");
-		daemon
+		Self { daemon, root }
 	}
 
 	pub fn public_root(&self) -> Xpub {
-		*self.inner.root.get().expect("Sapio TEE initialized")
+		*self.root.get().expect("Sapio TEE initialized")
 	}
 }
 

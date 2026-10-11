@@ -1,635 +1,51 @@
+//! SDK wallet construction over the pinned upstream service fixtures.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
 
-use ark::fees::{
-	BoardFees, FeeSchedule, LightningReceiveFees, LightningSendFees, OffboardFees, PpmFeeRate,
-	RefreshFees,
-};
-use bitcoin::{Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use bitcoin::absolute::LockTime;
-use bitcoin::transaction::Version;
-use bitcoin_ext::{BlockDelta, BlockHeight, FeeRateExt, TxOutExt};
-use bitcoin_ext::fee::P2A_SCRIPT;
-use bitcoin_ext::rpc::BitcoinRpcExt;
-use bitcoincore_rpc::json::SignRawTransactionInput;
-use bitcoincore_rpc::RpcApi;
-use ::futures::future::always_ready;
-use futures::future::join_all;
-use log::{debug, info, trace};
-use server::vtxopool::VtxoTarget;
-use server::Server;
-use tokio::{fs, join};
-use tonic::transport::Uri;
+use anyhow::{bail, Context};
+use bitcoin::{Amount, FeeRate};
+use bitcoin_ext::BlockDelta;
+use futures::StreamExt;
+use sapling::{WalletNetwork, OpenWalletArgs, WalletSeed};
+use sapling::movement::{MovementId, MovementStatus};
+use sapling::onchain::{OnchainWallet, OnchainWalletTrait};
+use sapling::persist::{WalletPersister, sqlite::SqliteClient};
+use tokio::fs;
 
-use bitcoind_async_client::traits::Reader;
+pub use ark_testing::context::ToArkUrl;
+use ark_testing::Bitcoind;
+use crate::constants::{self, BOARD_CONFIRMATIONS};
+use crate::util::FutureExt;
 
-use crate::daemon::bitcoind::BitcoindRpcHandle;
-use crate::daemon::bitcoind::snapshot;
-use crate::daemon::captaind::proxy::ArkRpcProxyServer;
-use crate::postgres::{self, PostgresDatabaseManager};
-use crate::util::{
-	get_bark_chain_source_from_env, get_cargo_workspace, get_tx_propagation_timeout_millis,
-	test_data_directory, poll_interval, TestContextChainSource,
-};
-use crate::{
-	btc, constants, sat, Bark, Barkd, Bitcoind, BitcoindConfig, Captaind, Electrs,
-	ElectrsConfig, Lightningd,
-};
+const BOARD_ONCHAIN_FEE_BUFFER: Amount = Amount::from_sat(100_000);
 
-pub mod builders;
+/// Service lifecycle stays upstream; wallets always use this repository's SDK.
+pub struct TestContext(ark_testing::TestContext);
 
-pub struct LightningPaymentSetup {
-	pub external: Lightningd,
-	pub internal: Lightningd,
-}
-
-impl LightningPaymentSetup {
-	/// Open a channel between the internal and external lightningd nodes, and
-	/// send half of the capacity to the other side to make sure both sides are
-	/// balanced.
-	pub async fn open_channel(&self, ctx: &TestContext, capacity: Amount) {
-		trace!("Creating channel between lightning nodes");
-		self.internal.connect(&self.external).await;
-		let funding_txid = self.internal.fund_channel(&self.external, capacity).await;
-
-		// We need to await the channel funding transaction or else we get
-		// infinite 'Waiting for gossip...' below.
-		ctx.await_transaction(funding_txid).await;
-		// Default depth before channel_ready
-		ctx.generate_blocks(6).await;
-
-		self.internal.wait_for_gossip(1).await;
-
-		// Send half of the capacity to the other side
-		let invoice = self.external.invoice(Some(capacity / 2), "balance", "balance channel").await;
-		self.internal.pay_bolt11(invoice).await;
-	}
-
-	pub async fn sync(&self) {
-		tokio::join!(
-			self.external.wait_for_block_sync(),
-			self.internal.wait_for_block_sync(),
-		);
-	}
-}
-
-pub trait ToArkUrl {
-	fn ark_url(&self) -> String;
-}
-impl ToArkUrl for Captaind {
-	fn ark_url(&self) -> String { self.ark_url() }
-}
-impl ToArkUrl for String {
-	fn ark_url(&self) -> String { self.clone() }
-}
-impl ToArkUrl for str {
-	fn ark_url(&self) -> String { self.to_owned() }
-}
-impl ToArkUrl for ArkRpcProxyServer {
-	fn ark_url(&self) -> String { self.address.clone() }
-}
-impl<T: ToArkUrl> ToArkUrl for Arc<T> {
-	fn ark_url(&self) -> String { <T as ToArkUrl>::ark_url(self.as_ref()) }
-}
-
-pub struct TestContext {
-	pub test_name: String,
-	pub datadir: PathBuf,
-
-	pub bitcoind: Option<Arc<Bitcoind>>,
-	/// The test's own copy of the bitcoind snapshot, made once when the
-	/// central bitcoind is started. All bitcoind nodes of this test copy
-	/// from here rather than from the shared snapshot, so that they are
-	/// guaranteed to start on the same chain even if the shared snapshot
-	/// gets regenerated while the test runs.
-	bitcoind_snapshot_dir: Option<PathBuf>,
-	/// the main captaind instance for the test
-	pub captainds: Mutex<Vec<Arc<Captaind>>>,
-
-	/// RPC handles for secondary bitcoind nodes that are p2p-connected to the
-	/// central one. Used by [`await_block_count_sync`] to ensure blocks have
-	/// propagated to all nodes.
-	secondary_bitcoinds: Mutex<Vec<BitcoindRpcHandle>>,
-
-	// use a central Electrs for the Esplora and mempool.space API if necessary
-	pub electrs: Option<Electrs>,
-
-	// ensures postgres daemon, if any, stays alive the TestContext's lifetime
-	postgres_manager: Option<postgres::PostgresDatabaseManager>,
+impl Deref for TestContext {
+	type Target = ark_testing::TestContext;
+	fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl TestContext {
-	pub async fn new_minimal(test_name: impl AsRef<str>) -> Self {
-		crate::util::init_logging();
-
-		let test_name = test_name.as_ref().to_owned();
-		let datadir = test_data_directory().await.join(&test_name);
-
-		if datadir.exists() {
-			fs::remove_dir_all(&datadir).await.unwrap();
-		}
-		fs::create_dir_all(&datadir).await.unwrap();
-
-		TestContext {
-			test_name,
-			datadir,
-			bitcoind: None,
-			bitcoind_snapshot_dir: None,
-			captainds: Mutex::new(Vec::new()),
-			secondary_bitcoinds: Mutex::new(Vec::new()),
-			electrs: None,
-			postgres_manager: None,
-		}
+	pub async fn new(name: impl AsRef<str>) -> Self {
+		Self(ark_testing::TestContext::new(name).await)
 	}
 
-	pub async fn new(test_name: impl AsRef<str>) -> Self {
-		let mut ctx = Self::new_minimal(test_name).await;
-
-		ctx.init_central_bitcoind().await;
-		ctx.init_central_electrs().await;
-		ctx.init_central_postgres().await;
-
-		ctx
+	pub fn sdk<'a>(&'a self, name: impl AsRef<str>, srv: &'a dyn ToArkUrl) -> SdkBuilder<'a> {
+		SdkBuilder::new(self, name, srv)
 	}
 
-	pub fn bitcoind_default_cfg(&self, name: impl AsRef<str>) -> BitcoindConfig {
-		let datadir = self.datadir.join(name.as_ref());
-		// Prefer the test's own snapshot copy so all nodes of this test
-		// start on the same chain; fall back to the shared snapshot for
-		// contexts that never started a central bitcoind.
-		let snapshot_dir = self.bitcoind_snapshot_dir.clone().or_else(|| {
-			std::env::var(constants::env::BITCOIND_SNAPSHOT_DIR)
-				.map(PathBuf::from).ok()
-		});
-		BitcoindConfig {
-			datadir,
-			wallet: false,
-			txindex: true,
-			network: Network::Regtest,
-			fallback_fee: FeeRate::from_sat_per_vb(1).unwrap(),
-			relay_fee: None,
-			snapshot_dir,
-		}
-	}
-
-	pub async fn init_central_bitcoind(&mut self) {
-		let snapshot_dir = std::env::var(constants::env::BITCOIND_SNAPSHOT_DIR)
-			.map(PathBuf::from)
-			.unwrap_or_else(|_| {
-				get_cargo_workspace().join("test/_bitcoind_snapshot")
-			});
-
-		snapshot::ensure_snapshot(&snapshot_dir).await;
-
-		// Copy the snapshot once into the test's datadir; every bitcoind of
-		// this test copies from there. Copying from the shared snapshot per
-		// node would let a concurrent regeneration hand different chains to
-		// different nodes of the same test.
-		let local_snapshot = self.datadir.join("bitcoind_snapshot");
-		snapshot::copy_snapshot(&snapshot_dir, &local_snapshot).await
-			.expect("failed to copy bitcoind snapshot for test");
-		self.bitcoind_snapshot_dir = Some(local_snapshot.clone());
-
-		let bitcoind = Bitcoind::new(
-			"bitcoind".to_string(),
-			BitcoindConfig {
-				datadir: self.datadir.join("bitcoind"),
-				wallet: true,
-				txindex: true,
-				network: Network::Regtest,
-				fallback_fee: FeeRate::from_sat_per_vb(1).unwrap(),
-				relay_fee: None,
-				snapshot_dir: Some(local_snapshot),
-			},
-			None,
-		);
-		bitcoind.start().await.unwrap();
-		bitcoind.load_wallet("central").await;
-
-		self.bitcoind = Some(Arc::new(bitcoind));
-	}
-
-	pub async fn init_central_electrs(&mut self) {
-		let electrs = match get_bark_chain_source_from_env() {
-			TestContextChainSource::BitcoinCore => None,
-			TestContextChainSource::ElectrsRest(electrs_type) => {
-				let cfg = ElectrsConfig {
-					network: Network::Regtest,
-					bitcoin_dir: self.bitcoind().datadir(),
-					bitcoin_rpc_port: self.bitcoind().rpc_port(),
-					bitcoin_zmq_port: self.bitcoind().zmq_port(),
-					electrs_dir: self.datadir.join("electrs"),
-					cors: Some("*".to_owned()),
-				};
-				let electrs = Electrs::new(&self.test_name, cfg, electrs_type);
-				electrs.start().await.unwrap();
-				Some(electrs)
-			},
-		};
-
-		self.electrs = electrs;
-		self.await_block_count_sync().await
-	}
-
-	pub fn postgres_manager(&self) -> &PostgresDatabaseManager {
-		self.postgres_manager.as_ref().unwrap()
-	}
-
-	pub async fn init_central_postgres(&mut self) {
-		if self.postgres_manager.is_none() {
-			let datadir = self.datadir.join("postgres");
-			self.postgres_manager = Some(PostgresDatabaseManager::init(datadir).await);
-		}
-	}
-
-	/// Returns the `Bitcoind` which is central to this `TestContext`
-	/// Will panic if no central `BitcoinD` is present
-	pub fn bitcoind(&self) -> &Bitcoind {
-		self.bitcoind.as_deref()
-			.expect("The central bitcoind hasn't been initialized. Call init_central_bitcoind first")
-	}
-
-	/// Returns a cloned `Arc<Bitcoind>` for shared ownership.
-	pub fn bitcoind_arc(&self) -> Arc<Bitcoind> {
-		Arc::clone(self.bitcoind.as_ref()
-			.expect("The central bitcoind hasn't been initialized. Call init_central_bitcoind first"))
-	}
-
-	// ── Builders ────────────────────────────────────────────────────
-
-	pub fn captaind(&self, name: impl AsRef<str>) -> builders::CaptaindBuilder<'_> {
-		builders::CaptaindBuilder::new(self, name)
-	}
-
-	pub fn register_test_captaind(&self, captaind: Arc<Captaind>) {
-		self.captainds.lock().unwrap().push(captaind);
-	}
-
-	pub fn bark<'a>(&'a self, name: impl AsRef<str>, srv: &'a dyn ToArkUrl) -> builders::BarkBuilder<'a> {
-		builders::BarkBuilder::new(self, name, srv)
-	}
-
-	/// In-process counterpart to [`Self::bark`]: returns a builder that
-	/// constructs a [`bark::Wallet`] directly via the library API,
-	/// instead of spawning the `bark` CLI binary.
-	pub fn bark_sdk<'a>(
-		&'a self,
-		name: impl AsRef<str>,
-		srv: &'a dyn ToArkUrl,
-	) -> builders::BarkSdkBuilder<'a> {
-		builders::BarkSdkBuilder::new(self, name, srv)
-	}
-
-	pub fn watchmand(&self, name: impl AsRef<str>) -> builders::WatchmandBuilder<'_> {
-		builders::WatchmandBuilder::new(self, name)
-	}
-
-	pub fn lightningd(&self, name: impl AsRef<str>) -> builders::LightningdBuilder<'_> {
-		builders::LightningdBuilder::new(self, name)
-	}
-
-	// ── Direct constructors ────────────────────────────────────
-
-	pub async fn new_bitcoind(&self, name: impl AsRef<str>) -> Bitcoind {
-		self.new_bitcoind_with_cfg(name.as_ref(), self.bitcoind_default_cfg(name.as_ref())).await
-	}
-
-	pub async fn new_bitcoind_with_cfg(&self, name: impl AsRef<str>, cfg: BitcoindConfig) -> Bitcoind {
-		let wallet = cfg.wallet;
-		let name = name.as_ref();
-
-		let bitcoind = Bitcoind::new(name.to_string(), cfg, Some(self.bitcoind().p2p_url()));
-		bitcoind.start().await.unwrap();
-		// A freshly snapshot-loaded secondary occasionally fails to catch up to
-		// the ctx bitcoind over P2P: the log shows the missing blocks arriving
-		// from the peer but being rejected as "Unexpected block message
-		// received from peer 0", and the tip stays put. Nudge it past this
-		// before any downstream captaind hits the node's RPC.
-		self.await_secondary_bitcoind_synced(&bitcoind).await;
-		if wallet {
-			bitcoind.create_wallet(name).await;
-		}
-		self.secondary_bitcoinds.lock().unwrap().push(bitcoind.rpc_handle());
-		bitcoind
-	}
-
-	/// Ensure a freshly-started secondary bitcoind has caught up to the ctx
-	/// bitcoind's tip. See the call site in [`new_bitcoind_with_cfg`] for the
-	/// direct-fetch race this guards against.
-	async fn await_secondary_bitcoind_synced(&self, node: &Bitcoind) {
-		let Some(ctx) = self.bitcoind.as_ref() else { return };
-		let target = ctx.get_block_count().await;
-
-		// Fast path: ZMQ tip notifications from the node itself. Bounded so a
-		// stalled P2P direct-fetch falls through to the RPC push below.
-		let fast = tokio::time::timeout(
-			Duration::from_secs(2),
-			node.wait_for_blockheight(BlockHeight::new(target as u32)),
-		).await;
-		if fast.is_ok() {
-			return;
-		}
-
-		// P2P stalled. Push blocks one at a time to avoid retriggering the
-		// batch race; `submitblock` is idempotent on already-known blocks.
-		let ctx_rpc = ctx.async_client();
-		// The async client reports a null result as an error, and null is how
-		// `submitblock` reports an accepted block.
-		let node_rpc = node.sync_client();
-		let mut have = node.get_block_count().await;
-		while have < target {
-			let next = have + 1;
-			let hash = ctx_rpc.get_block_hash(next).await
-				.expect("get_block_hash on ctx bitcoind");
-			let hex: String = ctx_rpc.call_raw(
-				"getblock", &[hash.to_string().into(), 0.into()],
-			).await.expect("getblock hex on ctx bitcoind");
-			// `submitblock`: null = accepted, "duplicate" = already had it,
-			// any other string = rejected. On rejection, only advance if the
-			// tip actually moved (e.g. via P2P); otherwise panic.
-			let resp: serde_json::Value = node_rpc.call(
-				"submitblock", &[hex.into()],
-			).expect("submitblock on stalled secondary bitcoind");
-			match &resp {
-				serde_json::Value::Null => {},
-				serde_json::Value::String(s) if s == "duplicate" => {},
-				other => {
-					let observed = node.get_block_count().await;
-					if observed <= have {
-						panic!("submitblock rejected block {} at height {} on {}: {}",
-							hash, next, node.name, other,
-						);
-					}
-					have = observed;
-					continue;
-				},
-			}
-			have = next;
-		}
-	}
-
-	pub async fn new_postgres(&self, db_name: &str) -> server::config::Postgres {
-		self.postgres_manager.as_ref().unwrap()
-			.request_database(db_name).await
-	}
-
-	async fn captaind_default_cfg(
-		&self,
-		name: impl AsRef<str>,
-		bitcoind: &Bitcoind,
-		lightningd: Option<&Lightningd>,
-	) -> server::config::Config {
-		let name = name.as_ref();
-		let data_dir = self.datadir.join(name);
-
-		let cln_array = if let Some(lnd) = lightningd {
-			let grpc_details = lnd.grpc_details().await;
-			let hold_details = lnd.hold_details().await;
-
-			let lightningd = server::config::Lightningd {
-				uri: Uri::from_str(&grpc_details.uri).expect("failed to parse cln grpc uri"),
-				priority: 1,
-				server_cert_path: grpc_details.server_cert_path,
-				client_cert_path: grpc_details.client_cert_path,
-				client_key_path: grpc_details.client_key_path,
-				hold_invoice: Some(server::config::HodlInvoiceClnPlugin {
-					uri: Uri::from_str(&hold_details.uri).expect("failed to parse hold plugin uri"),
-					server_cert_path: hold_details.server_cert_path,
-					client_cert_path: hold_details.client_cert_path,
-					client_key_path: hold_details.client_key_path,
-				})
-			};
-
-			let mut cln_array = Vec::new();
-			cln_array.push(lightningd);
-
-			cln_array
-		} else {
-			Vec::new()
-		};
-
-		// Create a new postgres database with the name of the test and database
-		let db_name = format!("{}/{}", self.test_name, name);
-		let postgres_cfg = self.new_postgres(&db_name).await;
-
-		// NB we don't auto-complete `..Default::default()` here
-		// to force us to evaluate every value in test context.
-		server::config::Config {
-			data_dir: data_dir.clone(),
-			network: Network::Regtest,
-			vtxo_lifetime: BlockDelta::new(432),
-			vtxo_exit_delta: BlockDelta::new(12),
-			round_interval: Duration::from_secs(3600),
-			round_submit_time: Duration::from_millis(5000),
-			// this one can be long cuz in most tests all users are ready and we don't wait
-			round_sign_time: Duration::from_millis(5000),
-			nb_round_nonces: 8,
-			round_forfeit_nonces_timeout: Duration::from_secs(30),
-			required_board_confirmations: constants::BOARD_CONFIRMATIONS as usize,
-			min_trusted_confs: 1,
-			max_vtxo_amount: None,
-			max_board_amount: None,
-			max_offboard_amount: None,
-			max_arkoor_amount: None,
-			max_ln_send_amount: None,
-			max_round_amount: None,
-			max_ln_receive_amount: None,
-			max_vtxo_exit_depth: 50,
-			max_arkoor_fanout: 4,
-			allow_expired_arkoor: false,
-			rpc_rich_errors: true,
-			nursery_confirm_target_blocks: BlockDelta::new(6),
-			sync_manager_block_poll_interval: Duration::from_millis(100),
-			handshake_psa: None,
-			tos_link: None,
-			otel_collector_endpoint: None,
-			otel_tracing_sampler: Some(1f64),
-			otel_deployment_name: db_name,
-			vtxopool: server::vtxopool::Config {
-				vtxo_targets: vec![
-					VtxoTarget { count: 3, amount: sat(10_000) },
-					VtxoTarget { count: 3, amount: btc(1) },
-				],
-				vtxo_target_issue_threshold: 50,
-				vtxo_lifetime: BlockDelta::new(432),
-				vtxo_pre_expiry: BlockDelta::new(12),
-				// A checkpointed allocation adds two txs to the chain, so this
-				// allows the same three chained allocations as before checkpoints.
-				max_vtxo_exit_depth: 6,
-			},
-			offboard_session_timeout: Duration::from_secs(30),
-			offboard_check_interval: Duration::from_secs(1),
-			offboard_acceptable_fee_rate_duration: Duration::from_secs(60 * 10),
-			fee_estimator: server::fee_estimator::Config {
-				update_interval: Duration::from_secs(60),
-				history_duration: Duration::from_secs(60 * 30),
-				fallback_fee_rate_fast: FeeRate::from_sat_per_vb_u32(25),
-				fallback_fee_rate_regular: FeeRate::from_sat_per_vb_u32(7),
-				fallback_fee_rate_slow: FeeRate::from_sat_per_vb_u32(5),
-				max_fee_rate: None,
-			},
-			rpc: server::config::Rpc {
-				// these will be overwritten on start, but can't be empty
-				public_address: SocketAddr::from_str("127.0.0.1:3535").unwrap(),
-				max_pending_accept_reset_streams: None,
-				admin_address: None,
-				integration_address: None,
-			},
-			bitcoind: server::config::Bitcoind {
-				url: bitcoind.rpc_url(),
-				cookie: Some(bitcoind.rpc_cookie()),
-				rpc_user: None,
-				rpc_pass: None,
-			},
-			postgres: postgres_cfg,
-			cln_array,
-			cln_reconnect_interval: Duration::from_secs(10),
-			invoice_check_interval: Duration::from_secs(3),
-			cln_xpay_timeout: Duration::from_secs(5),
-			cln_xpay_max_retry_for: Duration::from_secs(60),
-			invoice_check_base_delay: Duration::from_secs(2),
-			max_invoice_check_delay: Duration::from_secs(10),
-			invoice_poll_interval: Duration::from_secs(10),
-			htlc_settlement_poll_interval: Duration::from_secs(5),
-			track_all_base_delay: Duration::from_secs(1),
-			max_track_all_delay: Duration::from_secs(60),
-			htlc_expiry_delta: BlockDelta::new(6),
-			htlc_send_expiry_delta: BlockDelta::new(258),
-			max_user_invoice_cltv_delta: BlockDelta::new(58),
-			invoice_expiry: Duration::from_secs(10 * 60),
-			receive_htlc_forward_timeout: Duration::from_secs(30),
-			min_board_amount: Amount::from_sat(20_000),
-			ln_receive_anti_dos_required: false,
-			ln_max_fee_ppm: 900_000,
-			max_read_mailbox_items: 100,
-			fees: FeeSchedule {
-				board: BoardFees {
-					min_fee: Amount::ZERO,
-					base_fee: Amount::ZERO,
-					ppm: PpmFeeRate::ZERO,
-				},
-				offboard: OffboardFees {
-					base_fee: Amount::ZERO,
-					fixed_additional_vb: 100,
-					ppm_expiry_table: vec![],
-				},
-				refresh: RefreshFees {
-					base_fee: Amount::ZERO,
-					ppm_expiry_table: vec![],
-				},
-				lightning_receive: LightningReceiveFees {
-					base_fee: Amount::ZERO,
-					ppm: PpmFeeRate::ZERO,
-				},
-				lightning_send: LightningSendFees {
-					min_fee: Amount::ZERO,
-					base_fee: Amount::ZERO,
-					ppm_expiry_table: vec![],
-				},
-			},
-			bitcoin_address_blocklist: None,
-			bitcoin_address_blocklist_refresh_interval: None,
-			require_board_funding_tx: true,
-			round_legacy_hashlock_clauses: false,
-		}
-	}
-
-	async fn watchmand_default_cfg(
-		&self,
-		name: impl AsRef<str>,
-		bitcoind: &Bitcoind,
-		srv: &Captaind,
-	) -> server::config::watchmand::Config {
-		let sweep_address = srv.wallet_status().await.rounds.address.assume_checked();
-
-		let name = name.as_ref();
-		let data_dir = self.datadir.join(name);
-
-		// NB we don't auto-complete `..Default::default()` here
-		// to force us to evaluate every value in test context.
-		server::config::watchmand::Config {
-			postgres: srv.config().postgres.clone(),
-			watchman: server::watchman::Config {
-				reaction_interval: std::time::Duration::from_secs(1),
-				sweep_interval: std::time::Duration::from_secs(1),
-				progress_grace_period: BlockDelta::new(2),
-				claim_chunksize: 15.try_into().unwrap(),
-				incremental_relay_fee: FeeRate::from_sat_per_kvb_ceil(100),
-				min_cpfp_amount: Amount::from_sat(10_000),
-			},
-			sweep_address: Some(sweep_address.to_string().parse().expect("invalid sweep address")),
-			data_dir: data_dir.clone(),
-			network: Network::Regtest,
-			min_trusted_confs: 1,
-			sync_manager_block_poll_interval: Duration::from_millis(100),
-			otel_collector_endpoint: None,
-			otel_tracing_sampler: Some(1f64),
-			otel_deployment_name: format!("{}/{}", self.test_name, name),
-			fee_estimator: server::fee_estimator::Config {
-				update_interval: Duration::from_secs(60),
-				history_duration: Duration::from_secs(60 * 30),
-				fallback_fee_rate_fast: FeeRate::from_sat_per_vb_u32(25),
-				fallback_fee_rate_regular: FeeRate::from_sat_per_vb_u32(7),
-				fallback_fee_rate_slow: FeeRate::from_sat_per_vb_u32(5),
-				max_fee_rate: None,
-			},
-			bitcoind: server::config::Bitcoind {
-				url: bitcoind.rpc_url(),
-				cookie: Some(bitcoind.rpc_cookie()),
-				rpc_user: None,
-				rpc_pass: None,
-			},
-			htlc_settlement_poll_interval: Duration::from_secs(5),
-			admin_address: None,
-			bitcoin_address_blocklist: None,
-			bitcoin_address_blocklist_refresh_interval: None,
-		}
-	}
-
-	pub async fn new_server_with_cfg(
-		&self,
-		name: impl AsRef<str>,
-		lightningd: Option<&Lightningd>,
-		mod_cfg: impl FnOnce(&mut server::Config),
-	) -> Arc<Server> {
-		// using context bitcoind because we don't have a place to store the bitcoind
-		let mut cfg = self.captaind_default_cfg(name.as_ref(), self.bitcoind(), lightningd).await;
-		mod_cfg(&mut cfg);
-
-		Server::create(cfg.clone()).await.expect("error creating server");
-		let srv = Server::start(cfg).await.expect("error starting server");
-
-		// Server::start returns before LightningManager has finished its first
-		// connect pass. Tests that hit start_lightning_receive immediately would
-		// otherwise race with "no active hold-compatible cln node".
-		if lightningd.is_some() {
-			trace!("Waiting for lightning node to come online");
-			let wait = async {
-				while !srv.has_hold_node() {
-					tokio::time::sleep(poll_interval()).await;
-				}
-			};
-			if tokio::time::timeout(Duration::from_secs(5), wait).await.is_err() {
-				log::error!("timed out waiting for lightning node to come online;
-					letting test continue so the actual failure surfaces");
-			}
-		}
-
-		srv
-	}
-
-	pub fn bark_default_cfg(
+	pub fn sdk_default_cfg(
 		&self,
 		srv: &dyn ToArkUrl,
 		bitcoind: Option<&Bitcoind>,
-	) -> bark::Config {
+	) -> sapling::Config {
 		#[allow(deprecated)]
-		bark::Config {
+		sapling::Config {
 			server_address: srv.ark_url(),
 			server_access_token: None,
 			user_agent: None,
@@ -658,307 +74,174 @@ impl TestContext {
 			daemon_sync_interval_secs: 3,
 			daemon_manual_sync: false,
 			change_vtxo_split_factor: 2,
-			vtxo_key_gap_limit: bark::DEFAULT_VTXO_KEY_GAP_LIMIT,
-		}
-	}
-
-	/// Build a new barkd daemon connected to the given Ark server.
-	/// [`builders::BarkdBuilder::create`] starts the daemon and creates its wallet.
-	///
-	/// Uses esplora (electrs) as chain source when available, otherwise
-	/// creates a dedicated bitcoind.
-	pub fn barkd<'a>(
-		&'a self,
-		name: impl AsRef<str>,
-		srv: &'a Captaind,
-	) -> builders::BarkdBuilder<'a> {
-		builders::BarkdBuilder::new(self, name, srv)
-	}
-
-	/// Creates one sender and one receiver lightningd node and funds sender,
-	/// but does not create a channel between them.
-	pub async fn new_lightning_setup_no_channel(&self, name: impl AsRef<str>) -> LightningPaymentSetup {
-		trace!("Start receiver and sender lightningd nodes");
-		let internal = self.lightningd(format!("{}_internal", name.as_ref())).create().await;
-		let external = self.lightningd(format!("{}_external", name.as_ref())).create().await;
-
-		trace!("Funding all lightning-nodes");
-		self.fund_lightning(&internal, btc(12)).await;
-		let height = self.generate_blocks(6).await;
-		internal.wait_for_block(height).await;
-
-		LightningPaymentSetup { internal, external }
-	}
-
-	/// Creates one sender and one receiver lightningd node and funds sender,
-	/// and creates a channel between them.
-	pub async fn new_lightning_setup(&self, name: impl AsRef<str>) -> LightningPaymentSetup {
-		let lightning = self.new_lightning_setup_no_channel(name).await;
-		lightning.open_channel(self, btc(10)).await;
-		lightning
-	}
-
-	pub async fn fund_captaind(&self, srv: &Captaind, amount: Amount) {
-		info!("Fund {} {}", srv.name, amount);
-		let rounds_address = srv.get_rounds_funding_address().await;
-		self.bitcoind().fund_addr(rounds_address, amount).await;
-		self.bitcoind().generate(1).await;
-		self.await_block_count_sync().await;
-		// `await_block_count_sync` only waits for the server's bitcoind to
-		// receive the block; the wallet syncs in a background task and may
-		// still be catching up. Callers that immediately query `wallet_status`
-		// need to also wait for the wallet's own sync height to catch up.
-		let height = BlockHeight::new(srv.bitcoind().get_block_count().await as u32);
-		srv.wait_for_sync_height(height).await;
-	}
-
-	/// Send `amount` to an onchain address of this Bark client.
-	pub async fn fund_bark(&self, bark: &Bark, amount: Amount) -> Txid {
-		info!("Fund {} {}", bark.name(), amount);
-		let address = bark.get_onchain_address().await;
-		let txid = self.bitcoind().fund_addr(address, amount).await;
-		self.bitcoind().generate(1).await;
-		self.await_block_count_sync().await;
-		txid
-	}
-
-	/// Send `amount` to an onchain address of this barkd daemon.
-	pub async fn fund_barkd(&self, barkd: &Barkd, amount: Amount) -> Txid {
-		info!("Fund {} {}", barkd.name(), amount);
-		let address = barkd.onchain_address().await;
-		let txid = self.bitcoind().fund_addr(address, amount).await;
-		self.bitcoind().generate(1).await;
-		self.await_block_count_sync().await;
-		txid
-	}
-
-	pub async fn fund_lightning(&self, lightning: &Lightningd, amount: Amount) -> Txid {
-		info!("Fund {} {}", lightning.name, amount);
-		let address = lightning.get_onchain_address().await;
-
-		let client = self.bitcoind().sync_client();
-		client.send_to_address(
-			&address, amount, None, None, None, None, None, None,
-		).unwrap()
-	}
-
-	/// Wait until all secondary bitcoind nodes, electrs and the central captaind
-	/// have synced to the central bitcoind's current tip.
-	///
-	/// For electrs, polls the Prometheus `tip_height` metric rather than
-	/// the REST API height, because the REST height can update before the
-	/// history (address) index is ready — causing BDK wallet syncs to miss txs.
-	pub async fn await_block_count_sync(&self) {
-		let Some(bitcoind) = self.bitcoind.as_ref() else { return };
-		let tip = bitcoind.get_block_count().await;
-		trace!("Awaiting block count sync until {tip}...");
-
-		// Wait for all secondary bitcoind nodes to reach the same height.
-		let bitcoinds = self.secondary_bitcoinds.lock().unwrap().clone();
-		let bitcoinds = join_all(bitcoinds.into_iter().map(|b| async move {
-			let client = b.client();
-			loop {
-				match client.get_block_count() {
-					Ok(current) if current >= tip => break,
-					Ok(current) => {
-						trace!("Waiting for {} to reach height {} (at {})", b.name, tip, current);
-					}
-					// Node was shut down mid-test (e.g. server restart tests).
-					Err(e) => {
-						debug!("Skipping sync for {} (node unreachable: {})", b.name, e);
-						break;
-					}
-				}
-				tokio::time::sleep(poll_interval()).await;
-			}
-		}));
-
-		let electrs: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(electrs) = self.electrs.as_ref() {
-			Box::pin(electrs.await_tip_synced(tip as u32))
-		} else {
-			Box::pin(always_ready(|| ()))
-		};
-
-		// wait for all captainds to catch up
-		let captainds = self.captainds.lock().unwrap().clone();
-		let captainds = join_all(captainds.into_iter().map(|srv| async move {
-			srv.wait_for_sync_height(BlockHeight::new(tip as u32)).await
-		}));
-
-		// then join all futures
-		join!(bitcoinds, electrs, captainds);
-	}
-
-	/// Waits for the given transaction ID to be available in both the central bitcoind and electrs
-	pub async fn await_transaction(&self, txid: Txid) {
-		let bitcoin = async move {
-			if let Some(bitcoind) = &self.bitcoind {
-				bitcoind.await_transaction(txid).await;
-			}
-		};
-		let electrs = async move {
-			if let Some(electrs) = &self.electrs {
-				electrs.await_transaction(txid).await;
-			}
-		};
-		let bitcoinds = self.secondary_bitcoinds.lock().unwrap().clone();
-		let bitcoinds = join_all(bitcoinds.into_iter().map(|b| async move {
-			let client = b.client();
-			let start = Instant::now();
-			let timeout = get_tx_propagation_timeout_millis();
-			while Instant::now().duration_since(start).as_millis() < timeout as u128 {
-				if client.get_raw_transaction(&txid, None).is_ok() {
-					return;
-				} else {
-					tokio::time::sleep(poll_interval()).await;
-				}
-			}
-			panic!("Failed to get raw transaction: {}", txid);
-		}));
-		join!(bitcoin, electrs, bitcoinds);
-	}
-
-	/// Waits for the given transaction ID to be available in the central bitcoin and electrs, as
-	/// well as each given bitcoin node.
-	pub async fn await_transactions_across_nodes(
-		&self,
-		txids: impl IntoIterator<Item = Txid>,
-		extra_nodes: impl IntoIterator<Item = &Bitcoind>,
-	) {
-		let txids = txids.into_iter().collect::<Vec<_>>();
-		let central_futures = async {
-			join_all(txids.iter().map(|txid| self.await_transaction(*txid))).await;
-		};
-		let nodes_future = async {
-			join_all(extra_nodes.into_iter().flat_map(|b| {
-				txids.iter().map(|txid| b.await_transaction(*txid))
-			})).await
-		};
-		join!(central_futures, nodes_future);
-	}
-
-	/// Generated a block using the central bitcoind and ensures that electrs is synced with it.
-	/// Returns the new block height.
-	pub async fn generate_blocks(&self, block_num: u32) -> BlockHeight {
-		// Give transactions time to propagate
-		tokio::time::sleep(Duration::from_millis(1000)).await;
-
-		self.bitcoind().generate(block_num).await;
-
-		// Wait untill all blocks are propagated
-		self.await_block_count_sync().await;
-
-		let height = self.bitcoind().get_block_count().await;
-		info!("New chain tip: {}", height);
-		BlockHeight::new(height as u32)
-	}
-
-	/// Generated a block using the central bitcoind without waiting for propagation
-	pub async fn generate_blocks_unsynced(&self, block_num: u32) {
-		self.bitcoind().generate(block_num).await;
-	}
-
-	/// Broadcast a zero-fee parent transaction using CPFP via its P2A anchor.
-	///
-	/// Assumes the last output of `parent` is a P2A (pay-to-anchor) output.
-	/// Builds a v3 child transaction that spends the anchor plus a funded UTXO
-	/// from the test bitcoind wallet, submits the package, and returns the child txid.
-	pub async fn broadcast_cpfp(&self, parent: &Transaction) -> Txid {
-		let client = self.bitcoind().sync_client();
-
-		let parent_txid = parent.compute_txid();
-		let p2a_vout = parent.output.iter().position(|o| o.is_p2a_fee_anchor())
-			.expect("parent tx doesn't have a fee anchor") as u32;
-		let p2a_outpoint = OutPoint::new(parent_txid, p2a_vout);
-
-		let utxos = client.list_unspent(Some(1), None, None, None, None)
-			.expect("list_unspent failed");
-		let utxo = utxos.into_iter().next().expect("test bitcoind wallet should have a UTXO");
-		let fee = Amount::from_sat(2_000);
-		let change = utxo.amount.checked_sub(fee).expect("UTXO too small to cover CPFP fee");
-		let change_addr = client.get_new_address(None, None).unwrap().assume_checked();
-
-		let child_unsigned = Transaction {
-			version: Version(3),
-			lock_time: LockTime::ZERO,
-			input: vec![
-				TxIn {
-					previous_output: p2a_outpoint,
-					script_sig: ScriptBuf::new(),
-					sequence: Sequence::ZERO,
-					witness: Witness::new(),
-				},
-				TxIn {
-					previous_output: OutPoint::new(utxo.txid, utxo.vout),
-					script_sig: ScriptBuf::new(),
-					sequence: Sequence::ZERO,
-					witness: Witness::new(),
-				},
-			],
-			output: vec![TxOut {
-				value: change,
-				script_pubkey: change_addr.script_pubkey(),
-			}],
-		};
-
-		// Provide the P2A prevout explicitly so bitcoind can sign without looking
-		// it up in the UTXO set (the parent may be unconfirmed or not yet broadcast).
-		let p2a_prevout = SignRawTransactionInput {
-			txid: parent_txid,
-			vout: p2a_vout,
-			script_pub_key: P2A_SCRIPT.clone(),
-			redeem_script: None,
-			amount: Some(parent.output[p2a_vout as usize].value),
-		};
-		let child = client.sign_raw_transaction_with_wallet(
-			&child_unsigned,
-			Some(&[p2a_prevout]),
-			None,
-		).expect("sign_raw_transaction_with_wallet failed").transaction()
-			.expect("failed to deserialize signed child tx");
-
-		let child_txid = child.compute_txid();
-		client.submit_package(&[parent, &child])
-			.expect("submit_package of parent + CPFP child should succeed");
-
-		self.await_transaction(child_txid).await;
-
-		child_txid
-	}
-
-	/// Triggers a round and refreshes all given barks concurrently.
-	pub async fn refresh_all(&self, srv: &Captaind, barks: &[&Bark]) {
-		let futures = barks.iter().map(|b| b.try_refresh_all_no_retry());
-		let (results, _) = tokio::join!(
-			join_all(futures),
-			srv.trigger_round(),
-		);
-		for r in results {
-			r.expect("refresh failed");
+			vtxo_key_gap_limit: sapling::DEFAULT_VTXO_KEY_GAP_LIMIT,
 		}
 	}
 }
 
-impl Drop for TestContext {
-	fn drop(&mut self) {
-		log::info!("TestContext: Datadir is located at {:?}", self.datadir);
+/// Creates and funds an in-process Sapling wallet with a persisted seed and database.
+pub struct SdkBuilder<'a> {
+	ctx: &'a TestContext,
+	name: String,
+	srv: &'a dyn ToArkUrl,
+	fund_amount: Option<Amount>,
+	board_amounts: Vec<Amount>,
+	mod_cfg: Option<Box<dyn FnOnce(&mut sapling::Config)>>,
+	mnemonic: Option<bip39::Mnemonic>,
+}
 
-		if std::thread::panicking() {
-			log::info!("Leave test directory intact");
-			// do nothing
+impl<'a> SdkBuilder<'a> {
+	fn new(
+		ctx: &'a TestContext,
+		name: impl AsRef<str>,
+		srv: &'a dyn ToArkUrl,
+	) -> Self {
+		SdkBuilder {
+			ctx,
+			name: name.as_ref().to_string(),
+			srv,
+			fund_amount: None,
+			board_amounts: Vec::new(),
+			mod_cfg: None,
+			mnemonic: None,
+		}
+	}
+
+	/// Use the given BIP-39 mnemonic instead of generating a fresh one.
+	/// Lets a test recover into a new wallet from another wallet's seed.
+	pub fn mnemonic(mut self, mnemonic: bip39::Mnemonic) -> Self {
+		self.mnemonic = Some(mnemonic);
+		self
+	}
+
+	pub fn cfg(mut self, f: impl FnOnce(&mut sapling::Config) + 'static) -> Self {
+		self.mod_cfg = Some(Box::new(f));
+		self
+	}
+
+	/// Send `amount` to a fresh onchain address of the wallet before
+	/// returning it. If unset and [`Self::boarded`] is set, enough
+	/// onchain funds are sent automatically to cover all boards plus
+	/// fees.
+	pub fn funded(mut self, amount: Amount) -> Self {
+		self.fund_amount = Some(amount);
+		self
+	}
+
+	/// Board `amount` from the onchain wallet into Ark, wait for the
+	/// configured number of board confirmations, and sync the wallet so
+	/// the resulting VTXO is registered with the Ark server.
+	///
+	/// May be called multiple times to produce multiple distinct VTXOs;
+	/// each call appends a separate board.
+	pub fn boarded(mut self, amount: Amount) -> Self {
+		self.board_amounts.push(amount);
+		self
+	}
+
+	pub async fn create(self) -> sapling::Wallet {
+		self.try_create().await.unwrap()
+	}
+
+	pub async fn try_create(self) -> anyhow::Result<sapling::Wallet> {
+		let bitcoind = if self.ctx.electrs.is_some() {
+			None
 		} else {
-			let keep_all_data = std::env::var_os(constants::env::KEEP_ALL_TEST_DATA)
-				.map(|v| v == "true" || v == "1")
-				.unwrap_or(false);
-			if keep_all_data {
-				log::info!("Keep test data intact because {} is set", constants::env::KEEP_ALL_TEST_DATA);
-			} else {
-				match std::fs::remove_dir_all(&self.datadir) {
-					Ok(_) => log::info!("Cleaned up {:?}", self.datadir),
-					Err(e) => log::warn!("Failed to clean up datadir {:?} because {:?}", self.datadir, e)
+			Some(self.ctx.bitcoind_arc())
+		};
 
+		let mut cfg = self.ctx.sdk_default_cfg(self.srv, bitcoind.as_deref());
+		if let Some(mod_cfg) = self.mod_cfg {
+			mod_cfg(&mut cfg);
+		}
+
+		let datadir = self.ctx.datadir.join(&self.name);
+		fs::create_dir_all(&datadir).await
+			.with_context(|| format!("creating sapling-sdk datadir at {}", datadir.display()))?;
+
+		let network = WalletNetwork::Regtest.as_bitcoin();
+		let mnemonic = if let Some(m) = self.mnemonic {
+			m
+		} else {
+			bip39::Mnemonic::generate(12).context("mnemonic")?
+		};
+		fs::write(datadir.join("mnemonic"), mnemonic.to_string()).await
+			.context("writing mnemonic file")?;
+		fs::write(
+			datadir.join("config.toml"),
+			toml::to_string_pretty(&cfg).unwrap(),
+		).await.context("writing config.toml")?;
+
+		let db: Arc<dyn WalletPersister> = Arc::new(
+			SqliteClient::open(datadir.join("db.sqlite")).context("opening sqlite db")?,
+		);
+
+		let onchain = Arc::new(tokio::sync::RwLock::new(OnchainWallet::load_or_create(
+			network, mnemonic.to_seed(""), db.clone(),
+		).await.context("creating onchain wallet")?));
+
+		let seed = WalletSeed::new_from_mnemonic(network, &mnemonic);
+		let wallet = sapling::Wallet::open(network, seed, cfg, OpenWalletArgs {
+			datadir: Some(datadir),
+			persister: Some(db),
+			create_if_not_exists: true,
+			onchain: Some(onchain.clone()),
+			..Default::default()
+		}).await.context("creating Sapling wallet")?;
+
+		let fund_amount = self.fund_amount.or_else(|| {
+			if self.board_amounts.is_empty() {
+				None
+			} else {
+				Some(self.board_amounts.iter().copied().sum::<Amount>() + BOARD_ONCHAIN_FEE_BUFFER)
+			}
+		});
+		if let Some(amount) = fund_amount {
+			let mut onchain = onchain.write().await;
+			let address = onchain.address().await.context("onchain address")?;
+			self.ctx.bitcoind().fund_addr(address, amount).await;
+			self.ctx.bitcoind().generate(1).await;
+			self.ctx.await_block_count_sync().await;
+			onchain.sync(wallet.chain()).await.context("onchain sync after funding")?;
+		}
+
+		if !self.board_amounts.is_empty() {
+			// Subscribe before issuing so we can watch each board's terminal
+			// transition. Match on the specific `movement_id` each board
+			// returned so we don't count an unrelated Board movement's
+			// notification as one of ours.
+			let mut movements = wallet.subscribe_notifications().movements();
+
+			let mut pending: HashSet<MovementId> = HashSet::new();
+			for amount in &self.board_amounts {
+				let b = wallet.board_amount(*amount).await.context("board_amount")?;
+				self.ctx.await_transaction(b.funding_tx.compute_txid()).await;
+				pending.insert(b.movement_id);
+			}
+			self.ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+
+			wallet.sync().await;
+
+			// One deadline for the whole wait — a per-`next()` timeout would
+			// be reset by unrelated movements and never fire.
+			let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+			while !pending.is_empty() {
+				let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+				let m = movements.next()
+					.try_wait(remaining).await
+					.context("boards did not all complete before deadline")?
+					.context("wallet notification stream ended before all boards completed")?;
+				if !pending.contains(&m.id) {
+					continue;
+				}
+				match m.status {
+					MovementStatus::Pending => continue,
+					MovementStatus::Successful => { pending.remove(&m.id); },
+					other => bail!("board movement {} entered terminal status {:?}", m.id, other),
 				}
 			}
 		}
+
+		Ok(wallet)
 	}
 }

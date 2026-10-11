@@ -1,93 +1,70 @@
 [package]
-name = "ark-testing"
+name = "sapling-testing"
 version = "0.0.0"
 license = "MIT"
 edition = "2024"
-
-[[bin]]
-name = "lock-holder"
-path = "tests/core/lock-holder.rs"
-
-[[test]]
-name = "server"
-path = "tests/server/mod.rs"
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
 
 [[test]]
-name = "bark"
-path = "tests/bark/mod.rs"
-
-[[test]]
-name = "bark-sdk"
-path = "tests/bark_sdk/mod.rs"
-
-[[test]]
-name = "barkd"
-path = "tests/barkd/mod.rs"
-
-[[test]]
-name = "core"
-path = "tests/core/mod.rs"
-
-[[test]]
-name = "server-migrations"
-path = "tests/server-migrations/mod.rs"
-
-[[test]]
-name = "upgrade"
-path = "tests/upgrade/mod.rs"
+name = "sapling-sdk"
+path = "tests/sdk/mod.rs"
+required-features = ["integration"]
 
 [features]
-slow_test = []
-# Requires explicitly supplied, real local Sapio service and evaluator artifacts.
-sapio-integration = []
+default = []
+# Upstream server/application dependencies are never part of the default build.
+integration = [
+	"dep:ark-testing",
+	"dep:bark-server",
+	"dep:bark-server-log",
+	"dep:bark-cln-rpc",
+	"dep:ark-lib",
+	"dep:bark-server-rpc",
+	"dep:sapling-sdk",
+	"dep:bark-bitcoin-ext",
+	"dep:bip321",
+	"dep:bitcoincore-rpc",
+	"dep:anyhow",
+	"dep:bitcoin",
+	"dep:bip39",
+	"dep:serde_json",
+	"dep:futures",
+	"dep:tokio-stream",
+	"dep:tonic",
+	"dep:async-trait",
+	"dep:parking_lot",
+	"dep:tokio",
+	"dep:serde",
+	"dep:toml",
+]
+# Requires the real local-dev TEE and evaluator WASM; missing artifacts fail.
+sapio-integration = ["integration", "dep:reqwest", "dep:axum"]
 
 [dependencies]
-ark-lib = { path = "../lib", features = ["test-util"] }
-bark-server = { path = "../server" }
-bark-server-log = { path = "../server-log" }
-bark-server-rpc = { path = "../server-rpc", features = ["server"] }
-bark-cln-rpc = { path = "../cln-rpc"}
-bark-json = { path = "../bark-json", features = ["onchain-bdk"] }
-bark-wallet = { path = "../bark", features = ["filestore", "sqlite", "socks5-proxy"] }
-bark-bitcoin-ext = { path = "../bitcoin-ext" }
-bip321 = { path = "../bip321" }
-bark-rest = { path = "../bark-rest" }
-bark-rest-client = { path = "../bark-rest-client" }
-reqwest = { version = "^0.13", default-features = false }
-
-bitcoincore-rpc = "0.19.0"
-bitcoind-async-client.workspace = true
-portpicker = "0.1.1"
-regex = "1.10.5"
-libc = "0.2"
-which = "8"
-nix = { version = "0.30.1", features = [ "signal" ] }
-uuid = { version = "1.17.0", features = ["v4"] }
-
-anyhow.workspace = true
-lazy_static.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-toml.workspace = true
-bitcoin.workspace = true
-bip39 = { workspace = true, features = ["rand"] }
-bdk_esplora.workspace = true
-bdk_wallet.workspace = true
-bdk_bitcoind_rpc.workspace = true
-log.workspace = true
-env_logger.workspace = true
-chrono.workspace = true
-rand.workspace = true
-tokio = { workspace = true, features = [ "process" ] }
-tokio-stream.workspace = true
-tokio-tungstenite = "0.28"
-tonic.workspace = true
-tonic-health.workspace = true
-futures.workspace = true
-async-trait.workspace = true
-tokio-postgres.workspace = true
-semver.workspace = true
-parking_lot.workspace = true
-
-axum = { version = "0.8.4", features = ["macros", "tokio", "query"], default-features = false }
-tower-http = { version = "0.5", features = ["cors", "set-header"] }
+ark-testing = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f", optional = true }
+bark-server = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f", optional = true }
+bark-server-log = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f", optional = true }
+bark-cln-rpc = { git = "https://gitlab.com/ark-bitcoin/bark.git", rev = "626c9b241dd25d73212915d8fca959ab5e3b8f1f", optional = true }
+ark-lib = { path = "../protocol", features = ["test-util"], optional = true }
+bark-server-rpc = { path = "../rpc", features = ["server"], optional = true }
+sapling-sdk = { path = "../sdk", features = ["sqlite", "onchain-bdk", "socks5-proxy"], optional = true }
+bark-bitcoin-ext = { workspace = true, features = ["rpc"], optional = true }
+bip321 = { workspace = true, optional = true }
+bitcoincore-rpc = { version = "0.19.0", optional = true }
+anyhow = { workspace = true, optional = true }
+bitcoin = { workspace = true, optional = true }
+bip39 = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["process", "macros", "rt-multi-thread", "fs"], optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+toml = { version = "0.9", optional = true }
+reqwest = { version = "^0.13", default-features = false, features = ["json"], optional = true }
+axum = { version = "0.8.4", features = ["macros", "tokio", "query"], default-features = false, optional = true }

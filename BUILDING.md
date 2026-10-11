@@ -1,72 +1,106 @@
+# Building Sapling
 
-Building bark
-=========
+## SDK development environment
 
-
-This project has two binary components, each with multiple binaries:
-
-- the Bark server
-  - directory: `server/`
-  - crate: `bark-server`
-  - binaries:
-    - `captaind`: principal bark server binary, runs all user-facing
-      functionality
-    - `watchmand`: watcher daemon without user interaction that watches the
-      bitcoin blockchain for relevant events and performs necessary actions
-
-- the Bark CLIs
-  - directory: `bark-cli/`
-  - crate: `bark-cli`
-  - binaries:
-    - `barkd`: a production daemon process that runs a Bark wallet and exposes a
-      REST API and web UI
-    - `bark`: CLI wallet, mostly intended for development use. Plan is to turn this
-      into an RPC client to `barkd`.
-
-
-# Building using cargo
-
-Both binary crates can be built using cargo using the regular cargo build
-commands.
-
-The cargo build automatically detects whether it's being built on a release
-branch and adapts the version it will show. The git hash is also included.
-
-
-# Building using Nix (releases, reproducible)
-
-Both binary crates can also be built using nix. The nix build is our release
-build pipeline.
-
-Our repo has a flake that exposes targets for all our supported systems. They
-are reproducible and intended to be built on Linux (binaries won't reproduce
-when built elsewhere).
-
-```
-# build using nix directly
-$ nix build .#bark
-$ ./result/bin/bark --help
-
-# or build all artefacts
-$ just nix-build-all
-$ ls -l build/
+```sh
+nix develop
+just checks
+just unit
+just test-doc
+just rustdocs
 ```
 
+`nix develop` and `nix develop .#build` select the same SDK shell, with Rust
+1.90.0, C/C++ and Clang tooling, protobuf, SQLite, OpenSSL, CMake, Boost, `just`,
+`cargo-nextest`, and `wat2wasm`. CMake and Boost support the protocol tests'
+bitcoin consensus kernel. Without Nix, supply equivalent native dependencies;
+`sqlite-bundled` can replace the system SQLite dependency.
 
-# Building barkd with bark-web web UI
+`just checks`, `just unit`, and the documentation recipes include the optional
+BDK on-chain implementation. The default `cargo build --locked` builds only
+`sapling-sdk`, `ark-lib`, and `bark-server-rpc`, without server applications or
+integration fixtures. `just build` builds the same default SDK packages.
+There are no Nix application-release targets in this repository.
 
-`barkd` can be built with a built-in web UI:
-[bark-web](https://gitlab.com/ark-bitcoin/bark-web).
+Documentation is generated under `target/doc/sapling/`. The source-only package
+can be consumed from a separate application's Cargo manifest without copying
+this workspace's patches. See [the SDK guide](sdk/README.md).
 
-There are two ways to affect the bark-web distribution shipped inside `barkd`:
-- Builds with either cargo or Nix can set `BARK_WEB_DIST` to a directory that contains a built
-  bark-web distribution.
-- When building with Nix, you can alternatively set `BARK_WEB_VERSION` to any
-  git ref (branch, tag or commit hash) of the bark-web repository and it will
-  automatically prepare the dist folder and set `BARK_WEB_DIST` during the build.
+## Optional service integration tests
 
-We have a just shorthand for this:
+The `sapling-testing` package has no default features. Enabling `integration`
+fetches the upstream service fixtures at commit
+`626c9b241dd25d73212915d8fca959ab5e3b8f1f`. It deliberately does not vendor or
+build replacement server executables. Full test-only dependencies, including
+upstream wallet/REST helper libraries used by those fixtures, are isolated from
+SDK consumers.
+
+Provide external fixtures compatible with that revision:
+
+| Variable | Required external fixture |
+|---|---|
+| `CAPTAIND_EXEC` | Absolute executable path to upstream `captaind` |
+| `WATCHMAND_EXEC` | Absolute executable path to upstream `watchmand` |
+| `BITCOIND_EXEC` | Absolute executable path to Bitcoin Core |
+| `POSTGRES_BINS` | Directory containing `initdb`, `pg_ctl`, `postgres`, and `psql` |
+| `LIGHTNINGD_EXEC` | Core Lightning executable, or use `LIGHTNINGD_DOCKER_IMAGE` |
+| `LIGHTNINGD_PLUGIN_DIR` | Directory containing `cln-grpc` and the hold plugin; container path when using Docker |
+
+Build the server binaries from the
+[pinned upstream source](https://gitlab.com/ark-bitcoin/bark/-/tree/626c9b241dd25d73212915d8fca959ab5e3b8f1f)
+in a separate checkout. Its development tooling documents its Bitcoin, CLN,
+plugin, and PostgreSQL requirements. No Bark wallet executable is required:
+these tests construct Sapling wallets directly. Tests needing a fresh process
+reinvoke an internal test fixture that opens the same SDK database and seed.
+
+Run through `just`, which supplies the test directory and chain-backend
+configuration:
+
+```sh
+just int
+just int recovery_finds_vtxos_separated_by_the_gap_limit
+just int-reentrancy
 ```
-# build with bark-web's main branch dist
-$ just nix-build-bark-web-version main
+
+Do not run service integration tests with `cargo test` directly.
+`just int-esplora` and `just int-mempool` additionally require
+`ESPLORA_ELECTRS_EXEC` or `MEMPOOL_ELECTRS_EXEC`, respectively. Data and logs
+are written below `test/` unless `TEST_DIRECTORY` is set. Compile the complete
+harness without starting services using:
+
+```sh
+cargo check --locked -p sapling-testing --features sapio-integration --test sapling-sdk
 ```
+
+## Real Sapio service scenarios
+
+`just int-sapio` additionally requires:
+
+- `SAPIO_TEE_EXEC`: the real `sapio-tee` binary built with `local-dev` support.
+- `SAPIO_TEMPLATEHASH_WASM`: the reviewed BIP-446 template-hash-v1 artifact,
+  SHA256 `0fbc4e2cc68722474e3a708ffb934c0784990806ea1fb4a3dda64805fdd340a1`.
+- A private network namespace with exclusive loopback ports 8000 and 8367.
+  The helper also uses a cross-process lock to serialize the fixed-port service.
+
+The recipe compiles `testing/fixtures/sapio/output_value_floor.wat` using
+`wat2wasm`, unless `SAPIO_LIFECYCLE_WASM` names a precompiled artifact. This
+fixture exercises the real evaluator; it is not a signature or approval mock.
+Missing service binaries or artifacts fail explicitly.
+
+```sh
+just int-sapio
+just int-sapio sapio_bip446_receive_exact_payout_and_offline_sdk_recovery
+```
+
+These scenarios cover commitment ordering, coordinated receiving, restart
+recovery, hArk disclosure branches, and Lightning transitions. They are opt-in
+and are not part of default CI. Local-dev execution provides no hardware
+attestation evidence.
+
+## Dependency updates
+
+Upstream sources are pinned in the root and integration manifests. Update
+those revisions deliberately, along with `Cargo.lock`, and review the retained
+protocol/RPC changes against the new base. Do not replace the local modified
+protocol library with an unmodified upstream crate: that would discard
+Sapling's nested-signing and recovery behavior.

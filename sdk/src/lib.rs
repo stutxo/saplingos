@@ -1,0 +1,2345 @@
+#![doc = include_str!("../README.md")]
+
+#[cfg(all(any(target_os = "android", target_os = "ios"), feature = "tls-native-roots"))]
+compile_error!("feature `tls-native-roots` can't be used on Android or iOS, use `tls-webpki-roots` instead");
+
+pub extern crate ark;
+
+pub extern crate bip39;
+pub extern crate lightning_invoice;
+pub extern crate lnurl as lnurllib;
+
+#[macro_use] extern crate anyhow;
+#[macro_use] extern crate async_trait;
+#[macro_use] extern crate serde;
+
+pub mod actions;
+pub mod chain;
+pub mod exit;
+pub use bark_common::fs_perms;
+pub use bark_common::secret;
+pub mod movement;
+pub mod onchain;
+pub mod payment_request;
+pub mod persist;
+pub mod round;
+pub mod sapio;
+pub mod subsystem;
+pub mod vtxo;
+
+pub mod lock_manager;
+
+mod arkoor;
+mod balance;
+mod board;
+mod config;
+mod daemon;
+mod fees;
+mod import;
+mod lightning;
+mod mailbox;
+mod notification;
+mod offboard;
+#[cfg(feature = "socks5-proxy")]
+mod proxy;
+mod recovery;
+mod psbtext;
+mod utils;
+
+pub use self::arkoor::{ArkoorCreateResult, ArkoorAddressError};
+pub use self::balance::{Balance, BalanceSummary};
+pub use self::payment_request::{
+	AvailablePaymentMethod, PaymentInitOutput, PaymentMethodParsingError, PaymentRequest,
+};
+pub use self::config::{
+	WalletNetwork, Config, DEFAULT_VTXO_KEY_GAP_LIMIT, MAX_VTXO_KEY_GAP_LIMIT,
+};
+pub use self::daemon::{tip_watcher, DaemonHandle};
+pub use self::fees::FeeEstimate;
+pub use self::lightning::LightningSendOptions;
+pub use self::import::{ImportVtxoArgs, ImportVtxoError};
+pub use self::notification::{WalletNotification, NotificationStream};
+pub use self::recovery::{RecoveryReport, RecoveryReportEntry, RecoveryStatus};
+pub use self::vtxo::WalletVtxo;
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context};
+use bip39::Mnemonic;
+use bitcoin::{Amount, Network, OutPoint};
+use bitcoin::bip32::{self, ChildNumber, Fingerprint};
+use bitcoin::secp256k1::{self, Keypair, PublicKey};
+use futures::stream::FuturesUnordered;
+use log::{debug, error, info, trace, warn};
+use tokio_stream::StreamExt;
+
+use ark::{ArkInfo, ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
+use ark::attestations::VtxoStatusAttestation;
+use ark::address::VtxoDelivery;
+use ark::fees::{validate_and_subtract_fee_min_dust, VtxoFeeInfo};
+use ark::mailbox::MailboxIdentifier;
+use ark::rounds::{RoundAttempt, RoundEvent};
+use ark::vtxo::{Full, PubkeyVtxoPolicy, VtxoRef, VTXO_DUST};
+use ark::vtxo::policy::signing::VtxoSigner;
+use bitcoin_ext::{BlockDelta, BlockHeight, TxStatus};
+use server_rpc::{protos, ServerConnection};
+use server_rpc::protos::VtxoSpendState;
+use server_rpc::client::{ConnectError, CreateEndpointError};
+
+use crate::chain::{ChainSource, ChainSourceSpec};
+use crate::exit::Exit;
+use crate::lock_manager::LockManager;
+use crate::movement::{Movement, MovementId, PaymentMethod};
+use crate::movement::manager::MovementManager;
+use crate::notification::NotificationDispatch;
+use crate::onchain::{OnchainWalletTrait, Utxo};
+use crate::persist::WalletPersister;
+use crate::persist::models::{RoundStateId, StoredRoundState, Unlocked};
+#[cfg(feature = "socks5-proxy")]
+use crate::proxy::proxy_for_url;
+use crate::round::{RoundParticipation, RoundSecretNonces, RoundStatus};
+use crate::subsystem::RoundMovement;
+use crate::utils::rejected_vtxos_from_error;
+use crate::vtxo::{FilterVtxos, RefreshStrategy, VtxoFilter, VtxoStateKind, VtxoValidationError};
+use crate::vtxo::selection::{InputSelection, SelectedFeeInfos};
+
+#[cfg(all(feature = "wasm-web", feature = "socks5-proxy"))]
+compile_error!("features `wasm-web` does not support feature `socks5-proxy");
+
+#[cfg(all(feature = "wasm-web", feature = "bitcoind-rpc"))]
+compile_error!("`wasm-web` does not support the `bitcoind-rpc` feature");
+
+/// Derivation index for Bark usage
+const BARK_PURPOSE_INDEX: u32 = 350;
+/// Derivation index used to generate keypairs to sign VTXOs
+const VTXO_KEYS_INDEX: u32 = 0;
+/// Derivation index used to generate keypair for the mailbox
+const MAILBOX_KEY_INDEX: u32 = 1;
+/// Derivation index used to generate keypair for the recovery mailbox
+const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
+const MISSING_SERVER_TRANSPORT_HELP: &str =
+	"This build of sapling-sdk does not include an Ark server transport backend. Enable feature `sapling-sdk/native` or `sapling-sdk/wasm-web` to use server-backed wallet functionality.";
+
+/// The timeout value to use for streaming subscribe requests to the Ark server
+const SUBSCRIBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+lazy_static::lazy_static! {
+	/// Global secp context.
+	static ref SECP: secp256k1::Secp256k1<secp256k1::All> = secp256k1::Secp256k1::new();
+}
+
+/// Cap on server-advertised round nonces; each requested output allocates
+/// this many musig nonce pairs, so a huge value would DoS the client.
+const MAX_NB_ROUND_NONCES: usize = 16;
+
+/// Minimum `vtxo_exit_delta` accepted on mainnet: roughly eight hours of
+/// blocks to notice the server-only timeout leaf and broadcast a unilateral
+/// exit. Non-production networks (regtest, signet, testnet) only require it
+/// to be non-zero so tests and integrator sessions can use short deltas.
+const MIN_MAINNET_VTXO_EXIT_DELTA: BlockDelta = BlockDelta::new(96);
+
+/// Refuse an [ArkInfo] whose parameters would make participation unsafe:
+/// `vtxo_lifetime` must leave room to board and broadcast a unilateral exit
+/// before the server-only timeout leaf activates; `vtxo_exit_delta` must keep
+/// its CSV window; `nb_round_nonces` must be non-zero and bounded.
+fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyhow::Result<()> {
+	let required = ark_info.required_board_confirmations;
+	let margin = vtxo_exit_margin.to_u16() as usize;
+	let min_safe = required.saturating_add(margin);
+	ensure!(ark_info.vtxo_exit_delta > BlockDelta::ZERO,
+		"server-advertised vtxo_exit_delta is 0; refusing to connect",
+	);
+	ensure!(ark_info.nb_round_nonces > 0,
+		"server-advertised nb_round_nonces is 0; refusing to connect",
+	);
+	if ark_info.network == Network::Bitcoin {
+		// No upper bound: a long lifetime is safe because unilateral exit is
+		// always available before the server-only timeout leaf activates.
+		ensure!((ark_info.vtxo_lifetime.to_u16() as usize) > min_safe,
+			"server-advertised vtxo_lifetime {} is unsafe (minimum > {} = \
+			required_board_confirmations {} + vtxo_exit_margin {}); refusing to connect",
+			ark_info.vtxo_lifetime, min_safe, required, margin,
+		);
+		ensure!(ark_info.vtxo_exit_delta >= MIN_MAINNET_VTXO_EXIT_DELTA,
+			"server-advertised vtxo_exit_delta {} is below the mainnet minimum of {} \
+			 blocks; refusing to connect",
+			ark_info.vtxo_exit_delta, MIN_MAINNET_VTXO_EXIT_DELTA,
+		);
+		ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
+			"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
+			ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
+		);
+	}
+	Ok(())
+}
+
+/// Log that the server public key has changed.
+///
+/// Recommends that the user perform an emergency exit to recover their
+/// funds on-chain, since a rotated server pubkey makes the original VTXO
+/// spend/exit conditions unreachable.
+fn log_server_pubkey_changed_error(expected: PublicKey, got: PublicKey) {
+	error!(
+	    "
+Server public key has changed!
+
+The Ark server's public key is different from the one stored when this
+wallet was created. This typically happens when:
+
+	- The server operator has rotated their keys
+	- You are connecting to a different server
+	- The server has been replaced
+
+For safety, this wallet will not connect to the server until you
+resolve this. You can recover your funds on-chain by doing an emergency exit.
+
+This will exit your VTXOs to on-chain Bitcoin without needing the server's cooperation.
+
+Expected: {expected}
+Got:      {got}")
+}
+
+/// Log that the server mailbox pubkey has changed.
+fn log_server_mailbox_pubkey_changed_error(expected: PublicKey, got: PublicKey) {
+	error!(
+	    "
+Server mailbox public key has changed!
+
+The Ark server's mailbox public key is different from the one stored when this
+wallet was created. This typically happens when:
+
+	- The server operator has rotated their keys
+	- You are connecting to a different server
+	- The server has been replaced
+
+For safety, this wallet will not connect to the server until you resolve this.
+
+Unlike a server pubkey change, your VTXOs are not at risk - the mailbox pubkey
+only affects address receive semantics. Any Ark addresses you previously
+shared will stop receiving new payments; you will need to share new addresses
+after reconnecting.
+
+Expected: {expected}
+Got:      {got}")
+}
+
+/// The detailled balance of a Lightning receive.
+#[derive(Debug, Clone)]
+pub struct LightningReceiveBalance {
+	/// Sum of all pending lightning invoices
+	pub total: Amount,
+	/// Sum of all invoices for which we received the HTLC VTXOs
+	pub claimable: Amount,
+}
+
+/// Useful Bark wallet info
+#[derive(Debug, Clone)]
+pub struct DebugInfo {
+	/// The bitcoin network the wallet operates on
+	pub network: Network,
+	/// The ID of the wallet's server mailbox
+	pub mailbox_id: MailboxIdentifier,
+	/// The xpub from which all VTXO keypairs are derived
+	pub vtxo_xpub: bip32::Xpub,
+}
+
+pub struct UtxoInfo {
+	pub outpoint: OutPoint,
+	pub amount: Amount,
+	pub confirmation_height: Option<u32>,
+}
+
+impl From<Utxo> for UtxoInfo {
+	fn from(value: Utxo) -> Self {
+		match value {
+			Utxo::Local(o) => UtxoInfo {
+				outpoint: o.outpoint,
+				amount: o.amount,
+				confirmation_height: o.confirmation_height.map(|h| h.to_u32()),
+			},
+			Utxo::Exit(e) => UtxoInfo {
+				outpoint: e.vtxo.point(),
+				amount: e.vtxo.amount(),
+				confirmation_height: Some(e.height.to_u32()),
+			},
+		}
+	}
+}
+
+/// Represents an offchain balance structure consisting of available funds, pending amounts in
+/// unconfirmed rounds, and pending exits.
+pub struct OffchainBalance {
+	/// Funds currently available for use. This reflects the spendable balance.
+	pub available: Amount,
+	/// Funds that are pending in unconfirmed operational rounds.
+	pub pending_in_round: Amount,
+	/// Funds being unilaterally exited. These may require more onchain confirmations to become
+	/// available onchain.
+	pub pending_exit: Amount,
+}
+
+/// Read-only properties of the Sapling wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletProperties {
+	/// The Bitcoin network to run Sapling on.
+	///
+	/// Default value: signet.
+	pub network: Network,
+
+	/// The wallet fingerpint
+	///
+	/// Used on wallet loading to check mnemonic correctness
+	pub fingerprint: Fingerprint,
+
+	/// The server public key from the initial connection.
+	///
+	/// This is used to detect if the Ark server has been replaced,
+	/// which could indicate a malicious server. If the server pubkey
+	/// changes, the wallet will refuse to connect and warn the user
+	/// to perform an emergency exit.
+	pub server_pubkey: Option<PublicKey>,
+
+	/// The server's mailbox public key.
+	///
+	/// Stored so that Ark addresses can be generated without a live
+	/// connection to the Ark server. `None` indicates a wallet created
+	/// before this field was added; the value is populated on the first
+	/// successful handshake. If the key changes, the wallet refuses to
+	/// connect until the user resolves the rotation.
+	pub server_mailbox_pubkey: Option<PublicKey>,
+}
+
+/// Struct representing an extended private key derived from a
+/// wallet's seed, used to derive child VTXO keypairs
+///
+/// The VTXO seed is derived by applying a hardened derivation
+/// step at index 350 from the wallet's seed.
+pub struct WalletSeed {
+	master: bip32::Xpriv,
+	vtxo: bip32::Xpriv,
+}
+
+impl WalletSeed {
+	/// Create a new [WalletSeed] from a given BIP-32 master seed
+	pub fn new_from_seed(network: Network, seed: &[u8; 64]) -> Self {
+		let bark_path = [ChildNumber::from_hardened_idx(BARK_PURPOSE_INDEX).unwrap()];
+		let master = bip32::Xpriv::new_master(network, seed)
+			.expect("invalid seed")
+			.derive_priv(&SECP, &bark_path)
+			.expect("purpose is valid");
+
+		let vtxo_path = [ChildNumber::from_hardened_idx(VTXO_KEYS_INDEX).unwrap()];
+		let vtxo = master.derive_priv(&SECP, &vtxo_path)
+			.expect("vtxo path is valid");
+
+		Self { master, vtxo }
+	}
+
+	/// Create a new [WalletSeed] from a given BIP-39 [Mnemonic]
+	pub fn new_from_mnemonic(network: Network, mnemonic: &Mnemonic) -> Self {
+		Self::new_from_seed(network, &mnemonic.to_seed(""))
+	}
+
+	pub fn fingerprint(&self) -> Fingerprint {
+		self.master.fingerprint(&SECP)
+	}
+
+	fn derive_vtxo_keypair(&self, idx: u32) -> Keypair {
+		self.vtxo.derive_priv(&SECP, &[idx.into()]).unwrap().to_keypair(&SECP)
+	}
+
+	fn to_mailbox_keypair(&self) -> Keypair {
+		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
+		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
+	}
+
+	fn to_recovery_mailbox_keypair(&self) -> Keypair {
+		let mailbox_path = [ChildNumber::from_hardened_idx(RECOVERY_MAILBOX_KEY_INDEX).unwrap()];
+		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
+	}
+}
+
+/// Additional arguments for the [Wallet::open] function
+pub struct OpenWalletArgs {
+	/// Whether to run the background daemon
+	///
+	/// When disabled, you must manually call `Wallet::sync` to sync the wallet.
+	///
+	/// Default: true
+	pub run_daemon: bool,
+
+	/// The data directory to use for this wallet
+	///
+	/// This field can be used under most platforms as an alternative to
+	/// providing the `persister` and `lock_manager` fields.
+	///
+	/// This field is ignored if `persister` and `lock_manager` are provided
+	/// or for the wasm32 platform.
+	///
+	/// Default: none
+	pub datadir: Option<PathBuf>,
+
+	/// The persister to use for this wallet
+	///
+	/// Default: returned by [`crate::persist::platform_default`]
+	pub persister: Option<Arc<dyn WalletPersister>>,
+
+	/// The lock manager to use for this wallet
+	///
+	/// Default: returned by [`crate::lock_manager::platform_default`]
+	///
+	/// On some platforms (linux, macos, windows) the default lock manager
+	/// requires a datadir be provided.
+	pub lock_manager: Option<Box<dyn LockManager>>,
+
+	/// The onchain wallet to use, if any
+	///
+	/// Default: none
+	pub onchain: Option<Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>>,
+
+	/// Whether to create a new wallet if no wallet exists
+	///
+	///  Default: true
+	pub create_if_not_exists: bool,
+
+	/// Whether to create a new wallet even if the Ark server cannot be reached
+	///
+	/// Default: false
+	pub create_without_server: bool,
+
+	/// Whether to skip recovering VTXOs from the recovery mailbox.
+	///
+	/// When false (the default), recovery runs on wallet open.
+	///
+	/// Default: false
+	pub skip_recovery: bool,
+
+	/// A callback function to be called with the outcome of the recovery scan.
+	///
+	/// Called exactly once per successful open, including when no scan ran, so
+	/// the absence of a call never has to be interpreted.
+	///
+	/// Default: none
+	pub on_recovery_finished: Option<Box<dyn FnOnce(RecoveryStatus) + Send + Sync>>,
+}
+
+impl Default for OpenWalletArgs {
+	fn default() -> Self {
+	    Self {
+			run_daemon: true,
+			onchain: None,
+			datadir: None,
+			persister: None,
+			lock_manager: None,
+			create_if_not_exists: true,
+			create_without_server: false,
+			skip_recovery: false,
+			on_recovery_finished: None,
+		}
+	}
+}
+
+struct WalletInner {
+	/// The chain source the wallet is connected to
+	chain: Arc<ChainSource>,
+
+	/// Exit subsystem handling unilateral exits and on-chain reconciliation outside Ark rounds.
+	exit: Exit,
+
+	/// Allows easy creation of and management of wallet fund movements.
+	movements: Arc<MovementManager>,
+
+	/// Dispatch for wallet notifications
+	notifications: NotificationDispatch,
+
+	/// Active runtime configuration for networking, fees, policies and thresholds.
+	config: Config,
+
+	/// Persistence backend for wallet state (keys metadata, VTXOs, movements, round state, etc.).
+	db: Arc<dyn WalletPersister>,
+
+	/// Lazily initialized bounded transport for enclave and coordinated receive RPCs.
+	program_transport: tokio::sync::OnceCell<sapio::client::ProgramTransport>,
+
+	/// Coordinates access to the wallet's protected resources. The caller
+	/// picks a backend whose enforcement scope matches how the wallet is
+	/// deployed; see [`crate::lock_manager`].
+	lock_manager: Box<dyn LockManager>,
+
+	/// Deterministic seed material used to generate wallet keypairs.
+	seed: WalletSeed,
+
+	/// Live connection to an Ark server for round participation and synchronization.
+	///
+	/// Lazily initialised on first use via [`Wallet::require_server`]. A
+	/// [`OnceCell`] is the right primitive here: concurrent callers on a
+	/// cold cell all await the same in-flight `connect_to_server` future
+	/// instead of each opening a fresh gRPC channel.
+	server: tokio::sync::OnceCell<ServerConnection>,
+
+	/// Onchain wallet used for boarding, exit fee-bumping, and onchain syncing.
+	///
+	/// When present, the wallet can perform onchain operations without the
+	/// caller having to supply a wallet on every call.
+	onchain: Option<Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>>,
+
+	/// A handle to the currently running daemon, if any.
+	daemon: parking_lot::Mutex<Option<DaemonHandle>>,
+
+	/// The last chain tip at which we scanned spendable VTXOs for on-chain (force) exits.
+	/// The scan is skipped while the tip is unchanged, since a VTXO's on-chain status can
+	/// only change across blocks.
+	last_force_exit_scan_tip: tokio::sync::Mutex<Option<BlockHeight>>,
+
+	/// In-memory MuSig2 secret cosign nonces for in-flight round attempts.
+	/// See [`RoundSecretNonces`].
+	pub(crate) round_secret_nonces: RoundSecretNonces,
+}
+
+/// The central entry point for using this library as an Ark wallet.
+///
+/// Note that a [Wallet] instance can freely be [Clone]'ed to refer to the same
+/// wallet.
+///
+/// Overview
+/// - Wallet encapsulates the complete Ark client implementation:
+///   - address generation (Ark addresses/keys)
+///     - [Wallet::new_address],
+///     - [Wallet::new_address_with_index],
+///     - [Wallet::peek_address],
+///     - [Wallet::validate_arkoor_address]
+///   - boarding onchain funds into Ark from an onchain wallet (see [onchain::OnchainWallet])
+///     - [Wallet::board_amount],
+///     - [Wallet::board_all]
+///   - offboarding Ark funds to move them back onchain
+///     - [Wallet::offboard_vtxos],
+///     - [Wallet::offboard_all]
+///   - sending and receiving Ark payments (including to BOLT11/BOLT12 invoices)
+///     - [Wallet::send_arkoor_payment],
+///     - [Wallet::pay_lightning_invoice],
+///     - [Wallet::pay_lightning_address],
+///     - [Wallet::pay_lightning_offer]
+///   - tracking, selecting, and refreshing VTXOs
+///     - [Wallet::vtxos],
+///     - [Wallet::vtxos_with],
+///     - [Wallet::refresh_vtxos]
+///   - syncing with the Ark server, unilateral exits and performing general maintenance
+///     - [Wallet::maintenance]: Syncs everything offchain-related and refreshes VTXOs where
+///       necessary,
+///     - [Wallet::maintenance_refresh]: Refreshes VTXOs where necessary without syncing anything,
+///     - [Wallet::sync]: Syncs network fee-rates, ark rounds and arkoor payments,
+///     - [Wallet::sync_exits]: Updates the status of unilateral exits,
+///     - [Wallet::sync_pending_lightning_send_vtxos]: Updates the status of pending lightning payments,
+///     - [Wallet::try_claim_all_lightning_receives]: Wait for payment receipt of all open invoices, then claim them,
+///     - [Wallet::sync_pending_boards]: Registers boards which are available for use
+///       in offchain payments
+///
+/// Key capabilities
+/// - Address management:
+///   - derive and peek deterministic Ark addresses and their indices
+/// - Funds lifecycle:
+///   - board funds from an external onchain wallet onto the Ark
+///   - send out-of-round Ark payments (arkoor)
+///   - offboard funds to onchain addresses
+///   - manage HTLCs and Lightning receives/sends
+/// - VTXO management:
+///   - query spendable and pending VTXOs
+///   - refresh expiring or risky VTXOs
+///   - compute balance broken down by spendable/pending states
+/// - Synchronization and maintenance:
+///   - sync against the Ark server and the onchain source
+///   - reconcile pending rounds, exits, and offchain state
+///   - periodic maintenance helpers (e.g., auto-register boards, refresh policies)
+///
+/// Construction and persistence
+///
+/// A [Wallet] is opened or created using a mnemonic and a backend implementing [WalletPersister].
+/// The [Wallet::open] function allows for opening and creating a wallet if it doesn't exist yet.
+/// Check out the documentation on [OpenWalletArgs] for all optional arguments.
+///
+/// Example
+/// ```no_run
+/// use std::path::PathBuf;
+/// use std::sync::Arc;
+/// use tokio::fs;
+/// use sapling::{Config, onchain, Wallet, OpenWalletArgs, WalletSeed};
+/// use sapling::lock_manager::memory::MemoryLockManager;
+/// use sapling::persist::sqlite::SqliteClient;
+///
+/// const MNEMONIC_FILE : &str = "mnemonic";
+///
+/// #[tokio::main]
+/// async fn main() {
+/// 	// Pick the bitcoin network that will be used
+/// 	let network = bitcoin::Network::Signet;
+///
+/// 	// Configure the wallet
+/// 	let config = Config {
+/// 		server_address: String::from("https://ark.signet.2nd.dev"),
+/// 		esplora_address: Some(String::from("https://esplora.signet.2nd.dev")),
+/// 		..Config::network_default(network)
+/// 	};
+///
+/// 	// Create a sqlite database
+/// 	let datadir = PathBuf::from("./bark");
+///
+/// 	// Generate and seed and store it somewhere
+/// 	let mnemonic = bip39::Mnemonic::generate(12).expect("12 is valid");
+/// 	fs::write(datadir.join(MNEMONIC_FILE), mnemonic.to_string().as_bytes()).await.unwrap();
+/// 	let seed = WalletSeed::new_from_mnemonic(network, &mnemonic);
+///
+/// 	let wallet = Wallet::open(network, seed, config, OpenWalletArgs {
+/// 		datadir: Some(datadir),
+/// 		..Default::default()
+/// 	}).await.unwrap();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct Wallet {
+	inner: Arc<WalletInner>,
+}
+
+impl Wallet {
+	pub async fn network(&self) -> anyhow::Result<Network> {
+		Ok(self.properties().await?.network)
+	}
+
+	/// Access the server's chain source
+	pub fn chain(&self) -> &Arc<ChainSource> {
+		&self.inner.chain
+	}
+
+	/// Access the exit manager
+	pub fn exit_mgr(&self) -> &Exit {
+		&self.inner.exit
+	}
+
+	/// Access the movements manager
+	pub fn movements_mgr(&self) -> &MovementManager {
+		&self.inner.movements
+	}
+
+	/// Peek at the keypair directly after currently last revealed one,
+	/// together with its index, without storing it.
+	pub async fn peek_next_keypair(&self) -> anyhow::Result<(Keypair, u32)> {
+		let last_revealed = self.inner.db.get_last_vtxo_key_index().await?;
+
+		let index = last_revealed.map(|i| i + 1).unwrap_or(u32::MIN);
+		let keypair = self.inner.seed.derive_vtxo_keypair(index);
+
+		Ok((keypair, index))
+	}
+
+	/// Derive and store the keypair directly after currently last revealed one,
+	/// together with its index.
+	pub async fn derive_store_next_keypair(&self) -> anyhow::Result<(Keypair, u32)> {
+		let (keypair, index) = self.peek_next_keypair().await?;
+		self.inner.db.store_vtxo_key(index, keypair.public_key()).await?;
+		Ok((keypair, index))
+	}
+
+	#[deprecated(note = "use peek_keypair instead")]
+	pub async fn peak_keypair(&self, index: u32) -> anyhow::Result<Keypair> {
+		self.peek_keypair(index).await
+	}
+
+	/// Retrieves a keypair based on the provided index and checks if the corresponding public key
+	/// exists in the [Vtxo] database.
+	///
+	/// # Arguments
+	///
+	/// * `index` - The index used to derive a keypair.
+	///
+	/// # Returns
+	///
+	/// * `Ok(Keypair)` - If the keypair is successfully derived and its public key exists in the
+	///   database.
+	/// * `Err(anyhow::Error)` - If the public key does not exist in the database or if an error
+	///   occurs during the database query.
+	pub async fn peek_keypair(&self, index: u32) -> anyhow::Result<Keypair> {
+		let keypair = self.inner.seed.derive_vtxo_keypair(index);
+		if self.inner.db.get_public_key_idx(&keypair.public_key()).await?.is_some() {
+			Ok(keypair)
+		} else {
+			bail!("VTXO key {} does not exist, please derive it first", index)
+		}
+	}
+
+	/// Map each key in `wanted` we can derive from our seed to its keypair.
+	///
+	/// Keys the wallet already revealed come from the database. The rest are
+	/// matched by one scan of the unrevealed key space, which tolerates a run of
+	/// `gap_limit` indices that do not match and extends that window on every
+	/// match. Only keys at or below a match are stored, so a scan that matches
+	/// nothing leaves the key index unchanged. Keys that never match are absent
+	/// from the result.
+	///
+	/// Errors if `gap_limit` is above [MAX_VTXO_KEY_GAP_LIMIT].
+	pub(crate) async fn find_vtxo_keypairs(
+		&self,
+		wanted: impl IntoIterator<Item = PublicKey>,
+		gap_limit: u32,
+	) -> anyhow::Result<HashMap<PublicKey, Keypair>> {
+		// Disallow unreasonable gap limits to avoid allocating enormous amounts of memory.
+		if gap_limit > MAX_VTXO_KEY_GAP_LIMIT {
+			bail!("vtxo key gap limit {gap_limit} is above the maximum of {}",
+				MAX_VTXO_KEY_GAP_LIMIT);
+		}
+
+		// A revealed key is already on record, so only scan for what is left.
+		let mut found = HashMap::new();
+		let mut unrevealed = HashSet::new();
+		for pubkey in wanted {
+			match self.pubkey_keypair(&pubkey).await? {
+				Some((_idx, keypair)) => { found.insert(pubkey, keypair); },
+				None => { unrevealed.insert(pubkey); },
+			}
+		}
+		if unrevealed.is_empty() {
+			return Ok(found);
+		}
+
+		// We should derive unrevealed keys, so we add one to the last key index.
+		let start_idx = self.inner.db.get_last_vtxo_key_index().await?.map(|i| i + 1).unwrap_or(0);
+		let mut frontier = start_idx.saturating_add(gap_limit);
+		let mut idx = start_idx;
+		let mut gap = Vec::<(u32, PublicKey)>::new();
+		while idx <= frontier && !unrevealed.is_empty() {
+			let keypair = self.inner.seed.derive_vtxo_keypair(idx);
+			let pubkey = keypair.public_key();
+			if unrevealed.remove(&pubkey) {
+				// Reveal this key and the unmatched keys below it, because the
+				// wallet issues keys in sequence.
+				for (i, pk) in gap.drain(..) {
+					self.inner.db.store_vtxo_key(i, pk).await?;
+				}
+				self.inner.db.store_vtxo_key(idx, pubkey).await?;
+				found.insert(pubkey, keypair);
+
+				// `frontier` is the last index the scan tests. This index matched,
+				// so the next run of unused indices starts at idx + 1.
+				frontier = idx.saturating_add(1).saturating_add(gap_limit);
+			} else {
+				gap.push((idx, pubkey));
+			}
+			let Some(next_idx) = idx.checked_add(1) else { break };
+			idx = next_idx;
+		}
+
+		Ok(found)
+	}
+
+	/// Retrieves the [Keypair] for a provided [PublicKey]
+	///
+	/// # Arguments
+	///
+	/// * `public_key` - The public key for which the keypair must be found
+	///
+	/// # Returns
+	/// * `Ok(Some(u32, Keypair))` - If the pubkey is found, the derivation-index and keypair are
+	///                              returned
+	/// * `Ok(None)` - If the pubkey cannot be found in the database
+	/// * `Err(anyhow::Error)` - If an error occurred related to the database query
+	pub async fn pubkey_keypair(&self, public_key: &PublicKey) -> anyhow::Result<Option<(u32, Keypair)>> {
+		if let Some(index) = self.inner.db.get_public_key_idx(&public_key).await? {
+			let keypair = self.inner.seed.derive_vtxo_keypair(index);
+			if keypair.public_key() != *public_key {
+				ensure!(self.inner.db.get_program_key(public_key).await?.is_some(),
+					"stored VTXO key does not match its derivation index");
+				return Ok(None);
+			}
+			Ok(Some((index, keypair)))
+		} else {
+			Ok(None)
+		}
+	}
+
+	/// Retrieves the [Keypair] for a provided [Vtxo]
+	///
+	/// # Arguments
+	///
+	/// * `vtxo` - The vtxo for which the key must be found
+	///
+	/// # Returns
+	/// * `Ok(Some(Keypair))` - If the pubkey is found, the keypair is returned
+	/// * `Err(anyhow::Error)` - If the corresponding public key doesn't exist
+	///   in the database or a database error occurred.
+	pub async fn get_vtxo_key(&self, vtxo: impl VtxoRef) -> anyhow::Result<Keypair> {
+		let bare_vtxo = match vtxo.as_bare_vtxo() {
+			Some(bare) => bare,
+			None => Cow::Owned(self.get_vtxo_by_id(vtxo.vtxo_id()).await?.vtxo),
+		};
+		let pubkey = self.find_signable_clause(&bare_vtxo).await
+			.context("VTXO is not signable by wallet")?
+			.pubkey();
+		let idx = self.inner.db.get_public_key_idx(&pubkey).await?
+			.context("VTXO key not found")?;
+		let keypair = self.inner.seed.derive_vtxo_keypair(idx);
+		ensure!(keypair.public_key() == pubkey,
+			"program-owned VTXO has no local group key; use its external signer or saved recovery");
+		Ok(keypair)
+	}
+
+	#[deprecated(note = "use peek_address instead")]
+	pub async fn peak_address(&self, index: u32) -> anyhow::Result<ark::Address> {
+		self.peek_address(index).await
+	}
+
+	/// Peek for an [ark::Address] at the given key index.
+	///
+	/// May return an error if the address at the given index has not been derived yet.
+	pub async fn peek_address(&self, index: u32) -> anyhow::Result<ark::Address> {
+		let properties = self.properties().await?;
+		let network = properties.network;
+		let key = self.peek_signing_key(index).await?;
+		if let Some(program) = key.program() {
+			let server_pubkey = match properties.server_pubkey {
+				Some(public) => public,
+				None => self.require_server().await?.1.server_pubkey,
+			};
+			return self.coordinated_address(program, network, server_pubkey);
+		}
+		let mailbox = self.mailbox_identifier();
+
+		let (server_pubkey, mailbox_pubkey) =
+			if let (Some(spk), Some(mpk)) = (properties.server_pubkey, properties.server_mailbox_pubkey) {
+				(spk, mpk)
+			} else {
+				let (_, ark_info) = self.require_server().await?;
+				(ark_info.server_pubkey, ark_info.mailbox_pubkey)
+			};
+
+		let keypair = key.local_keypair().context("native address key unavailable")?;
+
+		Ok(ark::Address::builder()
+			.testnet(network != bitcoin::Network::Bitcoin)
+			.server_pubkey(server_pubkey)
+			.pubkey_policy(keypair.public_key())
+			.mailbox(mailbox_pubkey, mailbox, &keypair)
+			.context("failed to assign mailbox")?
+			.into_address()
+			.context("failed to build address")?)
+	}
+
+	/// Generate a new [ark::Address] and returns the index of the key used to create it.
+	///
+	/// This derives and stores the keypair directly after currently last revealed one.
+	pub async fn new_address_with_index(&self) -> anyhow::Result<(ark::Address, u32)> {
+		let (_, index) = self.derive_store_next_signing_key().await?;
+		let addr = self.peek_address(index).await?;
+		Ok((addr, index))
+	}
+
+	/// Generate a new address using the configured ownership and delivery protocol.
+	pub async fn new_address(&self) -> anyhow::Result<ark::Address> {
+		let (addr, _) = self.new_address_with_index().await?;
+		Ok(addr)
+	}
+
+	/// Sign an arbitrary message with the key of the given [ark::Address].
+	///
+	/// Returns `Ok(None)` if the address is not one of this wallet's own
+	/// addresses or its key has not been derived yet.
+	/// Program-backed addresses reject this operation: their cosigner accepts
+	/// authenticated transaction contexts and fixed ownership domains only.
+	///
+	/// The resulting signature can be verified with
+	/// [ark::message::verify_for_address] against the address.
+	pub async fn sign_message(
+		&self,
+		message: &[u8],
+		address: &ark::Address,
+	) -> anyhow::Result<Option<secp256k1::schnorr::Signature>> {
+		let pubkey = address.policy().user_pubkey();
+		ensure!(self.inner.db.get_program_key(&pubkey).await?.is_none(),
+			"program-backed addresses do not support arbitrary message signing");
+		let Some((_, keypair)) = self.pubkey_keypair(&pubkey).await? else {
+			return Ok(None);
+		};
+		Ok(Some(ark::message::sign(&keypair, message)))
+	}
+
+	/// Create a new wallet
+	///
+	/// This function simply initiates a new wallet; use [Wallet::open] to open
+	/// it afterwards. You can also call [Wallet::open] with `create_if_not_exists`
+	/// set to true to avoid having to call this function.
+	///
+	/// `lock_manager` coordinates access to the wallet's protected resources. Pick a backend
+	/// whose enforcement scope matches how the wallet is deployed — see [`crate::lock_manager`].
+	pub async fn create(
+		network: Network,
+		seed: &WalletSeed,
+		config: &Config,
+		db: &dyn WalletPersister,
+		lock_manager: &dyn LockManager,
+		allow_unreachable_server: bool,
+	) -> anyhow::Result<()> {
+		let wallet_fingerprint = seed.fingerprint();
+
+		// Block concurrent creators against the same locking universe. A
+		// short timeout is fine: if a sibling process wins the race they
+		// will have committed the wallet by the time we'd time out, and
+		// the `read_properties` check below catches that case cleanly.
+		let create_guard = lock_manager.lock(
+			&format!("{}.create", wallet_fingerprint),
+			Duration::from_secs(5),
+		).await.context("wallet initialization already in progress")?;
+
+		if let Some(existing) = db.read_properties().await? {
+			trace!("Existing config: {:?}", existing);
+			bail!("cannot overwrite already existing config")
+		}
+
+		// Try to connect to the server and get its pubkey. An unsafe ArkInfo
+		// is treated the same as an unreachable server: when
+		// `allow_unreachable_server` is set, both drop to `(None, None)` so
+		// we can still produce an offline wallet and revisit the server on
+		// the next open.
+		let (server_pubkey, mailbox_pubkey) = match Self::connect_to_server(&config, network).await {
+			Ok(conn) => {
+				let ark_info = conn.ark_info().await;
+				match check_ark_info_safe(&ark_info, config.vtxo_exit_margin) {
+					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey)),
+					Err(err) if allow_unreachable_server => {
+						warn!("server-advertised ArkInfo is unsafe, \
+							treating as unavailable: {:#}", err);
+						(None, None)
+					},
+					Err(err) => return Err(err),
+				}
+			},
+			Err(_) if allow_unreachable_server => (None, None),
+			Err(err) => {
+				bail!("Failed to connect to provided server: {:#}", err);
+			},
+		};
+
+		let properties = WalletProperties {
+			network,
+			fingerprint: wallet_fingerprint,
+			server_pubkey,
+			server_mailbox_pubkey: mailbox_pubkey,
+		};
+
+		// write the config to db
+		db.init_wallet(&properties).await.context("cannot init wallet in the database")?;
+		info!("Created wallet with fingerprint: {}", wallet_fingerprint);
+		if let Some(pk) = server_pubkey {
+			info!("Stored server pubkey: {}", pk);
+		}
+
+		// The wallet exists from this point on — drop the creation lock
+		// so another process is free to open it.
+		drop(create_guard);
+
+		Ok(())
+	}
+
+	/// Open an existing wallet or create one if `options.create_if_not_exists` is true
+	pub async fn open(
+		network: Network,
+		seed: WalletSeed,
+		config: Config,
+		args: OpenWalletArgs,
+	) -> anyhow::Result<Wallet> {
+		if !(1..=3).contains(&config.change_vtxo_split_factor) {
+			bail!("change_vtxo_split_factor must be 1, 2 or 3, got {}",
+				config.change_vtxo_split_factor,
+			);
+		}
+
+		let fingerprint = seed.fingerprint();
+		let lock_manager = if let Some(lm) = args.lock_manager {
+			lm
+		} else {
+			crate::lock_manager::platform_default(args.datadir.as_ref(), Some(fingerprint))
+				.context("failed to instantiate platform default lock manager")?
+		};
+
+		let db = if let Some(db) = args.persister {
+			db
+		} else {
+			if let Some(ref datadir) = args.datadir {
+				#[cfg(not(target_arch = "wasm32"))]
+				if !datadir.exists() && args.create_if_not_exists {
+					tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
+						"failed to create datadir at {}", datadir.display(),
+					))?;
+				}
+			}
+			crate::persist::platform_default(args.datadir.as_ref(), Some(fingerprint)).await
+				.context("failed to instantiate platform default persister")?
+		};
+
+		let mut created_now = false;
+		let properties = if let Some(p) = db.read_properties().await? {
+			p
+		} else if args.create_if_not_exists {
+			Self::create(
+				network, &seed, &config, &*db, &*lock_manager, args.create_without_server,
+			).await.context("error creating new wallet")?;
+			created_now = true;
+			db.read_properties().await?
+				.context("create failed: no wallet properties after Wallet::create was called")?
+		} else {
+			bail!("wallet does not exist; use Wallet::create or \
+				set options.create_if_not_exists to true");
+		};
+		if let Some(sapio) = &config.sapio { sapio.validate()?; }
+
+		if properties.fingerprint != fingerprint {
+			bail!("incorrect mnemonic")
+		}
+
+		let chain_source = if let Some(ref url) = config.esplora_address {
+			ChainSourceSpec::Esplora {
+				url: url.clone(),
+			}
+		} else if let Some(ref url) = config.bitcoind_address {
+			let auth = if let Some(ref c) = config.bitcoind_cookiefile {
+				bitcoin_ext::rpc::Auth::CookieFile(c.clone())
+			} else {
+				bitcoin_ext::rpc::Auth::UserPass(
+					config.bitcoind_user.clone().context("need bitcoind auth config")?,
+					config.bitcoind_pass.as_ref().context("need bitcoind auth config")?
+						.leak_ref().clone(),
+				)
+			};
+			ChainSourceSpec::Bitcoind {
+				url: url.clone(),
+				auth,
+				zmq: config.bitcoind_zmq_address.clone(),
+			}
+		} else {
+			bail!("Need to either provide esplora or bitcoind info");
+		};
+
+		#[cfg(feature = "socks5-proxy")]
+		let chain_proxy = proxy_for_url(&config.socks5_proxy, chain_source.url())?;
+		let chain_source_client = ChainSource::new(
+			chain_source, properties.network, config.fallback_fee_rate,
+			#[cfg(feature = "socks5-proxy")] chain_proxy.as_deref(),
+		).await?;
+		let chain = Arc::new(chain_source_client);
+		chain.require_version().await
+			.context("provided chain source doesn't meet version requirement")?;
+
+		let server = tokio::sync::OnceCell::new();
+
+		let notifications = NotificationDispatch::new();
+		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
+		let exit = Exit::new(db.clone(), chain.clone(), movements.clone()).await?;
+
+		let onchain = args.onchain;
+		let ret = Wallet { inner: Arc::new(WalletInner {
+			config, db, lock_manager, seed, exit, movements, notifications, server, chain,
+			onchain,
+			program_transport: tokio::sync::OnceCell::new(),
+			daemon: parking_lot::Mutex::new(None),
+			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+			round_secret_nonces: RoundSecretNonces::new(),
+		})};
+
+		ret.inner.exit.load().await
+			.context("error loading exit system after opening wallet")?;
+
+		let recovery = if !created_now {
+			RecoveryStatus::NotRun
+		} else if args.skip_recovery {
+			info!("Seed-based wallet recovery explicitly skipped");
+			RecoveryStatus::NotRun
+		} else {
+			// Recover any VTXOs backed up to the seed-derived recovery mailbox.
+			// Best-effort so it can't abort wallet creation, but a failure means
+			// funds may be missing — surface it loudly. Partial failures are
+			// logged inside the recovery call.
+			match ret.recover_from_mailbox().await {
+				Ok(report) => RecoveryStatus::Completed(report),
+				Err(e) => {
+					error!("VTXO recovery from the recovery mailbox failed; funds may be \
+						missing from this wallet until recovery succeeds: {:#}", e);
+					RecoveryStatus::Failed(e)
+				},
+			}
+		};
+
+		if args.run_daemon {
+			ret.start_daemon()
+				.context("failed to start daemon after opening wallet")?;
+		}
+
+		// Last, so the callback only ever fires for an open that returns a wallet.
+		if let Some(callback) = args.on_recovery_finished {
+			callback(recovery);
+		}
+
+		Ok(ret)
+	}
+
+	/// Returns the config used to create/load the bark [Wallet].
+	pub fn config(&self) -> &Config {
+		&self.inner.config
+	}
+
+	/// Retrieves the [WalletProperties] of the current bark [Wallet].
+	pub async fn properties(&self) -> anyhow::Result<WalletProperties> {
+		let properties = self.inner.db.read_properties().await?.context("Wallet is not initialised")?;
+		Ok(properties)
+	}
+
+	/// Returns the fingerprint of the wallet.
+	pub fn fingerprint(&self) -> Fingerprint {
+		self.inner.seed.fingerprint()
+	}
+
+	/// Returns the xpub from which all VTXO keypairs are derived.
+	pub fn vtxo_xpub(&self) -> bip32::Xpub {
+		bip32::Xpub::from_priv(&SECP, &self.inner.seed.vtxo)
+	}
+
+	/// Returns wallet information that helps to debug issues.
+	pub async fn debug_info(&self) -> anyhow::Result<DebugInfo> {
+		Ok(DebugInfo {
+			network: self.network().await?,
+			mailbox_id: self.mailbox_identifier(),
+			vtxo_xpub: self.vtxo_xpub(),
+		})
+	}
+
+	async fn connect_to_server(
+		config: &Config,
+		network: Network,
+	) -> anyhow::Result<ServerConnection> {
+		let server_address = crate::utils::url_with_default_https_scheme(&config.server_address);
+		let mut builder = ServerConnection::builder()
+			.address(&server_address)
+			.network(network);
+
+		#[cfg(feature = "socks5-proxy")]
+		if let Some(proxy) = proxy_for_url(&config.socks5_proxy, &server_address)? {
+			builder = builder.proxy(&proxy)
+		}
+
+		#[allow(deprecated)]
+		{
+			if let Some(ref token) = config.server_access_token {
+				builder = builder.access_token(token);
+			}
+		}
+
+		builder = builder.user_agent(config.user_agent.as_deref()
+			.unwrap_or(concat!("sapling/", env!("CARGO_PKG_VERSION"))));
+
+		builder.connect().await.map_err(wrap_server_connect_error)
+			.context("Failed to connect to Ark server")
+	}
+
+	async fn require_server(&self) -> anyhow::Result<(ServerConnection, ArkInfo)> {
+		// Connect lazily if not yet connected. `get_or_try_init` ensures
+		// concurrent callers on a cold cell all await the same in-flight
+		// connect future instead of each opening a fresh gRPC channel.
+		let conn = self.inner.server.get_or_try_init(|| async {
+			let network = self.properties().await?.network;
+			Self::connect_to_server(&self.inner.config, network).await
+				.context("You should be connected to Ark server to perform this action")
+		}).await?.clone();
+
+		let ark_info = conn.ark_info().await;
+		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
+		self.check_and_store_server_keys(&ark_info).await?;
+
+		Ok((conn, ark_info))
+	}
+
+	pub async fn refresh_server(&self) -> anyhow::Result<()> {
+		// If the cell is still cold, initialise it with a fresh connection.
+		// If it is already initialised, run a heartbeat against the existing
+		// one — `OnceCell` does not support replacing a stored value, but
+		// `ServerConnection` is built around a tonic `Channel` which
+		// transparently reconnects, so we don't need to swap it.
+		let srv = self.inner.server.get_or_try_init(|| async {
+			let properties = self.properties().await?;
+			Self::connect_to_server(&self.inner.config, properties.network).await
+				.map_err(anyhow::Error::from)
+		}).await?;
+
+		srv.check_connection().await?;
+		let ark_info = srv.ark_info().await;
+		ark_info.fees.validate().context("invalid fee schedule")?;
+		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
+		self.check_and_store_server_keys(&ark_info).await?;
+
+		Ok(())
+	}
+
+	/// Returns the configured onchain wallet, if any.
+	pub fn onchain(&self) -> Option<Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>> {
+		self.inner.onchain.clone()
+	}
+
+	/// Sync the internal onchain wallet against the chain source, if one is configured.
+	pub async fn sync_onchain(&self) -> anyhow::Result<()> {
+		if let Some(onchain) = self.inner.onchain.as_ref() {
+			onchain.write().await.sync(self.chain()).await?;
+		}
+		Ok(())
+	}
+
+	/// Validate that the server's public keys match what we have stored,
+	/// and persist them if this is the first time connecting after an upgrade.
+	///
+	/// Returns an error (via `bail!`) if either the server pubkey or mailbox
+	/// pubkey differs from the stored value; callers must not proceed with
+	/// server operations on error.
+	async fn check_and_store_server_keys(&self, ark_info: &ArkInfo) -> anyhow::Result<()> {
+		let properties = self.properties().await?;
+
+		if let Some(stored_pubkey) = properties.server_pubkey {
+			if stored_pubkey != ark_info.server_pubkey {
+				log_server_pubkey_changed_error(stored_pubkey, ark_info.server_pubkey);
+				bail!("Server public key has changed. You should exit all your VTXOs!");
+			}
+		} else {
+			self.inner.db.set_server_pubkey(ark_info.server_pubkey).await?;
+			info!("Stored server pubkey for existing wallet: {}", ark_info.server_pubkey);
+		}
+
+		if let Some(stored_mailbox_pubkey) = properties.server_mailbox_pubkey {
+			if stored_mailbox_pubkey != ark_info.mailbox_pubkey {
+				log_server_mailbox_pubkey_changed_error(stored_mailbox_pubkey, ark_info.mailbox_pubkey);
+				bail!("Server mailbox public key has changed.");
+			}
+		} else {
+			self.inner.db.set_server_mailbox_pubkey(ark_info.mailbox_pubkey).await?;
+			info!("Stored server mailbox pubkey for existing wallet: {}", ark_info.mailbox_pubkey);
+		}
+
+		Ok(())
+	}
+
+	/// Return [ArkInfo] fetched on last handshake with the Ark server
+	pub async fn ark_info(&self) -> anyhow::Result<Option<ArkInfo>> {
+		match self.inner.server.get() {
+			Some(srv) => Ok(Some(srv.ark_info().await)),
+			None => Ok(None),
+		}
+	}
+
+	/// Return [ArkInfo], connecting lazily if not yet connected.
+	///
+	/// Errors if the server cannot be reached or if the server's pubkey
+	/// or mailbox pubkey no longer matches what was stored at wallet
+	/// creation.
+	pub async fn require_ark_info(&self) -> anyhow::Result<ArkInfo> {
+		let (_, ark_info) = self.require_server().await?;
+		Ok(ark_info)
+	}
+
+	/// Fetches [Vtxo]'s funding transaction and validates the VTXO against it.
+	pub async fn validate_vtxo(&self, vtxo: &Vtxo<Full>) -> Result<(), VtxoValidationError> {
+		let tx = self.inner.chain.get_tx(&vtxo.chain_anchor().txid).await
+			.map_err(VtxoValidationError::Chain)?
+			.ok_or(VtxoValidationError::AnchorNotFound)?;
+
+		vtxo.validate(&tx).map_err(VtxoValidationError::Invalid)
+	}
+
+	/// Ask the server for the VTXO's spend state with its native ownership proof.
+	/// Program ownership requires both shares, but never an arbitrary digest RPC.
+	pub(crate) async fn fetch_vtxo_spend_state(
+		&self,
+		vtxo: impl VtxoRef,
+		key: &sapio::VtxoSigningKey,
+	) -> anyhow::Result<VtxoSpendState> {
+		let vtxo_id = vtxo.vtxo_id();
+		let attestation = if let Some(local) = key.local_keypair() {
+			VtxoStatusAttestation::new(vtxo_id, local)
+		} else {
+			let input = match vtxo.as_full_vtxo() {
+				Some(full) => full.clone(),
+				None => self.get_full_vtxo(vtxo_id).await?,
+			};
+			let bare = input.to_bare();
+			let signature = self.sign_vtxo_ownership(key, ark::sapio::protocol::OwnershipRequest {
+				input, proof: ark::sapio::protocol::OwnershipProof::Status,
+			}).await?;
+			VtxoStatusAttestation::from_signature(&bare, signature)?
+		};
+		let (mut srv, _) = self.require_server().await?;
+		let resp = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+			vtxo_id: vtxo_id.to_bytes().to_vec(),
+			attestation: attestation.serialize(),
+		}).await.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
+
+		VtxoSpendState::try_from(resp.spend_state).map_err(|_| anyhow::anyhow!(
+			"server returned unknown spend state {} for vtxo {vtxo_id}; this wallet may \
+			need updating", resp.spend_state,
+		))
+	}
+
+	/// Retrieves the full state of a [Vtxo] for a given [VtxoId] if it exists in the database.
+	pub async fn get_vtxo_by_id(&self, vtxo_id: VtxoId) -> anyhow::Result<WalletVtxo> {
+		let vtxo = self.inner.db.get_wallet_vtxo(vtxo_id).await
+			.with_context(|| format!("Error when querying vtxo {} in database", vtxo_id))?
+			.with_context(|| format!("The VTXO with id {} cannot be found", vtxo_id))?;
+		Ok(vtxo)
+	}
+
+	/// Hydrate a VTXO into its full form, including the unilateral exit chain.
+	///
+	/// [Wallet::get_vtxo_by_id] returns the bare form ([WalletVtxo] holds
+	/// [Vtxo<ark::vtxo::Bare>]). This method reads the genesis chain from the
+	/// database and reassembles the full VTXO. Use it from external SDK
+	/// callers that need the chain (e.g. to feed into [ArkoorPackageBuilder](ark::arkoor::ArkoorPackageBuilder)
+	/// or [Wallet::register_vtxo_transactions_with_server]).
+	pub async fn get_full_vtxo(&self, vtxo_id: VtxoId) -> anyhow::Result<Vtxo<Full>> {
+		self.inner.db.get_full_vtxo(vtxo_id).await
+			.with_context(|| format!("Error when querying full vtxo {} in database", vtxo_id))?
+			.with_context(|| format!("The VTXO with id {} cannot be found", vtxo_id))
+	}
+
+	/// Similar to [Wallet::get_full_vtxo] but it retrieves the full variant of each given VTXO.
+	pub async fn get_full_vtxos<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+	) -> anyhow::Result<Vec<Vtxo<Full>>> {
+		let ids = vtxos.into_iter().map(|v| v.vtxo_id()).collect::<Vec<_>>();
+		self.inner.db.get_full_vtxos(&ids).await
+			.with_context(||
+				format!("Error when querying full vtxos in database with IDs: {:?}", ids)
+			)
+	}
+
+	/// Fetches all movements ordered from newest to oldest.
+	#[deprecated(since="0.1.0-beta.5", note = "Use Wallet::history instead")]
+	pub async fn movements(&self) -> anyhow::Result<Vec<Movement>> {
+		self.history().await
+	}
+
+	/// Fetches all wallet fund movements ordered from newest to oldest.
+	pub async fn history(&self) -> anyhow::Result<Vec<Movement>> {
+		Ok(self.inner.db.get_all_movements().await?)
+	}
+
+	/// Applies an [RFC 7396](https://www.rfc-editor.org/rfc/rfc7396) JSON Merge Patch to the
+	/// metadata of a movement.
+	///
+	/// ```no_run
+	/// # use serde_json::json;
+	/// # async fn example(
+	/// #     wallet: &sapling::Wallet,
+	/// #     id: sapling::movement::MovementId,
+	/// # ) -> anyhow::Result<()> {
+	/// // Add or overwrite a key.
+	/// wallet.update_history_metadata(id, &json!({"note": "refund issued"})).await?;
+	///
+	/// // Delete a key (null means remove).
+	/// wallet.update_history_metadata(id, &json!({"note": null})).await?;
+	///
+	/// // Nested merge.
+	/// wallet.update_history_metadata(id, &json!({"counterparty": {"name": "Alice"}})).await?;
+	/// # Ok(()) }
+	/// ```
+	pub async fn update_history_metadata(
+		&self,
+		movement_id: MovementId,
+		patch: &serde_json::Value,
+	) -> anyhow::Result<()> {
+		self.inner.movements.patch_metadata(movement_id, patch).await?;
+		Ok(())
+	}
+
+	/// Query the wallet history by the given payment method
+	pub async fn history_by_payment_method(
+		&self,
+		payment_method: &PaymentMethod,
+	) -> anyhow::Result<Vec<Movement>> {
+		let mut ret = self.inner.db.get_movements_by_payment_method(payment_method).await?;
+		ret.sort_by_key(|m| m.id);
+		Ok(ret)
+	}
+
+	/// Returns all VTXOs from the database.
+	pub async fn all_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		Ok(self.inner.db.get_all_vtxos().await?)
+	}
+
+	/// Returns all not spent vtxos
+	pub async fn vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		Ok(self.inner.db.get_vtxos_by_state(&VtxoStateKind::UNSPENT_STATES).await?)
+	}
+
+	/// Returns all vtxos matching the provided predicate
+	pub async fn vtxos_with(&self, filter: &impl FilterVtxos) -> anyhow::Result<Vec<WalletVtxo>> {
+		let mut vtxos = self.vtxos().await?;
+		filter.filter_vtxos(&mut vtxos).await.context("error filtering vtxos")?;
+		Ok(vtxos)
+	}
+
+	/// Returns all spendable vtxos
+	pub async fn spendable_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		Ok(self.vtxos_with(&VtxoStateKind::Spendable).await?)
+	}
+
+	/// Returns all spendable vtxos matching the provided predicate
+	pub async fn spendable_vtxos_with(
+		&self,
+		filter: &impl FilterVtxos,
+	) -> anyhow::Result<Vec<WalletVtxo>> {
+		let mut vtxos = self.spendable_vtxos().await?;
+		filter.filter_vtxos(&mut vtxos).await.context("error filtering vtxos")?;
+		Ok(vtxos)
+	}
+
+	/// Returns all vtxos that will expire within `threshold` blocks
+	pub async fn get_expiring_vtxos(
+		&self,
+		threshold: BlockDelta,
+	) -> anyhow::Result<Vec<WalletVtxo>> {
+		let expiry = self.inner.chain.tip().await? + threshold;
+		let filter = VtxoFilter::new(&self).expires_before(expiry);
+		Ok(self.spendable_vtxos_with(&filter).await?)
+	}
+
+	/// Performs maintenance tasks and performs refresh interactively until finished when needed.
+	///
+	/// This can take a long period of time due to registering boards, syncing
+	/// rounds, arkoors, checking pending lightning payments and refreshing VTXOs
+	/// if necessary.
+	pub async fn maintenance(&self) -> anyhow::Result<()> {
+		info!("Starting wallet maintenance in interactive mode");
+		self.sync().await;
+
+		// First try progress any rounds that exist, best effort.
+		let rounds = self.progress_pending_rounds(None).await;
+		if let Err(e) = rounds.as_ref() {
+			warn!("Error progressing pending rounds: {:#}", e);
+		}
+
+		// Then if there are still some participations open, try to cancel them.
+		let states = self.inner.db.get_pending_round_state_ids().await?;
+		for id in states {
+			debug!("Cancelling pending round participation {}", id);
+			let mut state = match self.lock_wait_round_state(id).await {
+				Ok(Some(s)) => s,
+				Ok(None) => continue, // round disappeared, not our problem
+				Err(e) => {
+					warn!("Failed to lock round state with id {}: {:#}", id, e);
+					continue;
+				}
+			};
+			if let Err(e) = state.state_mut().try_cancel(self).await {
+				warn!("Error cancelling pending round: {:#}", e);
+			}
+		}
+
+		// And then call refresh so that we can start again.
+		let refresh = self.maintenance_refresh().await;
+		if let Err(e) = refresh.as_ref() {
+			warn!("Error refreshing VTXOs: {:#}", e);
+		}
+
+		if rounds.is_err() || refresh.is_err() {
+			bail!("Maintenance encountered errors.\nprogress_rounds: {:#?}\nrefresh: {:#?}",
+				rounds, refresh,
+			);
+		}
+
+		Ok(())
+	}
+
+	/// Performs maintenance tasks and schedules delegated refresh when needed. This risks spending
+	/// users' funds because refreshing may cost fees and any pending exits will be progressed.
+	///
+	/// This can take a long period of time due to syncing the onchain wallet, registering boards,
+	/// syncing rounds, arkoors, and the exit system, checking pending lightning payments and
+	/// refreshing VTXOs if necessary.
+	pub async fn maintenance_delegated(&self) -> anyhow::Result<()> {
+		info!("Starting wallet maintenance in delegated mode");
+		self.sync().await;
+		let rounds = self.progress_pending_rounds(None).await;
+		if let Err(e) = rounds.as_ref() {
+			warn!("Error progressing pending rounds: {:#}", e);
+		}
+		let refresh = self.maybe_schedule_maintenance_refresh_delegated().await;
+		if let Err(e) = refresh.as_ref() {
+			warn!("Error refreshing VTXOs: {:#}", e);
+		}
+
+		if rounds.is_err() || refresh.is_err() {
+			bail!("Delegated maintenance encountered errors.\n\
+				progress_rounds: {:#?}\nrefresh: {:#?}",
+				rounds, refresh,
+			);
+		}
+
+		Ok(())
+	}
+
+	/// Actively join the given in-flight round `attempt` with all VTXOs due for
+	/// maintenance refresh, dropping any input the server rejects as unusable and
+	/// re-submitting the rest to the *same* attempt (the server keeps its submit
+	/// window open after a rejection, so the corrected participation still lands
+	/// in this round).
+	///
+	/// This is the shared core of interactive maintenance: the blocking
+	/// [Wallet::maintenance_refresh] calls it and then drives the round to
+	/// completion, while the daemon calls it on the round Attempt event and lets
+	/// [Wallet::progress_pending_rounds] carry the round forward. Mirrors
+	/// [Wallet::maybe_schedule_maintenance_refresh_delegated].
+	///
+	/// Returns the id of the round state we joined, or `None` if there was
+	/// nothing economical to refresh.
+	pub(crate) async fn join_round_for_maintenance_refresh(
+		&self,
+		attempt: &RoundAttempt,
+	) -> anyhow::Result<Option<RoundStateId>> {
+		self.maintenance_refresh_retry_loop(|part| async move {
+			info!("Joining round {} for maintenance refresh ({} vtxos)",
+				attempt.round_seq, part.inputs.len());
+			Ok(Some(self.join_attempt_interactive(
+				part, attempt, Some(RoundMovement::Refresh),
+			).await?.id()))
+		}).await.context("failed to join round for maintenance refresh")
+	}
+
+	/// Checks VTXOs that are due to be refreshed, and schedules a delegated refresh if any
+	///
+	/// This will include any VTXOs within the expiry threshold
+	/// ([Config::vtxo_refresh_expiry_threshold]) or those which
+	/// are uneconomical to exit due to onchain network conditions.
+	///
+	/// Returns a [RoundStateId] if a refresh is scheduled.
+	pub async fn maybe_schedule_maintenance_refresh_delegated(
+		&self,
+	) -> anyhow::Result<Option<RoundStateId>> {
+		self.maintenance_refresh_retry_loop(|part| async move {
+			info!("Scheduling delegated maintenance refresh ({} vtxos)", part.inputs.len());
+			Ok(Some(self.join_next_round_delegated(part, Some(RoundMovement::Refresh)).await?.id()))
+		}).await.context("failed to schedule delegated maintenance refresh")
+	}
+
+	/// The retry loop shared by the interactive and delegated maintenance refreshes.
+	///
+	/// Selects the VTXOs due for refresh (minus any the server has already rejected
+	/// as unusable), runs `attempt_refresh` for them, and if it fails naming unusable
+	/// inputs, drops those and retries — up to 10 times. Both submission modes
+	/// validate inputs synchronously, so a rejection surfaces here rather than
+	/// poisoning the batch forever; `attempt_refresh` is the only part that differs.
+	async fn maintenance_refresh_retry_loop<F, Fut>(
+		&self,
+		attempt_refresh: F,
+	) -> anyhow::Result<Option<RoundStateId>>
+	where
+		F: Fn(RoundParticipation) -> Fut,
+		Fut: Future<Output = anyhow::Result<Option<RoundStateId>>>,
+	{
+		let mut excluded = HashSet::new();
+		for _ in 0..10 {
+			let vtxos = self.get_vtxos_to_refresh_with_excluded(excluded.iter().copied()).await?;
+			match (vtxos.is_empty(), excluded.is_empty()) {
+				// Every VTXO due for refresh has been excluded as unusable by the server:
+				// there is nothing left to submit, so surface an error rather than
+				// silently reporting success.
+				(true, false) => {
+					warn!("no VTXOs to refresh after exclusions: {:?}", excluded);
+					bail!("no VTXOs to refresh after excluding: {:?}", excluded);
+				},
+				// Nothing was due for refresh in the first place.
+				(true, true) => return Ok(None),
+				// Still have VTXOs to submit (possibly after dropping some exclusions).
+				(false, _) => {},
+			}
+			let part = match self.build_refresh_participation(vtxos).await? {
+				Some(participation) => participation,
+				None => return Ok(None),
+			};
+
+			match attempt_refresh(part).await {
+				Ok(state_id) => return Ok(state_id),
+				Err(e) => {
+					let rejected = rejected_vtxos_from_error(&e).into_iter()
+						.filter(|id| !excluded.contains(id))
+						.collect::<Vec<_>>();
+					if rejected.is_empty() {
+						return Err(e);
+					}
+					warn!("Maintenance refresh rejected {} unusable input(s) ({:?}); \
+						retrying without them", rejected.len(), rejected);
+					excluded.extend(rejected);
+				},
+			}
+		}
+		bail!("Maintenance refresh failed after 10 retries");
+	}
+
+	/// Performs an interactive refresh of all VTXOs that are due to be refreshed, if any
+	///
+	/// This will include any VTXOs within the expiry threshold
+	/// ([Config::vtxo_refresh_expiry_threshold]) or those which
+	/// are uneconomical to exit due to onchain network conditions.
+	///
+	/// Waits for a round to start, joins it, dropping any inputs the server rejects
+	/// as unusable and retries within the same attempt, then drives that round to
+	/// completion.
+	///
+	/// Returns a [RoundStatus] if a refresh occurs.
+	pub async fn maintenance_refresh(&self) -> anyhow::Result<Option<RoundStatus>> {
+		if self.get_vtxos_to_refresh().await?.is_empty() {
+			return Ok(None);
+		}
+
+		info!("Waiting for round to perform maintenance refresh...");
+		let mut events = self.subscribe_round_events().await?;
+		while let Some(event) = events.next().await {
+			let event = event.context("error on round event stream")?;
+			if let RoundEvent::Attempt(a) = event && a.attempt_seq == 0 {
+				debug!("Round {} started, triggering maintenance refresh", a.round_seq);
+				let state_id = match self.join_round_for_maintenance_refresh(&a).await? {
+					Some(id) => id,
+					None => return Ok(None),
+				};
+				// We submitted up-front, so drive the (now ongoing) round to completion
+				// on this same event stream.
+				let state = self.lock_wait_round_state(state_id).await?
+					.context("maintenance refresh round state vanished after joining")?;
+				return Ok(Some(self.drive_round_state(state, &mut events).await?));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Sync offchain wallet and update onchain fees. This is a much more lightweight alternative
+	/// to [Wallet::maintenance] as it will not refresh VTXOs or sync the onchain wallet.
+	///
+	/// Notes:
+	/// - Exits are only synced if we detect onchain activity which has force-exited our VTXO.
+	pub async fn sync(&self) {
+		self.inner.chain.invalidate_caches().await;
+
+		futures::join!(
+			async {
+				// NB: order matters here, if syncing call fails,
+				// we still want to update the fee rates
+				if let Err(e) = self.inner.chain.update_fee_rates(self.inner.config.fallback_fee_rate).await {
+					warn!("Error updating fee rates: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_mailbox().await {
+					warn!("Error in mailbox sync: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_pending_rounds().await {
+					warn!("Error while trying to progress rounds awaiting confirmations: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_pending_lightning_send_vtxos().await {
+					warn!("Error syncing pending lightning payments: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_pending_arkoor_sends().await {
+					warn!("Error syncing pending arkoor sends: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.try_claim_all_lightning_receives(false).await {
+					warn!("Error claiming pending lightning receives: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_pending_boards().await {
+					warn!("Error syncing pending boards: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_pending_offboards().await {
+					warn!("Error syncing pending offboards: {:#}", e);
+				}
+			},
+			async {
+				if let Err(e) = self.sync_force_exited_vtxos().await {
+					warn!("Error scanning for on-chain-exited VTXOs: {:#}", e);
+				}
+			},
+			async {
+				// Re-assert recovery state so vtxos whose mailbox post or
+				// registration failed at store time, or that predate the
+				// recovery mechanism, get caught up (non-critical).
+				if let Err(e) = self.catchup_recovery_vtxos().await {
+					warn!("Failed to catch up recovery VTXOs with server: {:#}", e);
+				}
+			}
+		);
+	}
+
+	/// Sync the transaction status of unilateral exits
+	///
+	/// This will not progress the unilateral exits in any way, it will merely check the
+	/// transaction status of each transaction as well as check whether any exits have become
+	/// claimable or have been claimed.
+	pub async fn sync_exits(&self) -> anyhow::Result<()> {
+		self.exit_mgr().sync(&self).await?;
+		Ok(())
+	}
+
+	/// Progress unilateral exits
+	///
+	/// This risks spending users' funds because refreshing may cost fees and any
+	/// pending exits will be progressed.
+	pub async fn progress_exits(&self) -> anyhow::Result<()> {
+		self.exit_mgr().progress_exits_with_cpfp(&self, None).await?;
+		Ok(())
+	}
+
+	/// Detect spendable VTXOs that were exited on-chain without the user asking for it — e.g.
+	/// the server's watchman progressing a shared tree, or a third party's unilateral exit
+	/// dragging a parent on-chain — and route them into the unilateral-exit flow so the funds
+	/// can be claimed on-chain.
+	///
+	/// Such VTXOs are otherwise left `Spendable` by a normal sync even though the server now
+	/// rejects spending them, leaving the user stuck. We detect them by checking, on each new
+	/// chain tip, whether any spendable VTXO's own funding tx is already on-chain.
+	///
+	/// This is deliberately independent of the onchain wallet sync, since the onchain wallet
+	/// may be disabled. The caller must also ensure that the wallet state is up to date before
+	/// calling this.
+	pub async fn sync_force_exited_vtxos(&self) -> anyhow::Result<()> {
+		// A VTXO's on-chain status can only change across blocks, so only scan when the tip moves.
+		let tip = self.inner.chain.tip().await?;
+		let mut lock = self.inner.last_force_exit_scan_tip.lock().await;
+		if *lock == Some(tip) {
+			return Ok(());
+		}
+
+		// Skip VTXOs already being exited.
+		let exiting = self.exit_mgr().get_exit_vtxo_ids().await;
+		let vtxos = self.inner.db.get_vtxos_by_state(&[VtxoStateKind::Spendable]).await?
+			.into_iter()
+			.filter(|v| !exiting.contains(&v.vtxo.id()));
+
+		// Check each candidate's funding tx in parallel.
+		let mut checked = FuturesUnordered::new();
+		for wv in vtxos {
+			let chain = self.inner.chain.clone();
+			checked.push(async move {
+				let txid = wv.vtxo_id().to_point().txid;
+				let status = chain.tx_status(txid).await;
+				(wv, status)
+			});
+		}
+
+		let mut to_exit = Vec::new();
+		while let Some((vtxo, status)) = futures::StreamExt::next(&mut checked).await {
+			match status {
+				Ok(TxStatus::NotFound) => {},
+				Ok(_) => {
+					info!("VTXO {} was exited on-chain without us; routing it to a claimable exit",
+						vtxo.vtxo.id(),
+					);
+					to_exit.push(vtxo.vtxo);
+				},
+				Err(e) => warn!("Could not check on-chain status of VTXO {}: {:#}",
+					vtxo.vtxo.id(), e,
+				),
+			}
+		}
+
+		if !to_exit.is_empty() {
+			self.exit_mgr().start_exit_for_vtxos(&to_exit).await
+				.context("failed to start exit for on-chain-exited VTXOs")?;
+
+			*lock = Some(tip);
+			self.sync_exits().await
+				.context("failed to sync exits after starting new ones")?;
+		} else {
+			*lock = Some(tip);
+		}
+
+		Ok(())
+	}
+
+	/// Drop a specific [Vtxo] from the database. This is destructive and will result in a loss of
+	/// funds.
+	pub async fn dangerous_drop_vtxo(&self, vtxo_id: VtxoId) -> anyhow::Result<()> {
+		warn!("Drop vtxo {} from the database", vtxo_id);
+		self.inner.db.remove_vtxo(vtxo_id).await?;
+		Ok(())
+	}
+
+	/// Drop all VTXOs from the database. This is destructive and will result in a loss of funds.
+	//TODO(stevenroose) improve the way we expose dangerous methods
+	pub async fn dangerous_drop_all_vtxos(&self) -> anyhow::Result<()> {
+		warn!("Dropping all vtxos from the db...");
+		for vtxo in self.vtxos().await? {
+			self.inner.db.remove_vtxo(vtxo.id()).await?;
+		}
+
+		self.exit_mgr().dangerous_clear_exit().await?;
+		Ok(())
+	}
+
+	/// Checks if the provided VTXO has some counterparty risk in the current wallet.
+	///
+	/// An arkoor vtxo is considered to have some counterparty risk if it is
+	/// (directly or not) based on round VTXOs that aren't owned by the
+	/// wallet. The check inspects the genesis chain, so this takes a full
+	/// VTXO; callers working from a bare listing should hydrate via
+	/// [Wallet::get_full_vtxo] or [WalletPersister::get_full_vtxos] first.
+	async fn has_counterparty_risk(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
+		for past_pks in vtxo.past_arkoor_pubkeys() {
+			let mut owns_any = false;
+			for past_pk in past_pks {
+				if self.inner.db.get_public_key_idx(&past_pk).await?.is_some() {
+					owns_any = true;
+					break;
+				}
+			}
+			if !owns_any {
+				return Ok(true);
+			}
+		}
+
+		let my_clause = self.find_signable_clause(vtxo).await;
+		Ok(!my_clause.is_some())
+	}
+
+	pub async fn build_refresh_participation<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+	) -> anyhow::Result<Option<RoundParticipation>> {
+		self.inner_build_refresh_participation(vtxos, None).await
+	}
+
+	pub async fn build_scheduled_refresh_participation<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+		height: BlockHeight,
+	) -> anyhow::Result<Option<RoundParticipation>> {
+		self.inner_build_refresh_participation(vtxos, Some(height)).await
+	}
+
+	async fn inner_build_refresh_participation<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+		height: Option<BlockHeight>,
+	) -> anyhow::Result<Option<RoundParticipation>> {
+		let (vtxos, total_amount) = {
+			let iter = vtxos.into_iter();
+			let size_hint = iter.size_hint();
+			let mut vtxos = Vec::<Vtxo<Full>>::with_capacity(size_hint.1.unwrap_or(size_hint.0));
+			let mut amount = Amount::ZERO;
+			for vref in iter {
+				// We use a Vec here instead of a HashMap or a HashSet of IDs because for the kinds
+				// of elements we expect to deal with, a Vec is likely to be quicker. The overhead
+				// of hashing each ID and making additional allocations isn't likely to be worth it
+				// for what is likely to be a handful of VTXOs or at most a couple of hundred.
+				let id = vref.vtxo_id();
+				if vtxos.iter().any(|v| v.id() == id) {
+					bail!("duplicate VTXO id: {}", id);
+				}
+				let vtxo = if let Some(vtxo) = vref.into_full_vtxo() {
+					vtxo
+				} else {
+					// Listings/selection return bare wallet vtxos; the round
+					// flow needs the full chain to forfeit and register.
+					self.inner.db.get_full_vtxo(id).await?
+						.with_context(|| format!("vtxo with id {} not found", id))?
+				};
+				amount += vtxo.amount();
+				vtxos.push(vtxo);
+			}
+			(vtxos, amount)
+		};
+
+		if vtxos.is_empty() {
+			info!("Skipping refresh since no VTXOs are provided.");
+			return Ok(None);
+		}
+		ensure!(total_amount >= VTXO_DUST,
+			"vtxo amount must be at least {} to participate in a round",
+			VTXO_DUST,
+		);
+
+		// Calculate refresh fees
+		let (_, ark_info) = self.require_server().await?;
+		let refresh_height = match height {
+			Some(height) => height,
+			None => self.inner.chain.tip().await?,
+		};
+
+		let vtxo_fee_infos = vtxos.iter()
+			.map(|v| VtxoFeeInfo::from_vtxo_and_tip(v, refresh_height));
+		let fee = ark_info.fees.refresh.calculate(vtxo_fee_infos).context("fee overflowed")?;
+		let output_amount = validate_and_subtract_fee_min_dust(total_amount, fee, VTXO_DUST)?;
+
+		info!("Refreshing {} VTXOs (total amount = {}, fee = {}, output = {}).",
+			vtxos.len(), total_amount, fee, output_amount,
+		);
+		let (user_key, _) = self.derive_store_next_signing_key().await?;
+		let req = VtxoRequest {
+			policy: VtxoPolicy::Pubkey(PubkeyVtxoPolicy { user_pubkey: user_key.public_key() }),
+			amount: output_amount,
+		};
+
+		Ok(Some(RoundParticipation {
+			inputs: vtxos,
+			outputs: vec![req],
+			unblinded_mailbox_id: None,
+		}))
+	}
+
+	/// This will refresh all provided VTXOs in an interactive round and wait until end
+	///
+	/// Returns the [RoundStatus] of the round if a successful refresh occurred.
+	/// It will return [None] if no [Vtxo] needed to be refreshed.
+	pub async fn refresh_vtxos<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+	) -> anyhow::Result<Option<RoundStatus>> {
+		let participation = match self.build_refresh_participation(vtxos).await? {
+			Some(participation) => participation,
+			None => return Ok(None),
+		};
+
+		Ok(Some(self.participate_round(participation, Some(RoundMovement::Refresh)).await?))
+	}
+
+	/// This will refresh all provided VTXOs in delegated (non-interactive) mode
+	///
+	/// Returns the [StoredRoundState] which can be used to track the round's
+	/// progress later by calling sync. It will return [None] if no [Vtxo]
+	/// needed to be refreshed.
+	pub async fn refresh_vtxos_delegated<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+	) -> anyhow::Result<Option<StoredRoundState<Unlocked>>> {
+		let part = match self.build_refresh_participation(vtxos).await? {
+			Some(participation) => participation,
+			None => return Ok(None),
+		};
+
+		Ok(Some(self.join_delegated_round(
+			part, Some(RoundMovement::Refresh), None,
+		).await?))
+	}
+
+	/// Same as [Wallet::refresh_vtxos_delegated] but it schedules the refresh for
+	/// the given block height instead of the next round (see [Wallet::join_delegated_round]).
+	pub async fn refresh_vtxos_scheduled<V: VtxoRef>(
+		&self,
+		vtxos: impl IntoIterator<Item = V>,
+		scheduled_height: BlockHeight,
+	) -> anyhow::Result<Option<StoredRoundState<Unlocked>>> {
+		let part = match self
+			.build_scheduled_refresh_participation(vtxos, scheduled_height).await?
+		{
+			Some(participation) => participation,
+			None => return Ok(None),
+		};
+
+		Ok(Some(self.join_delegated_round(
+			part, Some(RoundMovement::Refresh), Some(scheduled_height),
+		).await?))
+	}
+
+	/// This will find all VTXOs that meets must-refresh criteria. Then, if there are some VTXOs to
+	/// refresh, it will also add those that meet should-refresh criteria.
+	pub async fn get_vtxos_to_refresh(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		let vtxos = self.spendable_vtxos_with(&RefreshStrategy::should_refresh_if_must(
+			self,
+			self.inner.chain.tip().await?,
+			self.inner.chain.fee_rates().await.fast,
+		)).await?;
+		Ok(vtxos)
+	}
+
+	/// Similar to [Wallet::get_vtxos_to_refresh] but it allows VTXOs to be excluded from the
+	/// result.
+	pub async fn get_vtxos_to_refresh_with_excluded<V: VtxoRef>(
+		&self,
+		exclude: impl IntoIterator<Item = V>,
+	) -> anyhow::Result<Vec<WalletVtxo>> {
+		let mut vtxos = self.get_vtxos_to_refresh().await?;
+		for v in exclude.into_iter() {
+			if let Some(index) = vtxos.iter().position(|vtxo| vtxo.id() == v.vtxo_id()) {
+				vtxos.swap_remove(index);
+			}
+		}
+		Ok(vtxos)
+	}
+
+	/// Returns the block height at which the first VTXO will expire
+	pub async fn get_first_expiring_vtxo_blockheight(
+		&self,
+	) -> anyhow::Result<Option<BlockHeight>> {
+		Ok(self.spendable_vtxos().await?.iter().map(|v| v.expiry_height()).min())
+	}
+
+	/// Returns the next block height at which we have a VTXO that we
+	/// want to refresh
+	pub async fn get_next_required_refresh_blockheight(
+		&self,
+	) -> anyhow::Result<Option<BlockHeight>> {
+		let first_expiry = self.get_first_expiring_vtxo_blockheight().await?;
+		Ok(first_expiry.map(|h| {
+			h.saturating_sub(self.inner.config.vtxo_refresh_expiry_threshold)
+		}))
+	}
+
+	/// Base [InputSelection] for spending VTXOs: skips VTXOs whose exit
+	/// depth the server would reject as arkoor inputs. Those can only be
+	/// spent again after a refresh.
+	async fn spend_input_selection(&self) -> anyhow::Result<InputSelection> {
+		let mut selection = InputSelection::new();
+		if let Some(info) = self.ark_info().await? {
+			selection = selection.max_exit_depth(info.max_vtxo_exit_depth);
+		}
+		Ok(selection)
+	}
+
+	/// Select any spendable VTXOs to cover the provided amount.
+	async fn select_any_vtxos_to_cover(
+		&self,
+		amount: Amount,
+	) -> anyhow::Result<Vec<WalletVtxo>> {
+		self.spend_input_selection().await?.select(self.spendable_vtxos().await?, amount)
+	}
+
+	/// Determines which VTXOs to use for a fee-paying transaction where the fee is added on top of
+	/// the desired amount. E.g., a lightning payment, a send-onchain payment.
+	///
+	/// See [InputSelection::fee_scheme].
+	async fn select_any_vtxos_to_cover_with_fee<F>(
+		&self,
+		amount: Amount,
+		calc_fee: F,
+	) -> anyhow::Result<(Vec<WalletVtxo>, Amount)>
+	where
+		F: for<'a> Fn(Amount, SelectedFeeInfos<'a>) -> anyhow::Result<Amount>,
+	{
+		let tip = self.inner.chain.tip().await?;
+		self.spend_input_selection().await?
+			.fee_scheme(tip, calc_fee)
+			.select(self.spendable_vtxos().await?, amount)
+	}
+
+	/// Starts a daemon for the wallet.
+	///
+	/// The daemon uses the onchain wallet stored in [OpenWalletArgs::onchain] (if any)
+	/// for background onchain syncing and exit fee-bumping.
+	///
+	/// The daemon holds only a weak reference to the wallet, so it doesn't
+	/// keep the wallet alive: when the last [Wallet] clone is dropped, the
+	/// daemon shuts itself down. Any single unit of daemon work in flight
+	/// (a sync pass, a round participation) finishes gracefully first.
+	pub fn start_daemon(&self) -> anyhow::Result<()> {
+		let mut daemon = self.inner.daemon.lock();
+		if daemon.is_some() {
+			warn!("Called Wallet::start_daemon while daemon was already running.");
+			return Ok(());
+		}
+
+		let handle = crate::daemon::start_daemon(self);
+		let _ = daemon.insert(handle);
+
+		Ok(())
+	}
+
+	/// Stops the daemon for the wallet if it is running, otherwise does nothing.
+	pub fn stop_daemon(&self) {
+		let mut daemon = self.inner.daemon.lock();
+		if let Some(handle) = daemon.take() {
+			handle.stop();
+		}
+	}
+
+	/// Stops the daemon for the wallet if it is running and waits until its
+	/// tasks have finished.
+	pub async fn stop_daemon_wait(&self) -> anyhow::Result<()> {
+		let handle = self.inner.daemon.lock().take();
+		if let Some(handle) = handle {
+			handle.stop_wait().await?;
+		}
+		Ok(())
+	}
+
+	/// Posts the IDs of all non-spent (spendable, locked and exited) VTXOs
+	/// to the server's recovery mailbox and re-registers their fully-signed
+	/// transaction chains, so a wallet recovering from seed can rebuild
+	/// its state. Both server endpoints are idempotent.
+	///
+	/// Exited VTXOs are backed up too: their exit transactions being
+	/// broadcast doesn't mean the on-chain outputs were claimed, and a
+	/// wallet recovering from seed must learn about the exit to claim
+	/// the funds.
+	///
+	/// VTXOs whose mailbox post and chain registration both succeeded once
+	/// are marked [WalletVtxo::registered] and skipped from then on, so
+	/// repeated syncs don't re-upload — or even re-read — the whole wallet.
+	///
+	/// VTXOs of boards that are still in progress are left out: the server
+	/// only gets a vtxo row for those once the board registers, and that
+	/// step posts them for recovery itself.
+	async fn catchup_recovery_vtxos(&self) -> anyhow::Result<()> {
+		let mut ids = self.inner.db.get_unregistered_vtxo_ids().await?;
+		if ids.is_empty() {
+			return Ok(());
+		}
+
+		// TODO(pc): Investigate if we should first load `WalletVtxo` in case we have other reasons
+		//  to exclude VTXOs other than pending boards. This works for now.
+		let in_progress_boards = self.boards_in_progress().await?;
+		ids.retain(|id| !in_progress_boards.iter().any(|b| b.vtxo_id == *id));
+		if ids.is_empty() {
+			return Ok(());
+		}
+
+		// The mailbox post and the chain registration are independent and
+		// both idempotent, so one failing must not stop the other. A vtxo
+		// is only marked registered once both succeeded for it, so a failed
+		// mailbox post keeps every vtxo eligible for the next catch-up.
+		let posted = self.post_recovery_vtxo_ids(ids.iter().copied()).await
+			.context("failed to post recovery vtxo IDs");
+		let registered = self.register_recovery_vtxo_chains(&ids, posted.is_ok()).await;
+
+		match (posted, registered) {
+			(Ok(()), registered) => registered,
+			(posted, Ok(())) => posted,
+			(Err(posted), Err(registered)) => {
+				Err(registered.context(format!("mailbox post also failed: {:#}", posted)))
+			},
+		}
+	}
+
+	/// Registers the fully-signed transaction chains of the given wallet
+	/// VTXOs with the server, in chunks with a per-vtxo fallback. When
+	/// `mark_registered` is set, every successfully registered vtxo is
+	/// marked [WalletVtxo::registered]. Part of
+	/// [`Self::catchup_recovery_vtxos`].
+	async fn register_recovery_vtxo_chains(
+		&self,
+		ids: &[VtxoId],
+		mark_registered: bool,
+	) -> anyhow::Result<()> {
+		const CHUNK_SIZE: usize = 20;
+		let mut failed = 0;
+		for chunk_ids in ids.chunks(CHUNK_SIZE) {
+			// Load the full vtxos one chunk at a time: exit chains can be
+			// tens of KB each, so don't hold every chain in memory at once.
+			let chunk = self.inner.db.get_full_vtxos(chunk_ids).await
+				.context("failed to load full vtxos for recovery registration")?;
+			ensure!(chunk.len() == chunk_ids.len(),
+				"loaded {} full vtxos for {} ids", chunk.len(), chunk_ids.len(),
+			);
+
+			let mut succeeded = Vec::with_capacity(chunk.len());
+			match self.register_vtxo_transactions_with_server(&chunk).await {
+				Ok(()) => succeeded.extend(chunk.iter().map(|v| v.id())),
+				Err(e) => {
+					debug!("Failed to register chunk of {} vtxo transactions, \
+						retrying one by one: {:#}", chunk.len(), e,
+					);
+					for vtxo in &chunk {
+						match self.register_vtxo_transactions_with_server(
+							std::slice::from_ref(vtxo),
+						).await {
+							Ok(()) => succeeded.push(vtxo.id()),
+							Err(e) => {
+								error!("Failed to register vtxo {} transactions with server; \
+									recovery from seed may miss it until registration succeeds: {:#}",
+									vtxo.id(), e,
+								);
+								failed += 1;
+							},
+						}
+					}
+				},
+			}
+			if mark_registered && !succeeded.is_empty() {
+				self.inner.db.mark_vtxos_registered(&succeeded).await
+					.context("failed to mark vtxos as registered for recovery")?;
+			}
+		}
+		if failed > 0 {
+			bail!("failed to register {} of {} vtxo transactions", failed, ids.len());
+		}
+		Ok(())
+	}
+
+	/// Registers the signed transaction chains for the given VTXOs with the
+	/// server. This must be called before spending VTXOs so the server can
+	/// publish forfeits if needed.
+	pub async fn register_vtxo_transactions_with_server(
+		&self,
+		vtxos: &[impl AsRef<Vtxo<Full>>],
+	) -> anyhow::Result<()> {
+		if vtxos.is_empty() {
+			return Ok(());
+		}
+
+		let (mut srv, _) = self.require_server().await?;
+		srv.client.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
+			vtxos: vtxos.iter().map(|v| v.as_ref().serialize()).collect(),
+		}).await.context("failed to register vtxo transactions")?;
+
+		Ok(())
+	}
+}
+
+fn wrap_server_connect_error(err: ConnectError) -> anyhow::Error {
+	match err {
+		ConnectError::CreateEndpoint(CreateEndpointError::NoTransportBackend) => {
+			anyhow!(MISSING_SERVER_TRANSPORT_HELP)
+		},
+		other => anyhow::Error::from(other),
+	}
+}
+
+impl std::ops::Drop for WalletInner {
+	fn drop(&mut self) {
+		// The daemon task holds only a Weak reference to this struct (see
+		// [crate::daemon]), precisely so that it can't keep the wallet alive
+		// after the last user-held [Wallet] clone is dropped. That also means
+		// nobody is left to stop it at that point — do it here. Cancelling
+		// the token wakes the daemon loops immediately; the task finishes
+		// detached (Drop can't await it).
+		if let Some(handle) = self.daemon.lock().take() {
+			handle.stop();
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use bitcoin::{Amount, FeeRate, Network};
+	use bitcoin::secp256k1::PublicKey;
+
+	use ark::ArkInfo;
+	use bitcoin_ext::BlockDelta;
+
+	use super::{
+		check_ark_info_safe, MAX_NB_ROUND_NONCES, MIN_MAINNET_VTXO_EXIT_DELTA,
+	};
+
+
+	fn ark_info_with_lifetime(vtxo_lifetime: u16, required_board_confirmations: usize) -> ArkInfo {
+		use std::str::FromStr as _;
+		let pk = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+		).unwrap();
+		#[allow(deprecated)]
+		ArkInfo {
+			network: Network::Regtest,
+			server_pubkey: pk,
+			mailbox_pubkey: pk,
+			round_interval: std::time::Duration::from_secs(60),
+			nb_round_nonces: 8,
+			vtxo_exit_delta: BlockDelta::new(48),
+			vtxo_lifetime: BlockDelta::new(vtxo_lifetime),
+			htlc_send_expiry_delta: BlockDelta::new(100),
+			htlc_expiry_delta: BlockDelta::new(100),
+			max_vtxo_amount: None,
+			required_board_confirmations,
+			max_user_invoice_cltv_delta: BlockDelta::new(100),
+			min_board_amount: Amount::from_sat(1000),
+			vtxo_expiry_delta: BlockDelta::new(vtxo_lifetime),
+			offboard_feerate: FeeRate::ZERO,
+			max_offboard_inputs: 1,
+			ln_receive_anti_dos_required: false,
+			fees: Default::default(),
+			max_vtxo_exit_depth: 10,
+			tos_link: None,
+		}
+	}
+
+	#[test]
+	fn ark_info_with_zero_lifetime_is_rejected() {
+		let mut ai = ark_info_with_lifetime(0, 6);
+		ai.network = Network::Bitcoin;
+		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("unsafe"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn ark_info_at_the_boundary_is_rejected() {
+		// vtxo_lifetime == required + margin: still not strictly greater than
+		// the minimum, so the strict check refuses it.
+		let mut ai = ark_info_with_lifetime(6 + 12, 6);
+		ai.network = Network::Bitcoin;
+		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
+		assert!(check_ark_info_safe(&ai, BlockDelta::new(12)).is_err());
+	}
+
+	#[test]
+	fn ark_info_one_block_over_the_boundary_is_accepted() {
+		let ai = ark_info_with_lifetime(6 + 12 + 1, 6);
+		check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap();
+	}
+
+	#[test]
+	fn ark_info_generous_lifetime_is_accepted() {
+		let ai = ark_info_with_lifetime(4032, 6);
+		check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap();
+	}
+
+	#[test]
+	fn ark_info_with_zero_vtxo_exit_delta_is_rejected() {
+		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.vtxo_exit_delta = BlockDelta::ZERO;
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("vtxo_exit_delta"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn ark_info_below_mainnet_vtxo_exit_delta_is_rejected() {
+		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.network = Network::Bitcoin;
+		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA.saturating_sub(BlockDelta::new(1));
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("mainnet minimum"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn ark_info_at_mainnet_vtxo_exit_delta_is_accepted() {
+		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.network = Network::Bitcoin;
+		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
+		check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap();
+	}
+
+	#[test]
+	fn ark_info_with_zero_nb_round_nonces_is_rejected() {
+		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.nb_round_nonces = 0;
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn ark_info_at_nb_round_nonces_cap_is_accepted() {
+		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.nb_round_nonces = MAX_NB_ROUND_NONCES;
+		check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap();
+	}
+
+	#[test]
+	fn ark_info_over_nb_round_nonces_cap_is_rejected() {
+		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.network = Network::Bitcoin;
+		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
+		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+	}
+
+}
