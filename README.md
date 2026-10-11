@@ -12,7 +12,10 @@ saved beneficiary outputs cannot be redirected later.
 
 This integration is experimental. Local verification does not establish
 production Nitro attestation or replace an independent cryptographic review.
-See [the SDK guide](sdk/README.md) for configuration, coordinated receiving,
+
+Start with [How Sapling contracts work](docs/README.md) for a plain-English
+explanation, an escrow example, payout checks, and backup requirements. See
+[the SDK reference](sdk/README.md) for configuration, coordinated receives,
 and recovery APIs.
 
 ## Use the SDK

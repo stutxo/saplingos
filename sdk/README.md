@@ -5,6 +5,9 @@ Ark wallet with native keys or Sapio-backed program keys, persistence, payment
 operations, and resumable recovery. It does not run an Ark server or expose an
 administrative REST API.
 
+New to the design? Read [How Sapling contracts work](../docs/README.md) for the
+escrow example, emergency exit guarantees, and backup requirements.
+
 ## Open a wallet
 
 Applications supply configuration, secure seed storage, persistence, and an
