@@ -1415,13 +1415,22 @@ fn check_round_matches_participation(
 		(true, None) => BlockHeight::ZERO,
 	};
 
-	for (vtxo, req) in new_vtxos.iter().zip(&part.outputs) {
-		ensure!(vtxo.amount() == req.amount,
-			"unexpected VTXO amount: got {}, expected {}", vtxo.amount(), req.amount,
-		);
-		ensure!(*vtxo.policy() == req.policy,
-			"unexpected VTXO policy: got {:?}, expected {:?}", vtxo.policy(), req.policy,
-		);
+	// The server returns leaves in no specified order. Count each request so
+	// identical requests still require distinct leaves, without changing the
+	// request order used by the participation attestation.
+	let mut expected_outputs = HashMap::with_capacity(part.outputs.len());
+	for req in &part.outputs {
+		*expected_outputs.entry((req.amount, &req.policy)).or_insert(0usize) += 1;
+	}
+
+	for vtxo in new_vtxos {
+		match expected_outputs.get_mut(&(vtxo.amount(), vtxo.policy())) {
+			Some(remaining) if *remaining > 0 => *remaining -= 1,
+			_ => bail!(
+				"unexpected VTXO amount or policy: got {} with {:?}",
+				vtxo.amount(), vtxo.policy(),
+			),
+		}
 
 		// The server chose these tree-level parameters; make sure they match
 		// what we expect before we forfeit our inputs in exchange.
@@ -2801,6 +2810,193 @@ mod test {
 		// entry per cosign keypair, inner Vec is the tree-depth set of
 		// pre-generated nonces.
 		vec![vec![musig::nonce_pair(&key).0, musig::nonce_pair(&key).0]]
+	}
+
+	fn round_request(amount: u64, policy: &VtxoPolicy) -> VtxoRequest {
+		VtxoRequest { amount: Amount::from_sat(amount), policy: policy.clone() }
+	}
+
+	fn round_participation_fixture(
+		version: HashlockVersion,
+		outputs: Vec<VtxoRequest>,
+	) -> (RoundParticipation, Vec<Vtxo<Full>>, Transaction, ArkInfo) {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let user_cosign_key = Keypair::new(&secp, &mut rng);
+		let server_key = Keypair::new(&secp, &mut rng);
+		let server_cosign_key = Keypair::new(&secp, &mut rng);
+		let preimage: UnlockPreimage = rand::random();
+		let (tree, funding_tx) = ark::test_util::build_signed_tree(
+			version, outputs.iter().cloned(),
+			&user_cosign_key, &server_key, &server_cosign_key, UnlockHash::hash(&preimage),
+		);
+		let vtxos = tree.into_cached_tree().output_vtxos().collect::<Vec<_>>();
+		let part = RoundParticipation {
+			// This check only uses the input expiry and exit delta.
+			inputs: vec![vtxos[0].clone()],
+			outputs,
+			unblinded_mailbox_id: None,
+		};
+		#[allow(deprecated)]
+		let ark_info = ArkInfo {
+			network: bitcoin::Network::Regtest,
+			server_pubkey: server_key.public_key(),
+			mailbox_pubkey: server_key.public_key(),
+			round_interval: Duration::from_secs(60),
+			nb_round_nonces: 8,
+			vtxo_exit_delta: vtxos[0].exit_delta(),
+			vtxo_lifetime: BlockDelta::new(1000),
+			htlc_send_expiry_delta: BlockDelta::new(100),
+			htlc_expiry_delta: BlockDelta::new(100),
+			max_vtxo_amount: None,
+			required_board_confirmations: 6,
+			max_user_invoice_cltv_delta: BlockDelta::new(100),
+			min_board_amount: Amount::from_sat(1000),
+			vtxo_expiry_delta: BlockDelta::new(1000),
+			offboard_feerate: bitcoin::FeeRate::ZERO,
+			max_offboard_inputs: 1,
+			ln_receive_anti_dos_required: false,
+			fees: Default::default(),
+			max_vtxo_exit_depth: 10,
+			tos_link: None,
+		};
+		(part, vtxos, funding_tx, ark_info)
+	}
+
+	#[test]
+	fn round_matches_reordered_amounts_and_policies() {
+		let a = VtxoPolicy::new_pubkey(pubkey());
+		let b = VtxoPolicy::new_pubkey(pubkey());
+		let outputs = vec![
+			round_request(10_000, &a), round_request(20_000, &b),
+			round_request(20_000, &a), round_request(10_000, &b),
+		];
+		for version in [HashlockVersion::V0, HashlockVersion::V1] {
+			let (part, mut vtxos, funding_tx, ark_info) =
+				round_participation_fixture(version, outputs.clone());
+			vtxos.rotate_left(1);
+			let saved_part = serde_json::to_vec(&part).unwrap();
+			let saved_vtxos = vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>();
+			check_round_matches_participation(
+				&part, &vtxos, &funding_tx, &ark_info, None,
+				BlockHeight::new(100_000), BlockDelta::new(12),
+			).expect("valid leaves may arrive in any order");
+			assert_eq!(serde_json::to_vec(&part).unwrap(), saved_part);
+			assert_eq!(vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>(), saved_vtxos);
+		}
+	}
+
+	#[test]
+	fn round_matches_identical_requests_only_with_distinct_leaves() {
+		let a = VtxoPolicy::new_pubkey(pubkey());
+		let b = VtxoPolicy::new_pubkey(pubkey());
+		let (part, mut vtxos, funding_tx, ark_info) = round_participation_fixture(
+			HashlockVersion::V1, vec![
+				round_request(10_000, &a), round_request(10_000, &a),
+				round_request(20_000, &b),
+			],
+		);
+		vtxos.reverse();
+		assert_ne!(vtxos[1].id(), vtxos[2].id());
+		check_round_matches_participation(
+			&part, &vtxos, &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12),
+		).expect("identical requests must accept distinct leaves");
+
+		vtxos[2] = vtxos[1].clone();
+		let err = check_round_matches_participation(
+			&part, &vtxos, &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12),
+		).unwrap_err();
+		assert!(err.to_string().contains("duplicate VTXO"), "{err:#}");
+	}
+
+	#[test]
+	fn round_matches_rejects_substituted_output_multisets() {
+		let a = VtxoPolicy::new_pubkey(pubkey());
+		let b = VtxoPolicy::new_pubkey(pubkey());
+		let (mut part, vtxos, funding_tx, ark_info) = round_participation_fixture(
+			HashlockVersion::V1, vec![
+				round_request(10_000, &a), round_request(20_000, &b),
+				round_request(10_000, &a),
+			],
+		);
+		let total = part.total_out().unwrap();
+		for (case, outputs) in [
+			("substituted amounts", vec![
+				round_request(15_000, &a), round_request(15_000, &b), round_request(10_000, &a),
+			]),
+			("substituted policy", vec![
+				round_request(10_000, &a), round_request(20_000, &a), round_request(10_000, &a),
+			]),
+			("wrong multiplicity", vec![
+				round_request(10_000, &a), round_request(20_000, &b), round_request(10_000, &b),
+			]),
+			("wrong amount-policy pairs", vec![
+				round_request(20_000, &a), round_request(10_000, &b), round_request(10_000, &a),
+			]),
+		] {
+			part.outputs = outputs;
+			assert_eq!(part.total_out().unwrap(), total, "{case}");
+			assert_eq!(part.outputs.len(), vtxos.len(), "{case}");
+			let err = check_round_matches_participation(
+				&part, &vtxos, &funding_tx, &ark_info, None,
+				BlockHeight::new(100_000), BlockDelta::new(12),
+			).expect_err(case);
+			assert!(err.to_string().contains("unexpected VTXO amount or policy"), "{case}: {err:#}");
+		}
+	}
+
+	#[test]
+	fn round_matches_rejects_missing_or_extra_outputs() {
+		let policy = VtxoPolicy::new_pubkey(pubkey());
+		let (part, mut vtxos, funding_tx, ark_info) = round_participation_fixture(
+			HashlockVersion::V1, vec![round_request(10_000, &policy); 2],
+		);
+		let missing = check_round_matches_participation(
+			&part, &vtxos[..1], &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12),
+		).unwrap_err();
+		assert!(missing.to_string().contains("unexpected number of VTXOs"), "{missing:#}");
+		vtxos.push(vtxos[0].clone());
+		let extra = check_round_matches_participation(
+			&part, &vtxos, &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12),
+		).unwrap_err();
+		assert!(extra.to_string().contains("unexpected number of VTXOs"), "{extra:#}");
+	}
+
+	#[test]
+	fn round_matches_reordered_outputs_still_checks_tree_parameters() {
+		let policy = VtxoPolicy::new_pubkey(pubkey());
+		let (part, mut vtxos, funding_tx, ark_info) = round_participation_fixture(
+			HashlockVersion::V1, vec![
+				round_request(10_000, &policy), round_request(20_000, &policy),
+			],
+		);
+		vtxos.reverse();
+		check_round_matches_participation(
+			&part, &vtxos, &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12),
+		).unwrap();
+		let mut wrong_server = ark_info.clone();
+		wrong_server.server_pubkey = pubkey();
+		let mut wrong_delta = ark_info.clone();
+		wrong_delta.vtxo_exit_delta = ark_info.vtxo_exit_delta + BlockDelta::new(1);
+		for info in [&wrong_server, &wrong_delta] {
+			assert!(check_round_matches_participation(
+				&part, &vtxos, &funding_tx, info, None,
+				BlockHeight::new(100_000), BlockDelta::new(12),
+			).is_err());
+		}
+		assert!(check_round_matches_participation(
+			&part, &vtxos, &funding_tx, &ark_info, Some(BlockHeight::new(101_000)),
+			BlockHeight::new(100_000), BlockDelta::new(12),
+		).is_err(), "outputs must outlive the scheduled height");
+		assert!(check_round_matches_participation(
+			&part, &vtxos, &funding_tx, &ark_info, None,
+			BlockHeight::new(100_953), BlockDelta::new(12),
+		).is_err(), "unexpired inputs require exitable outputs");
 	}
 
 	#[test]

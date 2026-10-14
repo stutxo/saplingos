@@ -670,8 +670,18 @@ impl ChainSource {
 				}
 			},
 			ChainSourceClient::Esplora(client) => {
-				client.broadcast(tx).await?;
-				Ok(())
+				match client.broadcast(tx).await {
+					Ok(()) => Ok(()),
+					Err(error) => {
+						// A replay can fail after the transaction is already confirmed.
+						// Only independent readback of this exact txid proves success.
+						let txid = tx.compute_txid();
+						match client.get_tx(&txid).await {
+							Ok(Some(known)) if known.compute_txid() == txid => Ok(()),
+							_ => Err(error.into()),
+						}
+					},
+				}
 			},
 		}
 	}
@@ -1058,6 +1068,149 @@ fn classify_submit_package_errors<'a>(
 mod test {
 	use super::*;
 	use std::str::FromStr;
+
+	#[cfg(not(target_arch = "wasm32"))]
+	mod esplora_broadcast {
+		use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+		use tokio::sync::oneshot;
+
+		use super::*;
+
+		const DUPLICATE: &str = "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction outputs already in utxo set\"}";
+		const REJECTED: &str = "sendrawtransaction RPC error: max-fee-exceeded";
+
+		// Serve fixed chain data, not an echo of the submitted transaction.
+		// The genesis transaction is already confirmed and has a known txid.
+		async fn broadcast(
+			status: u16, message: &str, readback: Option<(u16, Vec<u8>)>,
+		) -> anyhow::Result<()> {
+			let tx = genesis_block(Network::Bitcoin).txdata.remove(0);
+			let txid = tx.compute_txid();
+			let raw_path = format!("GET /tx/{}/raw HTTP/1.1", txid);
+			let mut expected = vec!["POST /tx HTTP/1.1".to_owned()];
+			if readback.is_some() {
+				expected.push(raw_path.clone());
+			}
+			let tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
+			let message = message.as_bytes().to_vec();
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let url = format!("http://{}", listener.local_addr().unwrap());
+			let (stop, mut stopped) = oneshot::channel::<()>();
+			let server = tokio::spawn(async move {
+				let mut requests = Vec::new();
+				loop {
+					let (socket, _) = tokio::select! {
+						socket = listener.accept() => socket.unwrap(),
+						_ = &mut stopped => break,
+					};
+					let mut socket = BufReader::new(socket);
+					let mut line = String::new();
+					socket.read_line(&mut line).await.unwrap();
+					let request = line.trim_end().to_owned();
+					let mut content_length = 0;
+					loop {
+						line.clear();
+						assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+						if line == "\r\n" {
+							break;
+						}
+						if let Some((name, value)) = line.split_once(':') {
+							if name.eq_ignore_ascii_case("content-length") {
+								content_length = value.trim().parse::<usize>().unwrap();
+							}
+						}
+					}
+					let mut body = vec![0; content_length];
+					socket.read_exact(&mut body).await.unwrap();
+					let (status, response) = if request == "POST /tx HTTP/1.1" {
+						assert_eq!(body, tx_hex.as_bytes());
+						(status, &message)
+					} else {
+						assert_eq!(request, raw_path);
+						assert!(body.is_empty());
+						let (status, response) = readback.as_ref()
+							.expect("successful broadcast must not read back");
+						(*status, response)
+					};
+					requests.push(request);
+					socket.write_all(format!(
+						"HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+						status, response.len(),
+					).as_bytes()).await.unwrap();
+					socket.write_all(response).await.unwrap();
+					socket.shutdown().await.unwrap();
+				}
+				requests
+			});
+			let fee = FeeRate::BROADCAST_MIN;
+			let chain = ChainSource {
+				inner: ChainSourceClient::Esplora(
+					esplora_client::Builder::new(&url).max_retries(0).timeout(5)
+						.build_async().unwrap(),
+				),
+				network: Network::Bitcoin,
+				zmq_endpoint: None,
+				fee_rates: RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee }),
+				fee_rates_fetched_at: RwLock::new(None),
+				tip_cache: RwLock::new(None),
+			};
+			let result = chain.broadcast_tx(&tx).await;
+			let _ = stop.send(());
+			assert_eq!(server.await.unwrap(), expected);
+			result
+		}
+
+		fn assert_original_error(result: anyhow::Result<()>, message: &str) {
+			let error = result.unwrap_err();
+			match error.downcast_ref::<esplora_client::Error>().unwrap() {
+				esplora_client::Error::HttpResponse { status, message: actual } => {
+					assert_eq!(*status, 400);
+					assert_eq!(actual, message);
+				},
+				error => panic!("expected original broadcast failure, got {:?}", error),
+			}
+		}
+
+		#[tokio::test]
+		async fn confirmed_duplicate_succeeds_after_exact_transaction_readback() {
+			let raw = bitcoin::consensus::serialize(&genesis_block(Network::Bitcoin).txdata[0]);
+			broadcast(400, DUPLICATE, Some((200, raw))).await.unwrap();
+		}
+
+		#[tokio::test]
+		async fn verified_readback_does_not_depend_on_broadcast_error_text() {
+			let raw = bitcoin::consensus::serialize(&genesis_block(Network::Bitcoin).txdata[0]);
+			broadcast(502, "upstream response lost", Some((200, raw))).await.unwrap();
+		}
+
+		#[tokio::test]
+		async fn successful_broadcast_does_not_read_back() {
+			broadcast(200, "accepted", None).await.unwrap();
+		}
+
+		#[tokio::test]
+		async fn rejected_transaction_preserves_original_broadcast_error() {
+			assert_original_error(
+				broadcast(400, REJECTED, Some((404, b"Transaction not found".to_vec()))).await,
+				REJECTED,
+			);
+		}
+
+		#[tokio::test]
+		async fn failed_or_ambiguous_readback_preserves_original_broadcast_error() {
+			let mut different_tx = genesis_block(Network::Bitcoin).txdata.remove(0);
+			different_tx.lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+			for readback in [
+				(404, b"Transaction not found".to_vec()),
+				(503, b"readback unavailable".to_vec()),
+				(200, b"not a transaction".to_vec()),
+				(200, bitcoin::consensus::serialize(&different_tx)),
+			] {
+				assert_original_error(broadcast(400, DUPLICATE, Some(readback)).await, DUPLICATE);
+			}
+		}
+	}
 
 	#[test]
 	fn classify_package_errors_attributes_root_cause_in_package_order() {

@@ -76,6 +76,18 @@ supplying its own persistence must also choose a lock manager whose scope
 matches its deployment; native persisted wallets use their data directory for
 cross-process coordination.
 
+Delegated rounds can return VTXOs in a different order from the output requests.
+The SDK checks the exact amounts, policies, and number of each requested output.
+Each output must have a distinct VTXO ID and pass the tree and expiry checks.
+The saved participation order does not change.
+
+An Esplora broadcast can fail after the transaction has already confirmed.
+After a broadcast error, the SDK fetches the transaction by its computed ID.
+It accepts the replay only if the returned transaction has that same ID.
+If the lookup fails or returns no matching transaction, the original broadcast
+error remains. This lets a saved offboard resume without a replacement payment
+or a manual change to its input locks.
+
 The `simple_setup` example opens an existing configured signet wallet using
 `SAPLING_DATADIR` and `SAPLING_MNEMONIC`. It never prints the seed phrase.
 Production applications should use their own protected seed storage rather
