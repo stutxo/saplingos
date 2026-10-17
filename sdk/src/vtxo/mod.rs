@@ -579,4 +579,37 @@ mod test {
 		assert_eq!(decoded, good);
 		decoded.into_unsigned_tree(bitcoin::OutPoint::null());
 	}
+
+	/// The aggregate cosign nonces arrive from the server; their count must
+	/// be bound to the tree before they are indexed by internal node.
+	#[test]
+	fn cosign_branch_rejects_truncated_agg_nonces() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let server_key = Keypair::new(&secp, &mut rng);
+		let cosign_key = Keypair::new(&secp, &mut rng);
+
+		let spec = hostile_spec(server_key.public_key(),
+			vec![hostile_leaf(server_key.public_key(), Amount::from_sat(100_000), Some(cosign_key.public_key())),
+				hostile_leaf(server_key.public_key(), Amount::from_sat(50_000), Some(cosign_key.public_key()))],
+			vec![server_key.public_key()],
+		);
+		assert_eq!(spec.nb_internal_nodes(), 1);
+		let unsigned = spec.into_unsigned_tree(bitcoin::OutPoint::null());
+
+		// an empty aggregate nonce list is an ordinary error, not a panic
+		let err = unsigned.cosign_branch(&[], 0, &cosign_key, vec![])
+			.expect_err("truncated aggregate nonce list must be rejected");
+		assert!(matches!(
+			err, ark::error::CosignBranchError::InvalidNonceCount { expected: 1, provided: 0 },
+		), "unexpected error: {err}");
+
+		// control: the right number of nonces signs fine
+		let (sec_nonce, pub_nonce) = ark::musig::nonce_pair(&cosign_key);
+		let (_gsec, gpub_nonce) = ark::musig::nonce_pair(&server_key);
+		let agg_nonce = ark::musig::nonce_agg(&[&pub_nonce, &gpub_nonce]);
+		let sigs = unsigned.cosign_branch(&[agg_nonce], 0, &cosign_key, vec![sec_nonce])
+			.expect("cosigning with the correct nonce count");
+		assert_eq!(sigs.len(), 1);
+	}
 }

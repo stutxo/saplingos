@@ -17,7 +17,7 @@ use crate::{musig, scripts, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy, VtxoRequ
 use crate::encode::{
 	LengthPrefixedVector, OversizedVectorError, ProtocolDecodingError, ProtocolEncoding, ReadExt, WriteExt
 };
-use crate::error::IncorrectSigningKeyError;
+use crate::error::{CosignBranchError, IncorrectSigningKeyError};
 use crate::musig::context::{SigningContextError, SigningInput};
 use crate::tree::{self, Tree};
 use crate::vtxo::{self, Full, GenesisItem, GenesisTransition, HarkLeafVtxoPolicy, MaybePreimage, ServerVtxo, TapScriptClause};
@@ -621,13 +621,22 @@ impl UnsignedVtxoTree {
 		leaf_idx: usize,
 		cosign_key: &Keypair,
 		cosign_sec_nonces: Vec<SecretNonce>,
-	) -> Result<Vec<PartialSignature>, IncorrectSigningKeyError> {
+	) -> Result<Vec<PartialSignature>, CosignBranchError> {
+		// The aggregate nonces come from the (untrusted) server; they are
+		// indexed by internal node below, so bind their count to the tree
+		// before doing anything else.
+		if cosign_agg_nonces.len() != self.nb_internal_nodes() {
+			return Err(CosignBranchError::InvalidNonceCount {
+				expected: self.nb_internal_nodes(),
+				provided: cosign_agg_nonces.len(),
+			});
+		}
 		let req = self.spec.vtxos.get(leaf_idx).expect("leaf idx out of bounds");
 		if Some(cosign_key.public_key()) != req.cosign_pubkey {
 			return Err(IncorrectSigningKeyError {
 				required: req.cosign_pubkey,
 				provided: cosign_key.public_key(),
-			});
+			}.into());
 		}
 
 		let mut nonce_iter = cosign_sec_nonces.into_iter().enumerate();
@@ -2678,6 +2687,51 @@ mod test {
 			).unwrap(),
 		};
 		VtxoTreeSpec::new(vec![leaf], pk, BlockHeight::new(100_000), BlockDelta::new(2016), vec![pk]);
+	}
+
+	#[test]
+	fn cosign_branch_rejects_truncated_agg_nonces() {
+		let secp = secp256k1::Secp256k1::new();
+		let mut rand = rand::rngs::StdRng::seed_from_u64(43);
+		let server_key = Keypair::new(&secp, &mut rand);
+		let cosign_key = Keypair::new(&secp, &mut rand);
+		let user_key = Keypair::new(&secp, &mut rand);
+		let hash = sha256::Hash::from_byte_array(rand.r#gen());
+
+		let leaf = || VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(100_000),
+				policy: VtxoPolicy::new_pubkey(user_key.public_key()),
+			},
+			cosign_pubkey: Some(cosign_key.public_key()),
+			unlock_hash: hash,
+		};
+		let spec = VtxoTreeSpec::new(
+			vec![leaf(), leaf()],
+			server_key.public_key(),
+			BlockHeight::new(101_000),
+			BlockDelta::new(2016),
+			vec![server_key.public_key()],
+		);
+		assert_eq!(spec.nb_internal_nodes(), 1);
+		let unsigned = spec.into_unsigned_tree(OutPoint::null());
+
+		// an empty aggregate nonce list has to be rejected as an ordinary
+		// error, not indexed out of bounds
+		let err = unsigned.cosign_branch(&[], 0, &cosign_key, vec![])
+			.expect_err("truncated aggregate nonce list must be rejected");
+		assert!(
+			matches!(err, CosignBranchError::InvalidNonceCount { expected: 1, provided: 0 }),
+			"unexpected error: {err}",
+		);
+
+		// control: the right number of aggregate nonces signs fine
+		let (sec_nonce, pub_nonce) = musig::nonce_pair(&cosign_key);
+		let (_gsec, gpub_nonce) = musig::nonce_pair(&server_key);
+		let agg_nonce = musig::nonce_agg(&[&pub_nonce, &gpub_nonce]);
+		let sigs = unsigned.cosign_branch(&[agg_nonce], 0, &cosign_key, vec![sec_nonce])
+			.expect("cosigning with the correct nonce count");
+		assert_eq!(sigs.len(), 1);
 	}
 
 	#[test]
