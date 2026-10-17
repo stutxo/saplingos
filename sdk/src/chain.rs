@@ -62,6 +62,8 @@ const MIN_BITCOIND_VERSION: usize = 290000;
 /// Notes:
 /// - For [ChainSourceSpec::Bitcoind], authentication must be provided (cookie file or user/pass)
 ///   and the node must run with `txindex=1`.
+/// - [ChainSourceSpec::Bitcoind] does not support the SOCKS5 proxy option; [ChainSource::new]
+///   fails closed when a proxy is supplied rather than silently bypassing it.
 #[derive(Clone, Debug)]
 pub enum ChainSourceSpec {
 	Bitcoind {
@@ -155,8 +157,10 @@ impl ChainSourceClient {
 /// };
 /// let network = Network::Bitcoin;
 /// let fallback_fee = FeeRate::from_sat_per_vb(5);
+/// // The bitcoind backend has no proxy support and fails closed when one is
+/// // supplied; only the Esplora backend honours `socks5-proxy`.
 /// #[cfg(feature = "socks5-proxy")]
-/// let socks5 = Some("socks5h://127.0.0.1:9050");
+/// let socks5 = None;
 ///
 /// let instance = ChainSource::new(
 ///     spec, network, fallback_fee,
@@ -273,15 +277,23 @@ impl ChainSource {
 		let (inner, zmq_endpoint) = match spec {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceSpec::Bitcoind { url, auth, zmq } => {
+				// Neither the sync companion (`bitcoincore_rpc`) nor
+				// `bitcoind-async-client` can route through a SOCKS5 proxy, so
+				// we fail closed: silently bypassing a configured proxy would
+				// deanonymize the operator. The Esplora backend does honour
+				// `socks5-proxy`.
+				#[cfg(feature = "socks5-proxy")]
+				if proxy.is_some() {
+					bail!(
+						"the bitcoind backend does not support SOCKS5 proxies; refusing to \
+						 start with a proxy configured rather than silently bypassing it"
+					);
+				}
 				// `bdk_bitcoind_rpc::Emitter` is sync-only upstream, so we keep
 				// a sync companion to drive it inside `spawn_blocking`. The async
 				// client is used everywhere else. `BitcoinRpcClient` (rather
 				// than the bare `bitcoincore_rpc::Client`) is required so the
 				// `spawn_blocking` closure can take an owned, `Clone` value.
-				//
-				// The sync companion currently does not honour `socks5-proxy`;
-				// SOCKS5 is supported on the Esplora backend, where it is the
-				// realistic Tor-via-bitcoind use case.
 				let sync = BitcoinRpcClient::new(&url, auth.clone())
 					.context("failed to create sync bitcoind rpc client")?;
 				let async_auth = match auth {
@@ -1266,5 +1278,23 @@ mod test {
 			(child, None),
 		].into_iter(), &order);
 		assert!(matches!(res, BroadcastError::Other(ref s) if s.contains("package-mempool-limits")));
+	}
+
+	/// The bitcoind RPC clients (sync companion and async client alike) cannot
+	/// route through a SOCKS5 proxy, so construction must fail closed instead of
+	/// silently bypassing a proxy the operator configured for privacy.
+	#[cfg(all(feature = "socks5-proxy", feature = "bitcoind-rpc"))]
+	#[tokio::test]
+	async fn bitcoind_backend_rejects_configured_proxy() {
+		let spec = ChainSourceSpec::Bitcoind {
+			url: "http://bitcoind.invalid:8332".into(),
+			auth: rpc::Auth::UserPass("user".into(), "password".into()),
+			zmq: None,
+		};
+		let result = ChainSource::new(
+			spec, Network::Regtest, None, Some("socks5h://127.0.0.1:9050"),
+		).await;
+		let err = result.err().expect("bitcoind with a proxy must fail closed");
+		assert!(err.to_string().contains("proxy"), "unexpected error: {}", err);
 	}
 }
