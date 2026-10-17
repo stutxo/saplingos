@@ -970,6 +970,12 @@ impl Wallet {
 					tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
 						"failed to create datadir at {}", datadir.display(),
 					))?;
+					// The datadir holds the wallet db and other secrets:
+					// keep other local users out of it from the start.
+					// No-op on non-unix platforms.
+					crate::fs_perms::harden(datadir, 0o700).with_context(|| format!(
+						"failed to harden datadir at {}", datadir.display(),
+					))?;
 				}
 			}
 			crate::persist::platform_default(args.datadir.as_ref(), Some(fingerprint)).await
