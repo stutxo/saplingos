@@ -5,6 +5,7 @@ mod receive;
 pub use self::pay::LightningSendOptions;
 
 use std::net::IpAddr;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use anyhow::Context;
@@ -34,7 +35,9 @@ pub(crate) fn lightning_wallet_proxy(config: &crate::Config) -> Option<&str> {
 /// Per-request timeout for LNURL-pay HTTP exchanges (initial resolution and
 /// invoice callback), matching the wallet's other bounded HTTP transports
 /// (`sapio::client::HTTP_TIMEOUT_SECS`). A payee endpoint must not be able
-/// to stall a payment task indefinitely.
+/// to stall a payment task indefinitely. Native targets only: the wasm32
+/// fetch path cannot enforce it (see the wasm32 lnurl_pay_resolve).
+#[cfg(not(target_arch = "wasm32"))]
 const LNURL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hard cap on LNURL-pay response bodies, read incrementally before any
@@ -59,9 +62,13 @@ const LNURL_MAX_BODY: usize = 64 * 1024;
 ///   (proxied or not), so resolution cannot be abused as a blind GET oracle
 ///   against internal services of the wallet host.
 ///
-/// Hostnames cannot be classified without DNS; when the socks5h proxy is
-/// configured it resolves names remotely, which also keeps internal names
-/// unreachable from this path.
+/// Only literal IPs are filtered here: an unproxied *hostname* that
+/// resolves (via DNS) to a private or internal address is NOT mitigated,
+/// because no name resolution happens at validation time. When the socks5h
+/// proxy is configured it resolves names remotely from the proxy's vantage
+/// point, which keeps the wallet host's internal names unreachable from
+/// this path; operators paying arbitrary LNURLs from hosts with internal
+/// reachability should therefore configure the proxy.
 fn validate_lnurl_destination(url: &str, has_proxy: bool) -> anyhow::Result<()> {
 	let url = reqwest::Url::parse(url).context("invalid lnurl url")?;
 	ensure!(url.username().is_empty() && url.password().is_none(),
@@ -88,7 +95,8 @@ fn validate_lnurl_destination(url: &str, has_proxy: bool) -> anyhow::Result<()> 
 		let non_public = match ip {
 			IpAddr::V4(v4) => v4.is_private() || v4.is_loopback()
 				|| v4.is_link_local() || v4.is_unspecified(),
-			IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+			IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified()
+				|| v6.is_unique_local() || v6.is_unicast_link_local(),
 		};
 		ensure!(!non_public, "lnurl url targets a non-public address");
 	}
@@ -210,10 +218,20 @@ async fn lnurl_pay_resolve(
 	Ok((resp, invoice.pr))
 }
 
-/// wasm counterpart of [`lnurl_pay_resolve`]: browsers already mediate
-/// redirects, mixed content and proxies, so the fetch goes through lnurl-rs;
-/// the destination policy in [`validate_lnurl_destination`] still applies to
-/// both URLs.
+/// wasm32 counterpart of the native lnurl_pay_resolve. WEAKER THAN THE
+/// NATIVE PATH.
+///
+/// The fetch still goes through lnurl-rs because reqwest's wasm builder
+/// exposes no timeout/redirect/proxy controls: on wasm32 lnurl-rs 0.10
+/// honors neither `Builder::timeout` nor `Builder::proxy` (they are only
+/// applied on native targets), payee response bodies are buffered
+/// unbounded, and cross-origin redirects are followed by the browser's own
+/// fetch machinery (which does mediate mixed content and cross-origin
+/// requests per browser policy). What is enforced on every target,
+/// including this one, is the destination policy in
+/// [`validate_lnurl_destination`] for both the initial URL and the
+/// payee-chosen callback. Do not widen the doc language of the callers
+/// beyond this.
 #[cfg(target_arch = "wasm32")]
 async fn lnurl_pay_resolve(
 	lnurlp: &str,
@@ -222,8 +240,7 @@ async fn lnurl_pay_resolve(
 	wallet_proxy: Option<&str>,
 ) -> anyhow::Result<(PayResponse, String)> {
 	let _ = wallet_proxy;
-	let client = lnurllib::Builder::default().timeout(LNURL_TIMEOUT.as_secs())
-		.build_async().context("lnurl client error")?;
+	let client = lnurllib::Builder::default().build_async().context("lnurl client error")?;
 	let resp = match client.make_request(lnurlp).await.context("failed to make lnurl request")? {
 		LnUrlResponse::LnUrlPayResponse(v) => v,
 		LnUrlResponse::LnUrlWithdrawResponse(_) => bail!("received lnurl withdraw"),
@@ -276,12 +293,19 @@ fn verify_lnurlp_invoice(
 ///
 /// `wallet_proxy` is the wallet's configured socks5h proxy
 /// ([`Config::socks5_proxy`]); when set, both LNURL fetches are routed
-/// through it like the wallet's other network traffic.
+/// through it like the wallet's other network traffic (native targets only;
+/// the wasm32 fetch path cannot honor it).
 ///
 /// Both the initial URL and the payee-chosen invoice callback are validated
 /// against [`validate_lnurl_destination`] (https-only except `.onion` via
-/// the proxy, no credentials, no non-public IP destinations) and fetched
-/// with a bounded, non-redirecting client before any invoice is returned.
+/// the proxy, no credentials, no non-public IP destinations). On native
+/// targets both are then fetched with a bounded, non-redirecting client —
+/// hard per-request timeout, incremental body cap before JSON decode, no
+/// redirect following — before any invoice is returned. On wasm32 only the
+/// destination policy is enforced: the fetch uses the browser's own
+/// networking, which mediates redirects and mixed content itself but gets
+/// no LNURL-specific timeout, body cap or proxy (see the wasm32
+/// `lnurl_pay_resolve`).
 ///
 /// Returns an error if the endpoint resolves to a non-pay LNURL response
 /// (withdraw, channel), if a URL fails the destination policy, if the HTTP
@@ -348,6 +372,9 @@ mod test {
 			"https://0.0.0.0/",
 			"https://[::1]/callback",
 			"https://[::]/callback",
+			// IPv6 ULA and link-local literals are equally internal
+			"https://[fd00::1]/internal",
+			"https://[fe80::1]/",
 			// IPv4-mapped IPv6 forms must not bypass the IPv4 checks
 			"https://[::ffff:127.0.0.1]/callback",
 			"https://[::ffff:169.254.169.254]/",
