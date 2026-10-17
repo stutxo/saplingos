@@ -49,18 +49,29 @@ use crate::vtxo::VtxoValidationError;
 /// only happen for users with more than 1000 pending items.)
 pub(crate) const MAX_MAILBOX_REQUEST_BURST: usize = 10;
 
-/// The largest advance over the current cursor that one message's
-/// server-claimed checkpoint may effect before we refuse to persist it.
+/// Number of low bits in a server mailbox checkpoint that hold a
+/// per-millisecond counter; the upper bits are milliseconds since the Unix
+/// epoch.
 ///
-/// The server stamps each message with a "strictly ascending time based
-/// number" (mailbox_server.proto) and pages at most 100 messages per fetch
-/// (see [MAX_MAILBOX_REQUEST_BURST]), so no burst of legitimately delivered
-/// messages can justify a bigger jump. Bounding the advance stops a
-/// malicious or malfunctioning server from persisting an arbitrary
-/// far-future cursor (e.g. `u64::MAX`) with a single empty message, which
-/// would black out every later message: all fetches request messages
+/// The checkpoint shape is defined by the server: captaind's migrations
+/// V21/V37 build `next_checkpoint()` as `(unix_ms << 20) | per_ms_counter`,
+/// i.e. one global, time-shifted sequence — the "strictly ascending time
+/// based number" of mailbox_server.proto. Two stamps taken a millisecond
+/// apart already differ by 2^20, and a fresh wallet's first claim lands at
+/// roughly time-now-shifted (~1.9e18) while its cursor is still 0, so no
+/// fixed count-based advance bound can ever work against an honest server;
+/// plausibility can only be judged against wall time.
+pub(crate) const MAILBOX_CHECKPOINT_COUNTER_BITS: u32 = 20;
+
+/// How far into the future a server-claimed checkpoint may be timestamped
+/// before we refuse to persist it.
+///
+/// 24h absorbs clock drift and timezone misconfiguration on either side
+/// while still rejecting far-future poison values (e.g. `u64::MAX - 7`),
+/// which would black out every later message: all fetches request messages
 /// strictly after the stored checkpoint.
-pub(crate) const MAX_MAILBOX_CHECKPOINT_ADVANCE: u64 = 1000;
+pub(crate) const MAX_MAILBOX_CHECKPOINT_FUTURE_SKEW: std::time::Duration =
+	std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -172,11 +183,12 @@ enum CheckpointVerdict {
 /// Vet a server-claimed mailbox checkpoint against the freshly read cursor
 /// before it becomes the durable fetch position.
 ///
-/// The claimed value is server-controlled input. Rejecting implausible
-/// jumps keeps one `MailboxMessage{checkpoint: huge, arkoor vtxos: []}`
-/// (fully valid, unrefusable content) from poisoning the cursor and
-/// blacking out every later message; [MAX_MAILBOX_CHECKPOINT_ADVANCE]
-/// documents the bound. Claims at or below the cursor are not errors: the
+/// The claimed value is server-controlled input. Rejecting claims whose
+/// embedded timestamp (see [MAILBOX_CHECKPOINT_COUNTER_BITS]) lies
+/// implausibly far in the future (see [MAX_MAILBOX_CHECKPOINT_FUTURE_SKEW])
+/// keeps one `MailboxMessage{checkpoint: huge, arkoor vtxos: []}` — fully
+/// valid, unrefusable content — from poisoning the cursor and blacking out
+/// every later message. Claims at or below the cursor are not errors: the
 /// position is already covered (see [CheckpointVerdict::AlreadyCovered]),
 /// and the persisters independently refuse non-increasing stores.
 fn vet_server_checkpoint(
@@ -186,12 +198,15 @@ fn vet_server_checkpoint(
 	if claimed <= current {
 		return Ok(CheckpointVerdict::AlreadyCovered);
 	}
+	let claimed_ms = claimed >> MAILBOX_CHECKPOINT_COUNTER_BITS;
+	let limit_ms = chrono::Local::now().timestamp_millis() as u64
+		+ MAX_MAILBOX_CHECKPOINT_FUTURE_SKEW.as_millis() as u64;
 	anyhow::ensure!(
-		claimed - current <= MAX_MAILBOX_CHECKPOINT_ADVANCE,
-		"server-claimed mailbox checkpoint {claimed} jumps {jump} past the stored \
-			cursor {current}, more than the {MAX_MAILBOX_CHECKPOINT_ADVANCE} the \
-			delivered messages can justify; refusing to persist it",
-		jump = claimed - current,
+		claimed_ms <= limit_ms,
+		"server-claimed mailbox checkpoint {claimed} is timestamped {} ms in the \
+			future, beyond the allowed skew; refusing to persist a cursor the wallet \
+			would never fetch past",
+		claimed_ms.saturating_sub(limit_ms),
 	);
 	Ok(CheckpointVerdict::Advance)
 }
@@ -980,40 +995,52 @@ mod test {
 			.expect_err("a missing anchor must abort, not be absorbed");
 	}
 
-	/// The server-stamped checkpoint is untrusted input: only persist
-	/// advances the delivered messages can justify, and never rewind.
+	/// The server-stamped checkpoint is untrusted input: persist only
+	/// advances whose embedded timestamp is plausible (captaind stamps
+	/// checkpoints as `(unix_ms << 20) | per_ms_counter`), and never rewind.
 	#[test]
 	fn server_checkpoint_vetting() {
-		// Normal forward progress.
-		assert_eq!(vet_server_checkpoint(0, 1).unwrap(), CheckpointVerdict::Advance);
-		assert_eq!(vet_server_checkpoint(7, 8).unwrap(), CheckpointVerdict::Advance);
+		let shift = |ms: u64, counter: u64| (ms << MAILBOX_CHECKPOINT_COUNTER_BITS) | counter;
+		let now_ms = chrono::Local::now().timestamp_millis() as u64;
 
-		// The largest jump a full fetch burst can justify is accepted...
+		// A fresh wallet's cursor is 0 while the first honest claim is
+		// time-now-shifted (~1.9e18): that jump over the cursor must pass.
 		assert_eq!(
-			vet_server_checkpoint(100, 100 + MAX_MAILBOX_CHECKPOINT_ADVANCE).unwrap(),
+			vet_server_checkpoint(0, shift(now_ms, 0)).unwrap(),
 			CheckpointVerdict::Advance,
 		);
-		// ...anything larger is refused as a server protocol violation,
-		// including the absurd far-future values used to black out delivery.
-		assert!(vet_server_checkpoint(100, 101 + MAX_MAILBOX_CHECKPOINT_ADVANCE).is_err());
-		assert!(vet_server_checkpoint(7, u64::MAX).is_err());
-		assert!(vet_server_checkpoint(0, 9_000_000_000_000_000_000).is_err());
+
+		// Two stamps a millisecond apart differ by 2^20 and both must
+		// advance over the previous one.
+		let first = shift(now_ms, 3);
+		let second = shift(now_ms + 1, 0);
+		assert!(second > first);
+		assert_eq!(
+			vet_server_checkpoint(first, second).unwrap(),
+			CheckpointVerdict::Advance,
+		);
+
+		// A stamp slightly ahead of local time (clock skew both sides) is
+		// accepted.
+		assert_eq!(
+			vet_server_checkpoint(0, shift(now_ms + 60_000, 7)).unwrap(),
+			CheckpointVerdict::Advance,
+		);
+
+		// Far-future claims are refused as a server protocol violation,
+		// including the u64-range poison values from the attack scenario.
+		assert!(vet_server_checkpoint(first, u64::MAX - 7).is_err());
+		assert!(vet_server_checkpoint(0, shift(now_ms, 0).wrapping_mul(2)).is_err());
+		assert!(
+			vet_server_checkpoint(0, shift(now_ms + 2 * 24 * 60 * 60 * 1000, 0)).is_err(),
+			"a claim two days ahead exceeds the allowed skew",
+		);
 
 		// Equal or lower claims are already covered by the stored cursor
 		// (a racing consumer stored them first): nothing to persist, no
-		// error, and no rewind.
-		assert_eq!(vet_server_checkpoint(100, 100).unwrap(), CheckpointVerdict::AlreadyCovered);
-		assert_eq!(vet_server_checkpoint(100, 50).unwrap(), CheckpointVerdict::AlreadyCovered);
-
-		// Arithmetic near u64::MAX must not overflow.
-		assert_eq!(
-			vet_server_checkpoint(u64::MAX, u64::MAX).unwrap(),
-			CheckpointVerdict::AlreadyCovered,
-		);
-		assert_eq!(
-			vet_server_checkpoint(u64::MAX - 1, u64::MAX).unwrap(),
-			CheckpointVerdict::Advance,
-		);
-		assert!(vet_server_checkpoint(u64::MAX - MAX_MAILBOX_CHECKPOINT_ADVANCE - 1, u64::MAX).is_err());
+		// error, and no rewind — also at the numeric edge.
+		assert_eq!(vet_server_checkpoint(second, second).unwrap(), CheckpointVerdict::AlreadyCovered);
+		assert_eq!(vet_server_checkpoint(second, first).unwrap(), CheckpointVerdict::AlreadyCovered);
+		assert_eq!(vet_server_checkpoint(u64::MAX, u64::MAX).unwrap(), CheckpointVerdict::AlreadyCovered);
 	}
 }

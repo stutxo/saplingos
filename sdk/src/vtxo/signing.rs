@@ -57,6 +57,10 @@ impl Wallet {
 			return Ok(false);
 		}
 		Ok(match clause {
+			// Key-possession clauses sign with the wallet key alone.
+			VtxoClause::DelayedSign(_)
+			| VtxoClause::DelayedTimelockSign(_)
+			| VtxoClause::TimelockSign(_) => true,
 			// Hash-delay clauses additionally need the receive preimage.
 			VtxoClause::HashDelaySign(c) =>
 				self.lightning_receive_preimage(c.hash.into()).await?.is_some(),
@@ -64,7 +68,6 @@ impl Wallet {
 				self.lightning_receive_preimage(c.hash.into()).await?.is_some(),
 			// The wallet never signs these (see witness()).
 			VtxoClause::HashSign(_) | VtxoClause::HashSign_v0(_) => false,
-			_ => true,
 		})
 	}
 }
