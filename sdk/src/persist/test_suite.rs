@@ -98,6 +98,7 @@ macro_rules! bark_persister_tests {
 			test_remove_vtxo,
 			test_has_spent_vtxo,
 			test_store_vtxos_idempotent,
+			test_store_vtxos_existing_record_is_strict_noop,
 			test_steal_lock_to_spent,
 			test_steal_lock,
 
@@ -767,6 +768,38 @@ pub async fn test_store_vtxos_idempotent(db: &impl WalletPersister) {
 	assert_eq!(stored.state, VtxoState::Spendable, "the state survives a repeated store");
 	assert_eq!(db.get_all_vtxos().await.expect("get_all_vtxos").len(), 1,
 		"a repeated store must not insert a second row");
+}
+
+pub async fn test_store_vtxos_existing_record_is_strict_noop(db: &impl WalletPersister) {
+	let locked = &VTXO_VECTORS.board_vtxo;
+	let held = VtxoState::Locked { holder: Some(MovementId::new(1).into()) };
+	db.store_vtxos(&[(locked, &held)]).await.expect("initial store_vtxos");
+	db.mark_vtxos_registered(&[locked.id()]).await.expect("mark_vtxos_registered");
+
+	// A stale retry from a re-driven/recovered flow must be a strict no-op
+	// for the existing record: the current state, the signed bytes and the
+	// monotonic registered flag all survive unchanged on every backend.
+	db.store_vtxos(&[(locked, &VtxoState::Spendable)]).await.expect("stale live retry");
+	let stored = db.get_wallet_vtxo(locked.id()).await.expect("get_wallet_vtxo").unwrap();
+	assert_eq!(stored.state, held, "stale retry must not regress a Locked state");
+	assert!(stored.registered, "stale retry must not reset the registered flag");
+	assert!(db.get_unregistered_vtxo_ids().await.unwrap().is_empty(),
+		"a registered vtxo must not re-enter the unregistered listing");
+	assert_eq!(db.get_full_vtxo(locked.id()).await.unwrap().as_ref(), Some(locked),
+		"stale retry must not touch the signed bytes");
+
+	// A same-state retry must not reset the registered flag either.
+	db.store_vtxos(&[(locked, &held)]).await.expect("same-state retry");
+	assert!(db.get_wallet_vtxo(locked.id()).await.unwrap().unwrap().registered,
+		"same-state retry must not reset the registered flag");
+
+	// Terminal direction: a live replay over a terminal record is a silent
+	// no-op (SQLite INSERT OR IGNORE parity), preserving the terminal state.
+	let spent = &VTXO_VECTORS.round1_vtxo;
+	db.store_vtxos(&[(spent, &VtxoState::Spent)]).await.expect("store spent");
+	db.store_vtxos(&[(spent, &VtxoState::Spendable)]).await.expect("live replay over spent");
+	assert_eq!(db.get_wallet_vtxo(spent.id()).await.unwrap().unwrap().state, VtxoState::Spent,
+		"live replay must leave the terminal state untouched");
 }
 
 pub async fn test_steal_lock_to_spent(db: &impl WalletPersister) {

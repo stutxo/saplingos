@@ -807,15 +807,6 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 
 		for (vtxo, state) in vtxos {
 			let previous = lock.get(partition::VTXO, &vtxo.id().to_bytes()).await?;
-			if let Some(record) = &previous {
-				let existing = record.to_data::<SerdeVtxo>()?;
-				if matches!(existing.current_state(), Some(VtxoState::Spent | VtxoState::Exited)) {
-					anyhow::ensure!(matches!(state, VtxoState::Spent | VtxoState::Exited),
-						"cannot restore a terminal VTXO to a live state");
-					// Replay never replaces the signed bytes or terminal state.
-					continue;
-				}
-			}
 			if !matches!(state, VtxoState::Spent | VtxoState::Exited) {
 				absent.insert((partition::PROGRAM_RECOVERY_RESERVATION,
 					recovery_vtxo_key(vtxo.id()).into_bytes()));
@@ -834,6 +825,16 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 							recovery_vtxo_key(ancestor).into_bytes()));
 					}
 				}
+			}
+			// Contract: 'For each VTXO that already exists: no-op for that
+			// VTXO.' The reservation guard above still ran for live states,
+			// mirroring SQLite's unconditional guard before INSERT OR IGNORE.
+			// An existing record keeps its current state, full state history,
+			// registered flag and signed bytes; in particular a live retry
+			// landing on a terminal record is a silent no-op, never an error
+			// or a resurrection.
+			if previous.is_some() {
+				continue;
 			}
 			let serde_vtxo = SerdeVtxo {
 				vtxo: (*vtxo).clone(),
