@@ -21,11 +21,18 @@ pub struct ExitCpfpRequest {
 }
 
 /// Constraints a CPFP replacement transaction must satisfy to evict an existing one via RBF.
+///
+/// When the values originate from chain-backend mempool data (rather than from a child the
+/// wallet built and signed itself) they are unverified; producers clamp the rate to the
+/// fee-rate ingestion ceiling and cap `current_package_fee` against the rescued VTXO
+/// value before exposing them, dropping implausible reports entirely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RbfRequirement {
 	/// The effective fee rate of the existing package. A replacement must exceed this.
 	pub min_fee_rate: FeeRate,
 	/// The total fee paid by the existing package. A replacement must pay strictly more.
+	/// For backend-derived reports this is capped to at most one tenth of the rescued
+	/// value (with a 10,000 sat floor for near-dust exits).
 	pub current_package_fee: Amount,
 }
 

@@ -1283,7 +1283,18 @@ async fn broadcast_with_fees(tx: &Transaction, chain: &ChainSource,
 	let fees = if let Some((child, _)) = spending.get(&anchor) {
 		let info = chain.mempool_ancestor_info(*child).await?;
 		if info.effective_fee_rate().is_some_and(|rate| rate >= fee_rate) { return Ok(funded_state); }
-		MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee: info.total_fee }
+		// The ancestor report is unverified data from the configured chain backend: the fee
+		// and weight fields are both server-supplied, so an adversarial backend could demand
+		// up to the fee wallet's entire confirmed balance as the RBF floor. Bound the floor
+		// to a share of the value being recovered, and refuse to sign beyond it.
+		let recovered = tx.output.iter().try_fold(Amount::ZERO, |acc, o| acc.checked_add(o.value))
+			.context("recovery claim output values overflow")?;
+		let current_package_fee = crate::onchain::cap_backend_package_fee(recovered, info.total_fee)
+			.ok_or_else(|| anyhow::anyhow!(
+				"chain backend reports a {} package fee for the recovery child of {} to bump at most {} recovered value; refusing to sign over an implausible fee",
+				info.total_fee, tx.compute_txid(), recovered,
+			))?;
+		MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
 	} else {
 		MakeCpfpFees::Effective(fee_rate)
 	};
