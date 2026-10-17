@@ -188,6 +188,12 @@ pub struct Config {
 	/// A fallback fee rate to use in sat/kWu when we fail to retrieve a fee rate from the
 	/// configured bitcoind/esplora connection.
 	///
+	/// Values above the built-in sanity ceiling (1,000,000 sat/kWu = 4,000 sat/vB) are
+	/// clamped to it with a warning: once seeded or cached, these rates feed the same
+	/// fee-rate×weight arithmetic as untrusted backend estimates, and exit/recovery
+	/// signing sinks bail loudly on rates beyond the ceiling instead of panicking or
+	/// silently wrapping the computed fee.
+	///
 	/// Example for 1 sat/vB: --fallback-fee-rate 250
 	pub fallback_fee_rate: Option<FeeRate>,
 

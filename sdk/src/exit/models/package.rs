@@ -72,4 +72,21 @@ pub struct FeeInfo {
 	/// 0.1 sat/vB) multiplied by the replacement weight on top of this amount.
 	#[serde(rename = "total_fee_sat", with = "bitcoin::amount::serde::as_sat")]
 	pub total_fee: Amount,
+	/// Provenance: `true` when the fee was derived locally from a child the wallet (or its
+	/// operator, via the CPFP API) built and signed itself — we know what we signed. `false`
+	/// when read from the configured chain backend's mempool data: both the fee and the
+	/// weights behind `fee_rate` are then unverified, server-supplied fields, and consumers
+	/// must sanitize them (rate ceiling, package-fee cap against the rescued value) before
+	/// they may steer RBF decisions or signing.
+	#[serde(default)]
+	pub trusted: bool,
+}
+
+impl FeeInfo {
+	/// Marks the fee info as locally derived; called on any fee info provided at child
+	/// registration time ([crate::exit::Exit::provide_cpfp_tx_with_fee_info]), where the
+	/// registrant asserts it knows what it signed.
+	pub(crate) fn into_trusted(self) -> Self {
+		FeeInfo { trusted: true, ..self }
+	}
 }

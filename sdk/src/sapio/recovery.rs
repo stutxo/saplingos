@@ -1261,6 +1261,9 @@ pub async fn recover_program_bundle(bundle: &ProgramRecoveryBundle, chain: &Chai
 {
 	bundle.verify()?;
 	ensure!(bundle.network == chain.network(), "recovery bundle network mismatch");
+	// Backend rates are clamped at ingestion, but a caller override reaches the pinned
+	// ext CPFP builders unchecked; bail loudly rather than overflow their u64 fee math.
+	let fee_rate = crate::exit::validate_exit_fee_rate(fee_rate)?;
 	chain.require_version().await?;
 	fee_wallet.sync(chain).await.context("failed to sync program recovery fee wallet")?;
 	let tip = chain.tip().await?.to_u32();
@@ -1286,14 +1289,19 @@ async fn broadcast_with_fees(tx: &Transaction, chain: &ChainSource,
 		// The ancestor report is unverified data from the configured chain backend: the fee
 		// and weight fields are both server-supplied, so an adversarial backend could demand
 		// up to the fee wallet's entire confirmed balance as the RBF floor. Bound the floor
-		// to a share of the value being recovered, and refuse to sign beyond it.
+		// to a share of the value being recovered, and skip rather than sign when the claim
+		// exceeds it — the existing child stays in the mempool and recovery can be retried.
 		let recovered = tx.output.iter().try_fold(Amount::ZERO, |acc, o| acc.checked_add(o.value))
 			.context("recovery claim output values overflow")?;
-		let current_package_fee = crate::onchain::cap_backend_package_fee(recovered, info.total_fee)
-			.ok_or_else(|| anyhow::anyhow!(
-				"chain backend reports a {} package fee for the recovery child of {} to bump at most {} recovered value; refusing to sign over an implausible fee",
+		let Some(current_package_fee) = crate::onchain::cap_backend_package_fee(recovered, info.total_fee)
+		else {
+			log::warn!(
+				"Chain backend reports a {} package fee for the recovery child of {} rescuing at most {}; \
+				skipping the fee bump this round instead of signing over an implausible fee",
 				info.total_fee, tx.compute_txid(), recovered,
-			))?;
+			);
+			return Ok(funded_state);
+		};
 		MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
 	} else {
 		MakeCpfpFees::Effective(fee_rate)

@@ -74,6 +74,15 @@ fn clamp_backend_fee_rate(rate: FeeRate) -> FeeRate {
 	}
 }
 
+/// Initial fee tiers used until the first successful backend fetch. Operator-configured
+/// fallbacks are clamped to the same ceiling as backend data: once seeded they feed the
+/// exact same exit/claim/CPFP multiplications, so an absurd configured rate would be just
+/// as able to panic or wrap the pinned fee builders' u64 arithmetic.
+fn clamped_fee_tiers(fallback_fee: Option<FeeRate>) -> FeeRates {
+	let fee = clamp_backend_fee_rate(fallback_fee.unwrap_or(FeeRate::BROADCAST_MIN));
+	FeeRates { fast: fee, regular: fee, slow: fee }
+}
+
 #[cfg(feature = "bitcoind-rpc")]
 const MIN_BITCOIND_VERSION: usize = 290000;
 
@@ -347,8 +356,7 @@ impl ChainSource {
 
 		inner.check_network(network).await?;
 
-		let fee = fallback_fee.unwrap_or(FeeRate::BROADCAST_MIN);
-		let fee_rates = RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee });
+		let fee_rates = RwLock::new(clamped_fee_tiers(fallback_fee));
 
 		Ok(Self {
 			inner,
@@ -865,11 +873,13 @@ impl ChainSource {
 			(Ok(fee_rates), _) => (fee_rates, false),
 			(Err(e), None) => return Err(e),
 			(Err(e), Some(fallback)) => {
+				// A configured fallback bypasses fetch_fee_rates — clamp it here too.
+				let fallback = clamp_backend_fee_rate(fallback);
 				warn!("Error getting fee rates, falling back to {} sat/kvB: {}",
 					fallback.to_btc_per_kvb(), e,
 				);
 				(FeeRates { fast: fallback, regular: fallback, slow: fallback }, true)
-			}
+			},
 		};
 
 		*self.fee_rates.write().await = fee_rates;
@@ -1139,6 +1149,72 @@ mod test {
 		let block = Weight::from_wu(4_000_000);
 		assert!(MAX_PLAUSIBLE_FEE_RATE.checked_mul_by_weight(block).is_some());
 		assert!(MAX_PLAUSIBLE_FEE_RATE.checked_mul_by_weight(Weight::MAX).is_none());
+	}
+
+	#[test]
+	fn clamped_fee_tiers_reject_absurd_configured_fallbacks() {
+		// A misconfigured operator fallback goes straight into the fee tiers without
+		// touching fetch_fee_rates, so it must be clamped at seeding too.
+		let absurd = FeeRate::from_sat_per_kwu(1 << 54);
+		let tiers = clamped_fee_tiers(Some(absurd));
+		assert_eq!(tiers, FeeRates {
+			fast: MAX_PLAUSIBLE_FEE_RATE,
+			regular: MAX_PLAUSIBLE_FEE_RATE,
+			slow: MAX_PLAUSIBLE_FEE_RATE,
+		});
+		let sane = FeeRate::from_sat_per_vb_unchecked(50);
+		assert_eq!(clamped_fee_tiers(Some(sane)), FeeRates { fast: sane, regular: sane, slow: sane });
+		assert_eq!(clamped_fee_tiers(None), FeeRates {
+			fast: FeeRate::BROADCAST_MIN,
+			regular: FeeRate::BROADCAST_MIN,
+			slow: FeeRate::BROADCAST_MIN,
+		});
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn update_fee_rates_clamps_absurd_configured_fallback() {
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		// The backend fails every fetch; the wallet must fall back without propagating
+		// an operator's absurd configured rate into exit fee math.
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let server = tokio::spawn(async move {
+			loop {
+				let (mut socket, _) = listener.accept().await.unwrap();
+				let mut lines = BufReader::new(&mut socket);
+				let mut line = String::new();
+				loop {
+					line.clear();
+					if lines.read_line(&mut line).await.unwrap() == 0
+						|| line == "\r\n"
+					{
+						break;
+					}
+				}
+				socket.write_all(
+					b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+				).await.unwrap();
+			}
+		});
+		let source = ChainSource {
+			inner: ChainSourceClient::Esplora(
+				esplora_client::Builder::new(&url).max_retries(0).timeout(5).build_async().unwrap(),
+			),
+			network: Network::Bitcoin,
+			zmq_endpoint: None,
+			fee_rates: RwLock::new(clamped_fee_tiers(None)),
+			fee_rates_fetched_at: RwLock::new(None),
+			tip_cache: RwLock::new(None),
+		};
+		source.update_fee_rates(Some(FeeRate::from_sat_per_kwu(1 << 54))).await.unwrap();
+		let rates = source.fee_rates().await;
+		assert_eq!(rates.fast, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.regular, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.slow, MAX_PLAUSIBLE_FEE_RATE);
+		server.abort();
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]

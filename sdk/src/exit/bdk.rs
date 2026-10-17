@@ -33,7 +33,7 @@ pub(crate) fn wallet_child_fee_info(
 	let fee_rate = FeeRate::from_amount_and_weight_ceil(total_fee, package_weight)
 		// `total_fee` comes straight from this very division, so it always yields a rate.
 		.unwrap_or_else(|| fees.effective());
-	FeeInfo { fee_rate, total_fee }
+	FeeInfo { fee_rate, total_fee, trusted: true }
 }
 
 impl Exit {
@@ -52,7 +52,11 @@ impl Exit {
 	/// Callers with external or hardware wallets should use [Exit::exits_needing_cpfp]
 	/// and [Exit::provide_cpfp_tx] directly instead.
 	///
-	/// Returns an error if the wallet has no onchain wallet configured.
+	/// Returns an error if the wallet has no onchain wallet configured. A
+	/// `fee_rate_override` above the fee-rate sanity ceiling
+	/// ([crate::chain::MAX_PLAUSIBLE_FEE_RATE]) bails loudly with
+	/// [crate::exit::ExitError::FeeRateExceedsCeiling] instead of feeding the pinned
+	/// fee builders a value their u64 arithmetic cannot represent.
 	pub async fn progress_exits_with_cpfp(
 		&self,
 		wallet: &Wallet,
@@ -67,6 +71,9 @@ impl Exit {
 			Some(fr) => fr,
 			None => wallet.exit_mgr().default_exit_fee_rate().await,
 		};
+		// Backend rates are clamped at ingestion, but an override reaches the pinned ext
+		// builders unchecked; refuse a rate that could overflow their u64 fee math.
+		let fee_rate = crate::exit::validate_exit_fee_rate(fee_rate)?;
 
 		for req in self.exits_needing_cpfp().await {
 			let fees = match req.rbf_requirement {

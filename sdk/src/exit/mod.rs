@@ -189,25 +189,31 @@ pub(crate) fn checked_fee_at_rate(rate: FeeRate, weight: Weight) -> Result<Amoun
 	})
 }
 
-/// Sanitizes chain-backend-reported [FeeInfo] before it may steer exit fee construction.
+/// Sanitizes [FeeInfo] before it may steer exit fee construction.
 ///
-/// Mempool ancestor data is unverified: the fee *and* weight fields are server-supplied,
-/// so a lying backend can dictate both a package's fee floor (burning our confirmed
-/// balance in a replacement child) and its reported rate (forcing or blocking bumps).
-/// Children the wallet built itself never come through here — their committed fee is
-/// derived locally (see `bdk::wallet_child_fee_info`); everything still relying on the
-/// backend is clamped to the ingestion fee-rate ceiling and capped against the value the
-/// package rescues. `None` means the claim is implausible and must not steer signing —
-/// callers skip the bump and warn.
-pub(crate) fn sanitize_backend_fee_info(fi: FeeInfo, value_at_stake: Amount) -> Option<FeeInfo> {
+/// Chain-backend mempool ancestor data is unverified: the fee *and* weight fields are both
+/// server-supplied, so a lying backend can dictate both a package's fee floor (burning our
+/// confirmed balance in a replacement child) and its reported rate (forcing or blocking
+/// bumps). Untrusted reports are clamped to the ingestion fee-rate ceiling and capped
+/// against the value the package rescues; `None` means the claim is implausible and must
+/// not steer signing — callers skip the bump and warn.
+///
+/// Locally derived fee info ([FeeInfo::trusted] — children the wallet or its operator
+/// built and signed itself) passes through verbatim and uncapped: we know what we signed,
+/// so an honest above-cap package keeps bumping instead of being stranded.
+pub(crate) fn sanitize_fee_info(fi: FeeInfo, value_at_stake: Amount) -> Option<FeeInfo> {
+	if fi.trusted {
+		return Some(fi);
+	}
 	let total_fee = crate::onchain::cap_backend_package_fee(value_at_stake, fi.total_fee)?;
 	Some(FeeInfo {
 		fee_rate: fi.fee_rate.min(crate::chain::MAX_PLAUSIBLE_FEE_RATE),
 		total_fee,
+		trusted: fi.trusted,
 	})
 }
 
-/// Sanitizes a tracked child's fee info (see [sanitize_backend_fee_info]) for exit fee
+/// Sanitizes a tracked child's fee info (see [sanitize_fee_info]) for exit fee
 /// estimation, logging filtered lies; `None` means the committed fee is treated as
 /// unknown, i.e. no replacement is priced on fabricated numbers.
 fn sanitized_child_fee_info(
@@ -216,7 +222,7 @@ fn sanitized_child_fee_info(
 	exit_txid: Txid,
 ) -> Option<FeeInfo> {
 	child.fee_info.and_then(|fi| {
-		let sanitized = sanitize_backend_fee_info(fi, value_at_stake);
+		let sanitized = sanitize_fee_info(fi, value_at_stake);
 		if sanitized.is_none() {
 			warn!(
 				"Ignoring implausible chain-backend fee report for the CPFP child of exit tx {} (claimed total fee {} for a rescued value of {}); treating the committed fee as unknown",
@@ -945,8 +951,9 @@ impl Exit {
 								Some(fi) => {
 									// Backend-derived fee info is unverified; cap its fee
 									// floor against the rescued value and refuse to sign
-									// over implausible claims.
-									match sanitize_backend_fee_info(fi, ev.amount()) {
+									// over implausible claims. Locally derived (trusted)
+									// fees pass through verbatim.
+									match sanitize_fee_info(fi, ev.amount()) {
 										Some(fi) => Some(RbfRequirement {
 											min_fee_rate: fi.fee_rate,
 											current_package_fee: fi.total_fee,
@@ -1366,36 +1373,53 @@ mod test {
 	}
 
 	#[test]
-	fn sanitize_backend_fee_info_drops_99_btc_package_claim() {
+	fn sanitize_fee_info_drops_99_btc_backend_package_claim() {
 		// The audited payload: a chain backend claiming a 99 BTC package fee for an exit
 		// rescuing 1 BTC must produce no RBF signal — nothing to sign over, ever.
 		let fi = FeeInfo {
 			fee_rate: FeeRate::from_sat_per_kwu(1_000),
 			total_fee: Amount::from_sat(99_000_000_000),
+			trusted: false,
 		};
-		assert_eq!(sanitize_backend_fee_info(fi, Amount::from_sat(100_000_000)), None);
+		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(100_000_000)), None);
 	}
 
 	#[test]
-	fn sanitize_backend_fee_info_passes_plausible_reports_bit_exact() {
+	fn sanitize_fee_info_passes_plausible_backend_reports_bit_exact() {
 		let fi = FeeInfo {
 			fee_rate: FeeRate::from_sat_per_kwu(2_500),
 			total_fee: Amount::from_sat(3_000),
+			trusted: false,
 		};
-		assert_eq!(sanitize_backend_fee_info(fi, Amount::from_sat(100_000_000)), Some(fi));
+		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(100_000_000)), Some(fi));
 	}
 
 	#[test]
-	fn sanitize_backend_fee_info_clamps_reported_rate() {
+	fn sanitize_fee_info_clamps_reported_backend_rate() {
 		// Both fields are server-supplied and independently dialed: the rate is clamped
 		// to the ingestion ceiling even when the fee is small enough to pass.
 		let fi = FeeInfo {
 			fee_rate: FeeRate::from_sat_per_kwu(1 << 54),
 			total_fee: Amount::from_sat(1_000),
+			trusted: false,
 		};
-		assert_eq!(sanitize_backend_fee_info(fi, Amount::from_sat(100_000_000)), Some(FeeInfo {
+		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(100_000_000)), Some(FeeInfo {
 			fee_rate: crate::chain::MAX_PLAUSIBLE_FEE_RATE,
 			total_fee: Amount::from_sat(1_000),
+			trusted: false,
 		}));
+	}
+
+	#[test]
+	fn sanitize_fee_info_passes_trusted_wallet_fees_uncapped() {
+		// A wallet-built child honestly paying more than the backend-claim cap during a
+		// fee storm (e.g. a 0.01 BTC exit whose CPFP paid >10k sats) must keep bumping:
+		// we know what we signed, so the rescued-value cap must not strand our own exit.
+		let fi = FeeInfo {
+			fee_rate: FeeRate::from_sat_per_vb_unchecked(300),
+			total_fee: Amount::from_sat(500_000),
+			trusted: true,
+		};
+		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(1_000_000)), Some(fi));
 	}
 }

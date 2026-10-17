@@ -433,7 +433,7 @@ impl ExitTransactionManager {
 	/// A locally derived `fee_info` is trusted: the child is our own construction. `None`
 	/// (unknown, e.g. an externally crafted child) makes the next sync back-fill from
 	/// `mempool_ancestor_info` — unverified backend data that consumers must sanitize
-	/// before it steers any signing (see `crate::exit::sanitize_backend_fee_info`).
+	/// before it steers any signing (see `crate::exit::sanitize_fee_info`).
 	pub async fn set_wallet_child_tx(
 		&mut self,
 		exit_txid: Txid,
@@ -449,7 +449,11 @@ impl ExitTransactionManager {
 				tx: child_tx.clone(),
 			},
 			origin,
-			fee_info,
+			// Fee info supplied at child-registration time is operator/wallet-asserted
+			// ("I built and signed this child, I know its fee"): mark it locally derived
+			// so later consumers skip the chain-backend sanitization they apply to
+			// unverified mempool reports.
+			fee_info: fee_info.map(FeeInfo::into_trusted),
 		});
 		self.index.insert(child_txid, Arc::downgrade(&package));
 		self.status.insert(exit_txid, TxStatus::Mempool);
@@ -741,7 +745,7 @@ impl ExitTransactionManager {
 				txid,
 				error: format!("unable to calculate fee rate for {}", txid),
 			})?;
-		Ok(FeeInfo { fee_rate, total_fee: info.total_fee })
+		Ok(FeeInfo { fee_rate, total_fee: info.total_fee, trusted: false })
 	}
 
 	/// Best-effort variant of [`calculate_fee_params`]: returns `None` (and logs) when the
