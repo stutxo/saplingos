@@ -47,6 +47,33 @@ const TIP_CACHE_TTL: Duration = Duration::from_secs(1);
 /// than this buys nothing while costing one HTTP round trip per sync tick.
 const FEE_RATES_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Sanity ceiling for fee rates accepted from a configured chain backend:
+/// 1,000,000 sat/kwu, i.e. 4,000 sat/vB — far above any historically observed
+/// block-space rate, so clamping can only ever misfire on data that lies.
+///
+/// Chain backends (esplora servers, bitcoind RPC endpoints) are remote principals whose
+/// responses cannot be verified, yet their estimates flow into `FeeRate * Weight` u64
+/// arithmetic across the exit/claim/CPFP paths — including inside the pinned
+/// `bark-bitcoin-ext` helpers, which we cannot change. An esplora `/fee-estimates`
+/// response can carry up to ~2^64 sat/kwu (bitcoind `estimatesmartfee` up to
+/// [Amount::MAX_MONEY] sat/kvB); values above ~2^54 sat/kwu already overflow the product
+/// at ordinary transaction weights, panicking under this workspace's `overflow-checks =
+/// true` or silently wrapping the computed fee to near zero under a stock release
+/// profile. Rates above this ceiling do not describe a market, so they are clamped at
+/// ingestion.
+pub(crate) const MAX_PLAUSIBLE_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(1_000_000);
+
+/// Clamps a chain-backend fee estimate to [MAX_PLAUSIBLE_FEE_RATE], logging the lie.
+fn clamp_backend_fee_rate(rate: FeeRate) -> FeeRate {
+	if rate > MAX_PLAUSIBLE_FEE_RATE {
+		warn!("Chain backend fee estimate {} exceeds the sanity ceiling of {}; clamping",
+			rate, MAX_PLAUSIBLE_FEE_RATE);
+		MAX_PLAUSIBLE_FEE_RATE
+	} else {
+		rate
+	}
+}
+
 #[cfg(feature = "bitcoind-rpc")]
 const MIN_BITCOIND_VERSION: usize = 290000;
 
@@ -334,7 +361,9 @@ impl ChainSource {
 	}
 
 	async fn fetch_fee_rates(&self) -> anyhow::Result<FeeRates> {
-		match self.inner() {
+		// Backend responses are unverified — clamp absurd estimates at the ingestion
+		// boundary so downstream `FeeRate * Weight` arithmetic cannot panic or wrap.
+		let rates: FeeRates = match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
 				let get_fee_rate = async |target: u16| -> anyhow::Result<FeeRate> {
@@ -352,7 +381,7 @@ impl ChainSource {
 						Err(anyhow!("No rate returned from estimate_smart_fee for a {} confirmation target", target))
 					}
 				};
-				Ok(FeeRates {
+				Ok::<FeeRates, anyhow::Error>(FeeRates {
 					fast: get_fee_rate(FEE_RATE_TARGET_CONF_FAST).await?,
 					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR).await.expect("should exist"),
 					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW).await.expect("should exist"),
@@ -361,7 +390,7 @@ impl ChainSource {
 			ChainSourceClient::Esplora(client) => {
 				// The API should return rates for targets 1-25, 144 and 1008
 				let estimates = client.get_fee_estimates().await?;
-				let get_fee_rate = |target| {
+				let get_fee_rate = |target: u16| -> anyhow::Result<FeeRate> {
 					let fee = estimates.get(&target).with_context(||
 						format!("No rate returned from get_fee_estimates for a {} confirmation target", target)
 					)?;
@@ -369,13 +398,18 @@ impl ChainSource {
 						format!("Invalid rate returned from get_fee_estimates {} for a {} confirmation target", fee, target)
 					)
 				};
-				Ok(FeeRates {
+				Ok::<FeeRates, anyhow::Error>(FeeRates {
 					fast: get_fee_rate(FEE_RATE_TARGET_CONF_FAST)?,
 					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR)?,
 					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW)?,
 				})
 			}
-		}
+		}?;
+		Ok(FeeRates {
+			fast: clamp_backend_fee_rate(rates.fast),
+			regular: clamp_backend_fee_rate(rates.regular),
+			slow: clamp_backend_fee_rate(rates.slow),
+		})
 	}
 
 	/// The ZMQ endpoint of the bitcoind backend, if one was configured.
@@ -1068,6 +1102,93 @@ fn classify_submit_package_errors<'a>(
 mod test {
 	use super::*;
 	use std::str::FromStr;
+
+	#[test]
+	fn clamp_backend_fee_rate_caps_esplora_max_payload() {
+		// The largest value an esplora `/fee-estimates` payload can smuggle past
+		// `FeeRateExt::from_sat_per_vb_decimal_checked_ceil` (e.g. `{"1": 7.2e13}` sat/vB)
+		// is 2^54 sat/kwu — a value whose plain u64 product with ordinary weights overflows.
+		let absurd = FeeRate::from_sat_per_kwu(1 << 54);
+		assert!(absurd > MAX_PLAUSIBLE_FEE_RATE);
+		// Sanity: the raw hunter reproduction value does explode the naive multiplication.
+		assert!(absurd.checked_mul_by_weight(Weight::from_wu(2_048)).is_none());
+		assert_eq!(clamp_backend_fee_rate(absurd), MAX_PLAUSIBLE_FEE_RATE);
+	}
+
+	#[test]
+	fn clamp_backend_fee_rate_caps_bitcoind_max_payload() {
+		// `estimatesmartfee` can return up to MAX_MONEY sat per kvB.
+		let max = FeeRate::from_amount_per_kvb_ceil(Amount::MAX_MONEY);
+		assert!(max > MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(clamp_backend_fee_rate(max), MAX_PLAUSIBLE_FEE_RATE);
+	}
+
+	#[test]
+	fn clamp_backend_fee_rate_passes_through_sane_rates() {
+		for sat_per_kwu in [0, 250 /* 1 sat/vB */, 125_000 /* 500 sat/vB */] {
+			let rate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+			assert_eq!(clamp_backend_fee_rate(rate), rate);
+		}
+	}
+
+	#[test]
+	fn clamped_rate_stays_multipliable_at_realistic_weights() {
+		// A clamped rate must never overflow, even against a full 4M-WU block's worth
+		// of package weight; genuinely absurd weights are rejected by the checked
+		// multiplication at the sinks instead of panicking or wrapping.
+		let block = Weight::from_wu(4_000_000);
+		assert!(MAX_PLAUSIBLE_FEE_RATE.checked_mul_by_weight(block).is_some());
+		assert!(MAX_PLAUSIBLE_FEE_RATE.checked_mul_by_weight(Weight::MAX).is_none());
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn fetch_fee_rates_clamps_absurd_esplora_estimates() {
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let server = tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			let mut lines = BufReader::new(&mut socket);
+			let mut line = String::new();
+			lines.read_line(&mut line).await.unwrap();
+			assert!(line.starts_with("GET /fee-estimates "), "unexpected request: {}", line);
+			loop {
+				line.clear();
+				assert_ne!(lines.read_line(&mut line).await.unwrap(), 0);
+				if line == "\r\n" { break; }
+			}
+			// The hunter payload: ~7.2e13 sat/vB, admitted by the ext parser as 2^54 sat/kwu.
+			let body = r#"{"1": 7.205759403792793e13, "3": 7.205759403792793e13, "6": 7.205759403792793e13}"#;
+			let response = format!(
+				"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+				body.len(), body,
+			);
+			socket.write_all(response.as_bytes()).await.unwrap();
+		});
+
+		let source = ChainSource {
+			inner: ChainSourceClient::Esplora(
+				esplora_client::Builder::new(&url).max_retries(0).timeout(5).build_async().unwrap(),
+			),
+			network: Network::Bitcoin,
+			zmq_endpoint: None,
+			fee_rates: RwLock::new(FeeRates {
+				fast: FeeRate::BROADCAST_MIN,
+				regular: FeeRate::BROADCAST_MIN,
+				slow: FeeRate::BROADCAST_MIN,
+			}),
+			fee_rates_fetched_at: RwLock::new(None),
+			tip_cache: RwLock::new(None),
+		};
+		let rates = source.fetch_fee_rates().await.unwrap();
+		assert_eq!(rates.fast, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.regular, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.slow, MAX_PLAUSIBLE_FEE_RATE);
+		server.await.unwrap();
+	}
 
 	#[cfg(not(target_arch = "wasm32"))]
 	mod esplora_broadcast {

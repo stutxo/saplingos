@@ -137,7 +137,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bitcoin::{
-	Address, Amount, FeeRate, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, sighash
+	Address, Amount, FeeRate, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Weight,
+	Witness, sighash
 };
 use bitcoin::consensus::Params;
 use log::{error, info, trace, warn};
@@ -161,6 +162,32 @@ use crate::persist::models::StoredExit;
 use crate::psbtext::PsbtInputExt;
 use crate::subsystem::{ExitMovement, Subsystem};
 use crate::vtxo::VtxoStateKind;
+
+/// Validates a fee rate before it prices or funds exit transactions.
+///
+/// Backend-supplied rates are clamped at ingestion ([crate::chain::MAX_PLAUSIBLE_FEE_RATE]),
+/// but caller-supplied overrides reach the sinks unchecked; the pinned `bark-bitcoin-ext`
+/// CPFP helpers multiply rates by weights in plain u64 arithmetic, which overflows — a
+/// panic under `overflow-checks`, a silently wrapped near-zero fee otherwise — on rates a
+/// real fee market never produces, so we refuse them.
+pub(crate) fn validate_exit_fee_rate(rate: FeeRate) -> Result<FeeRate, ExitError> {
+	if rate > crate::chain::MAX_PLAUSIBLE_FEE_RATE {
+		return Err(ExitError::FeeRateExceedsCeiling {
+			rate, ceiling: crate::chain::MAX_PLAUSIBLE_FEE_RATE,
+		});
+	}
+	Ok(rate)
+}
+
+/// Computes the fee for `weight` at `rate` without ever panicking or wrapping.
+///
+/// Returns [ExitError::InternalError] if the product is not representable; with
+/// [validate_exit_fee_rate] applied upstream this only fires for absurd weights.
+pub(crate) fn checked_fee_at_rate(rate: FeeRate, weight: Weight) -> Result<Amount, ExitError> {
+	rate.checked_mul_by_weight(weight).ok_or_else(|| ExitError::InternalError {
+		error: format!("fee rate {rate} times weight {weight} overflows"),
+	})
+}
 
 /// What is known about the CPFP child of a pending exit transaction.
 pub(crate) enum ChildState {
@@ -1058,12 +1085,14 @@ impl Exit {
 		let fee_amount = {
 			let fee_rate = fee_rate_override
 				.unwrap_or(guard.chain_source.fee_rates().await.regular);
-			fee_rate * create_psbt(tx.clone()).await?
+			let fee_rate = validate_exit_fee_rate(fee_rate)?;
+			let signed_weight = create_psbt(tx.clone()).await?
 				.extract_tx()
 				.map_err(|e| ExitError::InternalError {
 					error: format!("Failed to get tx from signed exit claim PSBT: {}", e),
 				})?
-				.weight()
+				.weight();
+			checked_fee_at_rate(fee_rate, signed_weight)?
 		};
 
 		// We adjust the drain output to cover the fee
@@ -1218,5 +1247,48 @@ impl Exit {
 			groups.push(UnconfirmedExitParents { vtxo, parents });
 		}
 		Ok(groups)
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn validate_exit_fee_rate_rejects_backend_max_payload() {
+		// The largest fee rate an esplora `/fee-estimates` payload admits (2^54 sat/kwu)
+		// must be refused before any exit sink multiplies it by a weight.
+		let absurd = FeeRate::from_sat_per_kwu(1 << 54);
+		assert!(matches!(
+			validate_exit_fee_rate(absurd),
+			Err(ExitError::FeeRateExceedsCeiling { rate, .. }) if rate == absurd,
+		));
+	}
+
+	#[test]
+	fn validate_exit_fee_rate_accepts_sane_rates() {
+		for sat_per_kwu in [0, 250 /* 1 sat/vB */, 125_000 /* 500 sat/vB */] {
+			let rate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+			assert_eq!(validate_exit_fee_rate(rate).unwrap(), rate);
+		}
+		// The ceiling itself remains usable.
+		let ceiling = crate::chain::MAX_PLAUSIBLE_FEE_RATE;
+		assert_eq!(validate_exit_fee_rate(ceiling).unwrap(), ceiling);
+	}
+
+	#[test]
+	fn checked_fee_at_rate_matches_plain_math_for_sane_values() {
+		let rate = FeeRate::from_sat_per_vb_unchecked(10);
+		let weight = Weight::from_wu(2_048);
+		assert_eq!(checked_fee_at_rate(rate, weight).unwrap(), rate * weight);
+	}
+
+	#[test]
+	fn checked_fee_at_rate_errors_instead_of_panicking_or_wrapping() {
+		// Sinks validate rates to the ceiling first; should an unrepresentable product
+		// still occur (absurd weight), it must surface as an error rather than panic
+		// (overflow-checks) or wrap to a near-zero fee (stock release).
+		let res = checked_fee_at_rate(crate::chain::MAX_PLAUSIBLE_FEE_RATE, Weight::MAX);
+		assert!(matches!(res, Err(ExitError::InternalError { .. })));
 	}
 }
