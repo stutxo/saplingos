@@ -22,7 +22,7 @@ use crate::actions::lightning::pay::{
 	LightningSend, LightningSendState, Progress, settle_lightning_send_payment,
 	start_lightning_send,
 };
-use crate::lightning::{lnaddr_invoice, lnurlp_invoice};
+use crate::lightning::{lightning_wallet_proxy, lnaddr_invoice, lnurlp_invoice};
 use crate::lock_manager::LockGuard;
 use crate::movement::PaymentMethod;
 use crate::persist::WalletPersister;
@@ -268,7 +268,8 @@ impl Wallet {
 		opts: LightningSendOptions,
 	) -> anyhow::Result<Invoice> {
 		let comment = comment.as_ref();
-		let invoice: Invoice = lnaddr_invoice(addr, amount, comment).await
+		let invoice: Invoice = lnaddr_invoice(addr, amount, comment,
+			lightning_wallet_proxy(self.config())).await
 			.context("lightning address error")?.into();
 		info!("Sending {} to lightning address {}", amount, addr);
 		self.make_lightning_payment_with(&invoice, addr.clone().into(), None, opts).await?;
@@ -299,7 +300,8 @@ impl Wallet {
 		comment: Option<impl AsRef<str>>,
 		opts: LightningSendOptions,
 	) -> anyhow::Result<Invoice> {
-		let invoice: Invoice = lnurlp_invoice(&lnurl.url, amount, comment).await
+		let invoice: Invoice = lnurlp_invoice(&lnurl.url, amount, comment,
+			lightning_wallet_proxy(self.config())).await
 			.context("lnurl-pay error")?.into();
 		info!("Sending {} to lnurl {}", amount, lnurl);
 		self.make_lightning_payment_with(&invoice, lnurl.clone().into(), None, opts).await?;
