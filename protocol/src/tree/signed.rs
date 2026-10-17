@@ -169,6 +169,30 @@ enum ChildSpec<'a> {
 	},
 }
 
+/// Validate that no musig key aggregation performed while building or
+/// signing a tree with these leaves and global cosigners ever sees an
+/// empty key set, because [musig::combine_keys] panics on an empty set.
+///
+/// With at least one global cosign pubkey every node aggregate contains
+/// that key. Without any, at least one leaf must cosign (for the funding
+/// aggregate) and every internal node must have a cosigning leaf.
+fn check_cosign_sets(
+	vtxos: &[VtxoLeafSpec],
+	global_cosign_pubkeys: &[PublicKey],
+) -> Result<(), &'static str> {
+	if global_cosign_pubkeys.is_empty() {
+		if vtxos.iter().all(|v| v.cosign_pubkey.is_none()) {
+			return Err("vtxo tree spec must have at least one cosign pubkey");
+		}
+		if Tree::new(vtxos.len()).iter_internal().any(|node| {
+			node.leaves().all(|i| vtxos[i].cosign_pubkey.is_none())
+		}) {
+			return Err("vtxo tree spec has an internal node without cosign pubkeys");
+		}
+	}
+	Ok(())
+}
+
 impl VtxoTreeSpec {
 	pub fn new(
 		vtxos: Vec<VtxoLeafSpec>,
@@ -178,6 +202,9 @@ impl VtxoTreeSpec {
 		global_cosign_pubkeys: Vec<PublicKey>,
 	) -> VtxoTreeSpec {
 		assert_ne!(vtxos.len(), 0);
+		if let Err(e) = check_cosign_sets(&vtxos, &global_cosign_pubkeys) {
+			panic!("{e}");
+		}
 		VtxoTreeSpec {
 			vtxos, server_pubkey, expiry_height, exit_delta, global_cosign_pubkeys,
 			hashlock_version: HashlockVersion::V1,
@@ -1894,12 +1921,16 @@ impl ProtocolEncoding for VtxoTreeSpec {
 		let exit_delta = check_block_delta(r.read_u16()?)
 			.map_err(|e| ProtocolDecodingError::invalid_err(e, "exit_delta"))?;
 		let global_cosign_pubkeys = LengthPrefixedVector::decode(r)?.into_inner();
-		let vtxos = LengthPrefixedVector::decode(r)?.into_inner();
+		let vtxos: Vec<VtxoLeafSpec> = LengthPrefixedVector::decode(r)?.into_inner();
 		if vtxos.is_empty() {
 			return Err(ProtocolDecodingError::invalid(
 				"vtxo tree spec must have at least one leaf",
 			));
 		}
+		// Reject trees that can never be cosigned because some musig
+		// key aggregate would be empty.
+		check_cosign_sets(&vtxos, &global_cosign_pubkeys)
+			.map_err(ProtocolDecodingError::invalid)?;
 		Ok(VtxoTreeSpec {
 			vtxos, expiry_height, server_pubkey, exit_delta, global_cosign_pubkeys,
 			// not part of the encoding; see the field docs for how to handle
@@ -2413,7 +2444,7 @@ mod test {
 		// another participation's leaf with an identical request first,
 		// then two identical leaves of the same participation
 		let spec = VtxoTreeSpec::new(
-			vec![leaf(hash2), leaf(hash1), leaf(hash1)], pk, BlockHeight::new(100_000), BlockDelta::new(2016), vec![],
+			vec![leaf(hash2), leaf(hash1), leaf(hash1)], pk, BlockHeight::new(100_000), BlockDelta::new(2016), vec![pk],
 		);
 
 		// identical requests are bound to the distinct leaves of their
@@ -2460,6 +2491,75 @@ mod test {
 			.expect_err("decoding a VtxoTreeSpec with zero vtxos must fail");
 		let msg = err.to_string();
 		assert!(msg.contains("at least one leaf"), "unexpected error message: {msg}");
+	}
+
+	#[test]
+	fn vtxo_tree_spec_rejects_missing_cosign_pubkeys() {
+		let pk1: PublicKey = "020aceb65eed0ee5c512d3718e6f4bd868a7efb58ede7899ffd9bcba09555d4eb8"
+			.parse().unwrap();
+		let pk2: PublicKey = "02e4ed0ca35c3b8a2ff675b9b23f4961964b57e130afa607e32a83d2d9a510622b"
+			.parse().unwrap();
+		let hash = sha256::Hash::from_str(
+			"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+		).unwrap();
+
+		let leaf = |cosign_pubkey| VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(100_000),
+				policy: VtxoPolicy::new_pubkey(pk1),
+			},
+			cosign_pubkey,
+			unlock_hash: hash,
+		};
+		let spec = |vtxos, global_cosign_pubkeys| VtxoTreeSpec {
+			vtxos,
+			expiry_height: BlockHeight::new(100_000),
+			server_pubkey: pk1,
+			exit_delta: BlockDelta::new(2016),
+			global_cosign_pubkeys,
+			hashlock_version: HashlockVersion::V1,
+		};
+
+		// a spec with no cosign pubkeys at all can never be signed or spent
+		let buf = spec(vec![leaf(None), leaf(None)], vec![]).serialize();
+		let err = VtxoTreeSpec::deserialize(&buf)
+			.expect_err("spec without any cosign pubkey must be rejected");
+		let msg = err.to_string();
+		assert!(msg.contains("at least one cosign pubkey"), "unexpected error message: {msg}");
+
+		// without global cosigners, an internal node whose leaves all lack
+		// a cosign pubkey can never be signed either; with 8 leaves and only
+		// the first leaf cosigning, some internal node has no cosigner in
+		// every possible tree shape
+		let mut vtxos = vec![leaf(Some(pk2))];
+		vtxos.extend(iter::repeat(leaf(None)).take(7));
+		let buf = spec(vtxos.clone(), vec![]).serialize();
+		let err = VtxoTreeSpec::deserialize(&buf)
+			.expect_err("spec with an internal node without cosign pubkeys must be rejected");
+		let msg = err.to_string();
+		assert!(msg.contains("internal node without cosign pubkeys"),
+			"unexpected error message: {msg}");
+
+		// control: the same leaves with a global cosigner are accepted
+		encoding_roundtrip(&spec(vtxos, vec![pk2]));
+	}
+
+	#[test]
+	#[should_panic(expected = "vtxo tree spec must have at least one cosign pubkey")]
+	fn vtxo_tree_spec_new_panics_without_cosign_pubkeys() {
+		let pk: PublicKey = "020aceb65eed0ee5c512d3718e6f4bd868a7efb58ede7899ffd9bcba09555d4eb8"
+			.parse().unwrap();
+		let leaf = VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(100_000),
+				policy: VtxoPolicy::new_pubkey(pk),
+			},
+			cosign_pubkey: None,
+			unlock_hash: sha256::Hash::from_str(
+				"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+			).unwrap(),
+		};
+		VtxoTreeSpec::new(vec![leaf], pk, BlockHeight::new(100_000), BlockDelta::new(2016), vec![]);
 	}
 
 	#[test]

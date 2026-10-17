@@ -467,4 +467,77 @@ mod test {
 			server, exit_delta, min_expiry.saturating_sub(BlockDelta::new(1)), server, exit_delta, min_expiry,
 		).is_err(), "expiry one block below the minimum must be rejected");
 	}
+
+	use ark::ProtocolEncoding;
+	use ark::tree::signed::{HashlockVersion, VtxoLeafSpec, VtxoTreeSpec};
+	use bitcoin::Amount;
+	use bitcoin::hashes::{sha256, Hash};
+	use bitcoin::secp256k1::PublicKey;
+
+	fn hostile_leaf(
+		pk: PublicKey,
+		amount: Amount,
+		cosign_pubkey: Option<PublicKey>,
+	) -> VtxoLeafSpec {
+		VtxoLeafSpec {
+			vtxo: ark::VtxoRequest {
+				amount,
+				policy: ark::VtxoPolicy::new_pubkey(pk),
+			},
+			cosign_pubkey,
+			unlock_hash: sha256::Hash::hash(&amount.to_sat().to_le_bytes()),
+		}
+	}
+
+	fn hostile_spec(
+		server: PublicKey,
+		vtxos: Vec<VtxoLeafSpec>,
+		globals: Vec<PublicKey>,
+	) -> VtxoTreeSpec {
+		VtxoTreeSpec {
+			vtxos,
+			expiry_height: BlockHeight::new(100_000),
+			server_pubkey: server,
+			exit_delta: BlockDelta::new(2016),
+			global_cosign_pubkeys: globals,
+			hashlock_version: HashlockVersion::V1,
+		}
+	}
+
+	/// A server-supplied [VtxoTreeSpec] is decoded straight from the wire in
+	/// the round flow; tree shapes that can never be cosigned must be
+	/// rejected with decoding errors instead of panicking the wallet while
+	/// building the tree.
+	#[test]
+	fn vtxo_tree_spec_rejects_missing_cosign_pubkeys() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let server = Keypair::new(&secp, &mut rng).public_key();
+		let cosigner = Keypair::new(&secp, &mut rng).public_key();
+
+		// no cosign pubkeys at all: such a tree can never be signed or spent
+		let spec = hostile_spec(server,
+			vec![hostile_leaf(server, Amount::from_sat(100_000), None),
+				hostile_leaf(server, Amount::from_sat(50_000), None)],
+			vec![],
+		).serialize();
+		let err = VtxoTreeSpec::deserialize(&spec)
+			.expect_err("tree without any cosign pubkey must be rejected");
+		assert!(err.to_string().contains("at least one cosign pubkey"),
+			"unexpected error: {err}");
+
+		// without global cosigners, an internal node whose leaves all lack
+		// a cosign pubkey can never be signed either
+		let mut vtxos = vec![hostile_leaf(server, Amount::from_sat(5_000), Some(cosigner))];
+		vtxos.extend((0..7).map(|i| hostile_leaf(server, Amount::from_sat(5_000 + i), None)));
+		let spec = hostile_spec(server, vtxos.clone(), vec![]).serialize();
+		let err = VtxoTreeSpec::deserialize(&spec)
+			.expect_err("tree with an internal node without cosign pubkeys must be rejected");
+		assert!(err.to_string().contains("internal node without cosign pubkeys"),
+			"unexpected error: {err}");
+
+		// control: a global cosigner rescues the same leaves
+		let spec = hostile_spec(server, vtxos, vec![cosigner]);
+		assert_eq!(VtxoTreeSpec::deserialize(&spec.serialize()).unwrap(), spec);
+	}
 }
