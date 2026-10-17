@@ -86,7 +86,53 @@ impl FeeInfo {
 	/// Marks the fee info as locally derived; called on any fee info provided at child
 	/// registration time ([crate::exit::Exit::provide_cpfp_tx_with_fee_info]), where the
 	/// registrant asserts it knows what it signed.
-	pub(crate) fn into_trusted(self) -> Self {
-		FeeInfo { trusted: true, ..self }
+	///
+	/// Registration-time values are bounded too (`None` on absurd input): a buggy caller
+	/// could otherwise hand us a `total_fee` above [Amount::MAX_MONEY] — which overflows
+	/// the pinned CPFP builder's panicking relay-floor addition — or a `fee_rate` above
+	/// the ingestion ceiling, whose weight multiplication cannot be represented.
+	pub(crate) fn try_into_trusted(self) -> Option<FeeInfo> {
+		if self.total_fee > Amount::MAX_MONEY
+			|| self.fee_rate > crate::chain::MAX_PLAUSIBLE_FEE_RATE
+		{
+			return None;
+		}
+		Some(FeeInfo { trusted: true, ..self })
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn plausible() -> FeeInfo {
+		FeeInfo {
+			fee_rate: FeeRate::from_sat_per_kwu(2_500),
+			total_fee: Amount::from_sat(3_000),
+			trusted: false,
+		}
+	}
+
+	#[test]
+	fn try_into_trusted_rejects_absurd_registration_time_info() {
+		// Registration-time fee info feeds the pinned CPFP builder verbatim once trusted:
+		// a total_fee above representable money would overflow its panicking relay-floor
+		// addition, and an above-ceiling rate overflows its weight multiplication. Neither
+		// describes a real signed child, so both are refused at the chokepoint.
+		let absurd_fee = FeeInfo { total_fee: Amount::from_sat(u64::MAX), ..plausible() };
+		assert_eq!(absurd_fee.try_into_trusted(), None);
+		let absurd_rate = FeeInfo { fee_rate: FeeRate::from_sat_per_kwu(1 << 54), ..plausible() };
+		assert_eq!(absurd_rate.try_into_trusted(), None);
+	}
+
+	#[test]
+	fn try_into_trusted_tags_plausible_info() {
+		let fi = plausible();
+		assert_eq!(fi.try_into_trusted(), Some(FeeInfo { trusted: true, ..fi }));
+		// Boundary values remain usable.
+		let max_fee = FeeInfo { total_fee: Amount::MAX_MONEY, ..fi };
+		assert!(max_fee.try_into_trusted().is_some());
+		let max_rate = FeeInfo { fee_rate: crate::chain::MAX_PLAUSIBLE_FEE_RATE, ..fi };
+		assert!(max_rate.try_into_trusted().is_some());
 	}
 }

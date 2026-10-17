@@ -452,8 +452,19 @@ impl ExitTransactionManager {
 			// Fee info supplied at child-registration time is operator/wallet-asserted
 			// ("I built and signed this child, I know its fee"): mark it locally derived
 			// so later consumers skip the chain-backend sanitization they apply to
-			// unverified mempool reports.
-			fee_info: fee_info.map(FeeInfo::into_trusted),
+			// unverified mempool reports. Absurd registration-time values are dropped —
+			// they cannot describe a real signed child and would break the pinned CPFP
+			// fee math downstream; the next sync then back-fills (sanitized) backend data.
+			fee_info: fee_info.and_then(|fi| match fi.try_into_trusted() {
+				Some(fi) => Some(fi),
+				None => {
+					warn!(
+						"Ignoring absurd registration-time fee info for the CPFP child of exit tx {} (claimed fee {}, rate {})",
+						exit_txid, fi.total_fee, fi.fee_rate,
+					);
+					None
+				},
+			}),
 		});
 		self.index.insert(child_txid, Arc::downgrade(&package));
 		self.status.insert(exit_txid, TxStatus::Mempool);
