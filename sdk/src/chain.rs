@@ -539,10 +539,13 @@ impl ChainSource {
 					set = next_set;
 				}
 				// Calculate the total weight and fee of the unconfirmed ancestry
-				for info in info_map.into_values().filter(|info| !info.status.confirmed) {
-					result.total_fee += info.fee();
-					result.total_weight += info.weight();
-				}
+				let (fee, weight) = checked_ancestor_sums(
+					info_map.into_values()
+						.filter(|info| !info.status.confirmed)
+						.map(|info| (info.fee(), info.weight())),
+				)?;
+				result.total_fee = fee;
+				result.total_weight = weight;
 			},
 		}
 		// Now calculate the effective fee rate of the package
@@ -916,6 +919,27 @@ pub struct FeeRates {
 	pub slow: FeeRate,
 }
 
+/// Sum the fees and weights of an unconfirmed mempool ancestry as reported
+/// by an Esplora server, erroring rather than panicking when the reported
+/// values cannot represent reality.
+///
+/// The Esplora server's answers are trusted by the caller, but `Amount`'s
+/// (and `Weight`'s) `Add` panic on overflow, so hostile or corrupt fee
+/// reports would crash the wallet. Fees past the money supply are
+/// necessarily corrupt and error instead.
+fn checked_ancestor_sums(
+	ancestry: impl IntoIterator<Item = (Amount, Weight)>,
+) -> anyhow::Result<(Amount, Weight)> {
+	ancestry.into_iter().try_fold((Amount::ZERO, Weight::ZERO), |(fee, weight), (f, w)| {
+		let fee = fee.checked_add(f)
+			.filter(|f| *f <= Amount::MAX_MONEY)
+			.context("mempool ancestor fees exceed the money supply")?;
+		let weight = weight.checked_add(w)
+			.context("mempool ancestor weight overflow")?;
+		Ok((fee, weight))
+	})
+}
+
 /// Contains the fee information for an unconfirmed transaction found in the mempool.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolAncestorInfo {
@@ -1068,6 +1092,34 @@ fn classify_submit_package_errors<'a>(
 mod test {
 	use super::*;
 	use std::str::FromStr;
+
+	/// Hostile Esplora fee reports must error, never panic the wallet.
+	#[test]
+	fn esplora_ancestor_fee_overflow_errors() {
+		let wu = Weight::from_wu(1000);
+		assert_eq!(
+			checked_ancestor_sums([
+				(Amount::MAX_MONEY, wu), (Amount::from_sat(500), wu),
+			]).unwrap_err().to_string(),
+			"mempool ancestor fees exceed the money supply",
+		);
+		// Raw u64 overflow errors as well.
+		checked_ancestor_sums([
+			(Amount::MAX, wu), (Amount::ONE_SAT, wu),
+		]).unwrap_err();
+		// Weight overflow errors too.
+		checked_ancestor_sums([
+			(Amount::ONE_SAT, Weight::MAX), (Amount::ONE_SAT, Weight::from_wu(1)),
+		]).unwrap_err();
+		// Reporting within bounds is accepted verbatim.
+		assert_eq!(
+			checked_ancestor_sums([
+				(Amount::from_sat(250), Weight::from_wu(900)),
+				(Amount::from_sat(251), Weight::from_wu(100)),
+			]).unwrap(),
+			(Amount::from_sat(501), Weight::from_wu(1000)),
+		);
+	}
 
 	#[cfg(not(target_arch = "wasm32"))]
 	mod esplora_broadcast {
