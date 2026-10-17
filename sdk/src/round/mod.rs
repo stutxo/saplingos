@@ -1386,6 +1386,7 @@ fn check_round_matches_participation(
 	scheduled_height: Option<BlockHeight>,
 	tip: BlockHeight,
 	exit_margin: BlockDelta,
+	unlock_hash: UnlockHash,
 ) -> anyhow::Result<()> {
 	ensure!(new_vtxos.len() == part.outputs.len(),
 		"unexpected number of VTXOs: got {}, expected {}", new_vtxos.len(), part.outputs.len(),
@@ -1441,6 +1442,17 @@ fn check_round_matches_participation(
 
 		// We accept the VTXO if only the hArk transition (last) failure happens
 		check_vtxo_fails_hash_lock(funding_tx, vtxo)?;
+
+		// The replacement output must be locked under exactly the hash our
+		// forfeits commit to: the server earns the forfeit claim only by
+		// revealing the preimage of the participation's unlock hash, and
+		// that same preimage is the only way to unlock our new outputs. A
+		// leaf locked under any other hash is unspendable by us yet the
+		// forfeits stay claimable, so reject before any forfeit handoff.
+		ensure!(vtxo.unlock_hash() == Some(unlock_hash),
+			"round output {} is hash-locked under a foreign unlock hash",
+			vtxo.id(),
+		);
 	}
 
 	Ok(())
@@ -1585,7 +1597,7 @@ async fn progress_delegated(
 	let tip = wallet.inner.chain.tip().await.context("chain source error")?;
 	check_round_matches_participation(
 		participation, &new_vtxos, &funding_tx, &ark_info, scheduled_height,
-		tip, wallet.inner.config.vtxo_exit_margin,
+		tip, wallet.inner.config.vtxo_exit_margin, unlock_hash,
 	).context("new VTXOs received from server don't match our participation")?;
 
 	// Discovery never forfeits. The StoredRoundState driver checkpoints these
@@ -1667,7 +1679,7 @@ async fn progress_attempt(
 			}
 
 			match construct_new_vtxos(
-				part, unsigned_round_tx, vtxos_spec, cosign_sigs,
+				part, unsigned_round_tx, vtxos_spec, cosign_sigs, *unlock_hash,
 			).await {
 				Ok(v) => AttemptProgressResult::Finished {
 					funding_tx: signed_round_tx.clone(),
@@ -1764,6 +1776,7 @@ async fn construct_new_vtxos(
 	unsigned_round_tx: &Transaction,
 	vtxo_tree: &VtxoTreeSpec,
 	vtxo_cosign_sigs: &[schnorr::Signature],
+	unlock_hash: UnlockHash,
 ) -> anyhow::Result<Vec<Vtxo<Full>>> {
 	let round_txid = unsigned_round_tx.compute_txid();
 	let vtxos_utxo = OutPoint::new(round_txid, ROUND_TX_VTXO_TREE_VOUT);
@@ -1784,6 +1797,14 @@ async fn construct_new_vtxos(
 
 	let mut new_vtxos = vec![];
 	for (idx, req) in signed_vtxos.spec.spec.vtxos.iter().enumerate() {
+		// Only leaves locked under the hash our forfeits commit to are
+		// acceptable: a leaf matching our request under a foreign hash is
+		// unspendable once the forfeit shares are handed over. The tree
+		// order is server-chosen, so a forged duplicate ordered before the
+		// genuine leaf must never be selected.
+		if req.unlock_hash != unlock_hash {
+			continue;
+		}
 		if let Some(expected_idx) = expected_vtxos.iter().position(|r| **r == req.vtxo) {
 			let vtxo = signed_vtxos.build_vtxo(idx);
 
@@ -2796,7 +2817,7 @@ mod test {
 	use bitcoin::secp256k1::Secp256k1;
 
 	use ark::VtxoPolicy;
-	use ark::tree::signed::{HashlockVersion, UnlockPreimage};
+	use ark::tree::signed::{CachedSignedVtxoTree, HashlockVersion, UnlockPreimage, VtxoLeafSpec};
 
 	fn pubkey() -> bitcoin::secp256k1::PublicKey {
 		let secp = Secp256k1::new();
@@ -2819,16 +2840,17 @@ mod test {
 	fn round_participation_fixture(
 		version: HashlockVersion,
 		outputs: Vec<VtxoRequest>,
-	) -> (RoundParticipation, Vec<Vtxo<Full>>, Transaction, ArkInfo) {
+	) -> (RoundParticipation, Vec<Vtxo<Full>>, Transaction, ArkInfo, UnlockHash) {
 		let secp = Secp256k1::new();
 		let mut rng = rand::thread_rng();
 		let user_cosign_key = Keypair::new(&secp, &mut rng);
 		let server_key = Keypair::new(&secp, &mut rng);
 		let server_cosign_key = Keypair::new(&secp, &mut rng);
 		let preimage: UnlockPreimage = rand::random();
+		let unlock_hash = UnlockHash::hash(&preimage);
 		let (tree, funding_tx) = ark::test_util::build_signed_tree(
 			version, outputs.iter().cloned(),
-			&user_cosign_key, &server_key, &server_cosign_key, UnlockHash::hash(&preimage),
+			&user_cosign_key, &server_key, &server_cosign_key, unlock_hash,
 		);
 		let vtxos = tree.into_cached_tree().output_vtxos().collect::<Vec<_>>();
 		let part = RoundParticipation {
@@ -2860,7 +2882,7 @@ mod test {
 			max_vtxo_exit_depth: 10,
 			tos_link: None,
 		};
-		(part, vtxos, funding_tx, ark_info)
+		(part, vtxos, funding_tx, ark_info, unlock_hash)
 	}
 
 	#[test]
@@ -2872,14 +2894,14 @@ mod test {
 			round_request(20_000, &a), round_request(10_000, &b),
 		];
 		for version in [HashlockVersion::V0, HashlockVersion::V1] {
-			let (part, mut vtxos, funding_tx, ark_info) =
+			let (part, mut vtxos, funding_tx, ark_info, unlock_hash) =
 				round_participation_fixture(version, outputs.clone());
 			vtxos.rotate_left(1);
 			let saved_part = serde_json::to_vec(&part).unwrap();
 			let saved_vtxos = vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>();
 			check_round_matches_participation(
 				&part, &vtxos, &funding_tx, &ark_info, None,
-				BlockHeight::new(100_000), BlockDelta::new(12),
+				BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 			).expect("valid leaves may arrive in any order");
 			assert_eq!(serde_json::to_vec(&part).unwrap(), saved_part);
 			assert_eq!(vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>(), saved_vtxos);
@@ -2890,7 +2912,7 @@ mod test {
 	fn round_matches_identical_requests_only_with_distinct_leaves() {
 		let a = VtxoPolicy::new_pubkey(pubkey());
 		let b = VtxoPolicy::new_pubkey(pubkey());
-		let (part, mut vtxos, funding_tx, ark_info) = round_participation_fixture(
+		let (part, mut vtxos, funding_tx, ark_info, unlock_hash) = round_participation_fixture(
 			HashlockVersion::V1, vec![
 				round_request(10_000, &a), round_request(10_000, &a),
 				round_request(20_000, &b),
@@ -2900,13 +2922,13 @@ mod test {
 		assert_ne!(vtxos[1].id(), vtxos[2].id());
 		check_round_matches_participation(
 			&part, &vtxos, &funding_tx, &ark_info, None,
-			BlockHeight::new(100_000), BlockDelta::new(12),
+			BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 		).expect("identical requests must accept distinct leaves");
 
 		vtxos[2] = vtxos[1].clone();
 		let err = check_round_matches_participation(
 			&part, &vtxos, &funding_tx, &ark_info, None,
-			BlockHeight::new(100_000), BlockDelta::new(12),
+			BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 		).unwrap_err();
 		assert!(err.to_string().contains("duplicate VTXO"), "{err:#}");
 	}
@@ -2915,7 +2937,7 @@ mod test {
 	fn round_matches_rejects_substituted_output_multisets() {
 		let a = VtxoPolicy::new_pubkey(pubkey());
 		let b = VtxoPolicy::new_pubkey(pubkey());
-		let (mut part, vtxos, funding_tx, ark_info) = round_participation_fixture(
+		let (mut part, vtxos, funding_tx, ark_info, unlock_hash) = round_participation_fixture(
 			HashlockVersion::V1, vec![
 				round_request(10_000, &a), round_request(20_000, &b),
 				round_request(10_000, &a),
@@ -2941,7 +2963,7 @@ mod test {
 			assert_eq!(part.outputs.len(), vtxos.len(), "{case}");
 			let err = check_round_matches_participation(
 				&part, &vtxos, &funding_tx, &ark_info, None,
-				BlockHeight::new(100_000), BlockDelta::new(12),
+				BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 			).expect_err(case);
 			assert!(err.to_string().contains("unexpected VTXO amount or policy"), "{case}: {err:#}");
 		}
@@ -2950,18 +2972,18 @@ mod test {
 	#[test]
 	fn round_matches_rejects_missing_or_extra_outputs() {
 		let policy = VtxoPolicy::new_pubkey(pubkey());
-		let (part, mut vtxos, funding_tx, ark_info) = round_participation_fixture(
+		let (part, mut vtxos, funding_tx, ark_info, unlock_hash) = round_participation_fixture(
 			HashlockVersion::V1, vec![round_request(10_000, &policy); 2],
 		);
 		let missing = check_round_matches_participation(
 			&part, &vtxos[..1], &funding_tx, &ark_info, None,
-			BlockHeight::new(100_000), BlockDelta::new(12),
+			BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 		).unwrap_err();
 		assert!(missing.to_string().contains("unexpected number of VTXOs"), "{missing:#}");
 		vtxos.push(vtxos[0].clone());
 		let extra = check_round_matches_participation(
 			&part, &vtxos, &funding_tx, &ark_info, None,
-			BlockHeight::new(100_000), BlockDelta::new(12),
+			BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 		).unwrap_err();
 		assert!(extra.to_string().contains("unexpected number of VTXOs"), "{extra:#}");
 	}
@@ -2969,7 +2991,7 @@ mod test {
 	#[test]
 	fn round_matches_reordered_outputs_still_checks_tree_parameters() {
 		let policy = VtxoPolicy::new_pubkey(pubkey());
-		let (part, mut vtxos, funding_tx, ark_info) = round_participation_fixture(
+		let (part, mut vtxos, funding_tx, ark_info, unlock_hash) = round_participation_fixture(
 			HashlockVersion::V1, vec![
 				round_request(10_000, &policy), round_request(20_000, &policy),
 			],
@@ -2977,7 +2999,7 @@ mod test {
 		vtxos.reverse();
 		check_round_matches_participation(
 			&part, &vtxos, &funding_tx, &ark_info, None,
-			BlockHeight::new(100_000), BlockDelta::new(12),
+			BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 		).unwrap();
 		let mut wrong_server = ark_info.clone();
 		wrong_server.server_pubkey = pubkey();
@@ -2986,16 +3008,16 @@ mod test {
 		for info in [&wrong_server, &wrong_delta] {
 			assert!(check_round_matches_participation(
 				&part, &vtxos, &funding_tx, info, None,
-				BlockHeight::new(100_000), BlockDelta::new(12),
+				BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 			).is_err());
 		}
 		assert!(check_round_matches_participation(
 			&part, &vtxos, &funding_tx, &ark_info, Some(BlockHeight::new(101_000)),
-			BlockHeight::new(100_000), BlockDelta::new(12),
+			BlockHeight::new(100_000), BlockDelta::new(12), unlock_hash,
 		).is_err(), "outputs must outlive the scheduled height");
 		assert!(check_round_matches_participation(
 			&part, &vtxos, &funding_tx, &ark_info, None,
-			BlockHeight::new(100_953), BlockDelta::new(12),
+			BlockHeight::new(100_953), BlockDelta::new(12), unlock_hash,
 		).is_err(), "unexpired inputs require exitable outputs");
 	}
 
@@ -3095,6 +3117,161 @@ mod test {
 			.expect("vtxos with room for a unilateral exit should be accepted");
 		assert!(check_output_vtxos_exitable(&vtxos, BlockHeight::new(100_971), BlockDelta::new(12), BlockDelta::new(6)).is_err(),
 			"vtxos without room for a unilateral exit must be rejected");
+	}
+
+	/// A server-built round tree whose forged leaf (identical VtxoRequest,
+	/// foreign unlock hash H_B, first in server-chosen spec order) precedes
+	/// the genuine leaf locked under the participation unlock hash H_A.
+	#[allow(clippy::type_complexity)]
+	fn mismatched_unlock_hash_fixture() -> (
+		RoundParticipation, VtxoTreeSpec, Transaction, Vec<schnorr::Signature>,
+		CachedSignedVtxoTree, UnlockPreimage, UnlockHash, UnlockHash, ArkInfo,
+	) {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let user_key = Keypair::new(&secp, &mut rng);
+		let server_key = Keypair::new(&secp, &mut rng);
+		let server_cosign_key = Keypair::new(&secp, &mut rng);
+		let user_cosign_key = Keypair::new(&secp, &mut rng);
+
+		let preimage_a: UnlockPreimage = rand::random();
+		let hash_a = UnlockHash::hash(&preimage_a);
+		let preimage_b: UnlockPreimage = rand::random();
+		let hash_b = UnlockHash::hash(&preimage_b);
+		assert_ne!(hash_a, hash_b);
+
+		let req = round_request(10_000, &VtxoPolicy::new_pubkey(user_key.public_key()));
+		let spec = VtxoTreeSpec::new(
+			vec![
+				// forged leaf: identical request, foreign unlock hash, first
+				// in server-chosen spec order
+				VtxoLeafSpec { vtxo: req.clone(), cosign_pubkey: None, unlock_hash: hash_b },
+				// genuine leaf under the participation's unlock hash
+				VtxoLeafSpec { vtxo: req.clone(), cosign_pubkey: None, unlock_hash: hash_a },
+			],
+			server_key.public_key(),
+			BlockHeight::new(101_000),
+			BlockDelta::new(24),
+			vec![user_cosign_key.public_key(), server_cosign_key.public_key()],
+		);
+
+		let funding_tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![],
+			output: vec![spec.funding_tx_txout()],
+		};
+		let utxo = OutPoint::new(funding_tx.compute_txid(), ROUND_TX_VTXO_TREE_VOUT);
+		let unsigned = spec.clone().into_unsigned_tree(utxo);
+
+		let nonces = |key: &Keypair| -> (Vec<SecretNonce>, Vec<PublicNonce>) {
+			unsigned.internal_sighashes.iter()
+				.map(|sh| musig::nonce_pair_with_msg(key, &sh.to_byte_array()))
+				.unzip()
+		};
+		let (user_secs, user_pubs) = nonces(&user_cosign_key);
+		let (server_secs, server_pubs) = nonces(&server_cosign_key);
+		let agg_nonces = user_pubs.iter().zip(&server_pubs)
+			.map(|(u, s)| musig::AggregatedNonce::new(&[u, s]))
+			.collect::<Vec<_>>();
+		let user_sigs = unsigned.cosign_tree(&agg_nonces, &user_cosign_key, user_secs);
+		let server_sigs = unsigned.cosign_tree(&agg_nonces, &server_cosign_key, server_secs);
+		let sigs = unsigned.combine_partial_signatures(
+			&agg_nonces, &HashMap::new(), &[&user_sigs, &server_sigs],
+		).expect("valid partial signatures");
+		let cached = unsigned.into_signed_tree(sigs.clone()).into_cached_tree();
+
+		// The genuine leaf serves as a placeholder participation input; only
+		// its exit_delta/expiry are read by the checks.
+		let part = RoundParticipation {
+			inputs: vec![cached.build_vtxo(1)],
+			outputs: vec![req],
+			unblinded_mailbox_id: None,
+		};
+		#[allow(deprecated)]
+		let ark_info = ArkInfo {
+			network: bitcoin::Network::Regtest,
+			server_pubkey: server_key.public_key(),
+			mailbox_pubkey: server_key.public_key(),
+			round_interval: Duration::from_secs(60),
+			nb_round_nonces: 8,
+			vtxo_exit_delta: BlockDelta::new(24),
+			vtxo_lifetime: BlockDelta::new(1000),
+			htlc_send_expiry_delta: BlockDelta::new(100),
+			htlc_expiry_delta: BlockDelta::new(100),
+			max_vtxo_amount: None,
+			required_board_confirmations: 6,
+			max_user_invoice_cltv_delta: BlockDelta::new(100),
+			min_board_amount: Amount::from_sat(1000),
+			vtxo_expiry_delta: BlockDelta::new(1000),
+			offboard_feerate: bitcoin::FeeRate::ZERO,
+			max_offboard_inputs: 1,
+			ln_receive_anti_dos_required: false,
+			fees: Default::default(),
+			max_vtxo_exit_depth: 10,
+			tos_link: None,
+		};
+		(part, spec, funding_tx, sigs, cached, preimage_a, hash_a, hash_b, ark_info)
+	}
+
+	/// Delegated acceptance must reject a replacement VTXO locked under a
+	/// foreign unlock hash: the server earns the forfeit claim by revealing
+	/// only the preimage of the participation hash H_A, which cannot unlock
+	/// an H_B-locked leaf.
+	#[test]
+	fn delegated_acceptance_rejects_foreign_unlock_hash() {
+		let (part, _spec, funding_tx, _sigs, cached, preimage_a, hash_a, hash_b, ark_info) =
+			mismatched_unlock_hash_fixture();
+		let forged = cached.build_vtxo(0);
+		assert_eq!(forged.unlock_hash(), Some(hash_b),
+			"forged leaf carries the server's foreign unlock hash");
+
+		let err = check_round_matches_participation(
+			&part, &[forged.clone()], &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12), hash_a,
+		).expect_err("a leaf locked under a foreign unlock hash must be rejected");
+		assert!(err.to_string().contains("foreign unlock hash"), "{err:#}");
+
+		let mut accepted = forged;
+		assert!(!accepted.provide_unlock_preimage(preimage_a),
+			"preimage of the participation unlock hash {hash_a} cannot unlock the \
+			foreign-hash output {hash_b}");
+	}
+
+	/// Control: the same acceptance check passes for the genuine leaf locked
+	/// under the participation unlock hash.
+	#[test]
+	fn delegated_acceptance_accepts_matching_unlock_hash() {
+		let (part, _spec, funding_tx, _sigs, cached, preimage_a, hash_a, _hash_b, ark_info) =
+			mismatched_unlock_hash_fixture();
+		let mut genuine = cached.build_vtxo(1);
+		assert_eq!(genuine.unlock_hash(), Some(hash_a));
+
+		check_round_matches_participation(
+			&part, std::slice::from_ref(&genuine), &funding_tx, &ark_info, None,
+			BlockHeight::new(100_000), BlockDelta::new(12), hash_a,
+		).expect("the genuine leaf must be accepted");
+		assert!(genuine.provide_unlock_preimage(preimage_a),
+			"preimage of the participation unlock hash unlocks the accepted output");
+	}
+
+	/// Interactive construction must skip a request-matching duplicate leaf
+	/// locked under a foreign hash, even when the server orders it before
+	/// the genuine leaf, and select the genuine H_A leaf instead.
+	#[tokio::test]
+	async fn interactive_construction_skips_foreign_hash_leaf() {
+		let (part, spec, funding_tx, sigs, _cached, preimage_a, hash_a, _hash_b, _ark_info) =
+			mismatched_unlock_hash_fixture();
+
+		let vtxos = construct_new_vtxos(&part, &funding_tx, &spec, &sigs, hash_a)
+			.await.expect("a tree containing the genuine leaf passes acceptance");
+		assert_eq!(vtxos.len(), 1);
+		assert_eq!(vtxos[0].unlock_hash(), Some(hash_a),
+			"the foreign-hash duplicate leaf must not be selected");
+
+		let mut accepted = vtxos.into_iter().next().unwrap();
+		assert!(accepted.provide_unlock_preimage(preimage_a),
+			"preimage of the participation unlock hash unlocks the constructed output");
 	}
 
 	#[test]
