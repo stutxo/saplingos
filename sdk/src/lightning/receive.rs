@@ -82,7 +82,12 @@ impl Wallet {
 			for id in recv.pending_balance_vtxo_ids() {
 				let vtxo = self.get_vtxo_by_id(id).await?;
 				if vtxo.state.kind() == VtxoStateKind::Locked {
-					total += vtxo.vtxo.amount();
+					// The amount was issued by the server: checked, never the
+					// panicking `+=`. Bounded to the money supply like the
+					// fields of [crate::Balance] this total mirrors.
+					total = total.checked_add(vtxo.vtxo.amount())
+						.filter(|a| *a <= Amount::MAX_MONEY)
+						.context("claimable lightning receive balance exceeds the money supply")?;
 				}
 			}
 		}

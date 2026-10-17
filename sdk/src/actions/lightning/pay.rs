@@ -357,7 +357,10 @@ pub(crate) async fn start_lightning_send(
 		|a, v| ark_info.fees.lightning_send.calculate(a, v).context("fee overflowed"),
 	).await.context("Could not find enough suitable VTXOs to cover lightning payment")?;
 
-	let input_total = inputs.iter().map(|v| v.amount()).sum::<Amount>();
+	// The selected input VTXOs were issued by the server: never `sum`, which
+	// panics on forged large amounts.
+	let input_total = crate::utils::checked_sum_amounts(inputs.iter().map(|v| v.amount()))
+		.context("selected input amounts overflow")?;
 	let change = input_total.checked_sub(payment_amount + fee)
 		.context("selected inputs don't cover payment and fee")?;
 
@@ -433,7 +436,10 @@ pub(crate) async fn request_lightning_send_htlcs(
 		send.htlc_key, send.invoice.payment_hash(), send.htlc_expiry,
 	);
 	let total_amount = send.total_amount();
-	let input_amount = full_inputs.iter().map(|v| v.amount()).sum::<Amount>();
+	// The stored input VTXOs were issued by the server: never `sum`, which
+	// panics on forged large amounts.
+	let input_amount = crate::utils::checked_sum_amounts(full_inputs.iter().map(|v| v.amount()))
+		.context("lightning send input amounts overflow")?;
 	let change_amount = input_amount.checked_sub(total_amount)
 		.context("input vtxos don't cover payment and fee")?;
 
@@ -803,7 +809,10 @@ async fn finish_lightning_send_revocation(
 	wallet.ensure_program_recoveries(vtxos).await?;
 	wallet.register_vtxo_transactions_with_server(vtxos).await?;
 
-	let revoked = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
+	// The revoked VTXOs were issued by the server: never `sum`, which panics
+	// on forged large amounts.
+	let revoked = crate::utils::checked_sum_amounts(vtxos.iter().map(|v| v.amount()))
+		.context("revoked VTXO amounts overflow")?;
 	let effective = -send.total_amount().to_signed().context("total amount out of range")? +
 		revoked.to_signed().context("revoked amount out of range")?;
 	if effective != SignedAmount::ZERO {
@@ -853,7 +862,10 @@ pub(crate) async fn exit_lightning_send_htlcs(
 	};
 	wallet.exit_lightning_vtxos(vtxos, &send.id()).await?;
 
-	let exited = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
+	// The exited VTXOs were issued by the server: never `sum`, which panics
+	// on forged large amounts.
+	let exited = crate::utils::checked_sum_amounts(vtxos.iter().map(|v| v.amount()))
+		.context("exited VTXO amounts overflow")?;
 	let effective = -send.total_amount().to_signed()? + exited.to_signed()?;
 	if effective != SignedAmount::ZERO {
 		warn!(

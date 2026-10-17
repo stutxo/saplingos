@@ -526,7 +526,10 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 		trace!("Received HTLC VTXO {} from server: {}", vtxo.id(), vtxo.serialize_hex());
 		wallet.validate_vtxo(vtxo).await
 			.context("received invalid HTLC VTXO from server")?;
-		htlc_amount += vtxo.amount();
+		// The server chose this amount: checked, never the panicking `+=`.
+		htlc_amount = htlc_amount.checked_add(vtxo.amount())
+			.filter(|a| *a <= Amount::MAX_MONEY)
+			.context("HTLC VTXO amounts exceed the money supply")?;
 
 		if let VtxoPolicy::ServerHtlcRecv(p) = vtxo.policy() {
 			if p.payment_hash != payment_hash {
@@ -770,7 +773,10 @@ async fn deliver_lightning_receive(
 	wallet.register_vtxo_transactions_with_server(&delivery.vtxos).await?;
 	wallet.mark_vtxos_as_spent(&delivery.input_vtxo_ids).await?;
 
-	let received = delivery.vtxos.iter().map(|v| v.amount()).sum();
+	// The claimed VTXOs were issued by the server: never `sum`, which panics
+	// on forged large amounts.
+	let received = crate::utils::checked_sum_amounts(delivery.vtxos.iter().map(|v| v.amount()))
+		.context("lightning receive delivery amounts overflow")?;
 	let update = if external_destination {
 		let destination = recv.claim_destination.as_ref()
 			.context("external receive has no claim destination")?;

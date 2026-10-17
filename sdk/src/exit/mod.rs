@@ -1011,7 +1011,13 @@ impl Exit {
 					return Err(ExitError::VtxoNotClaimable { vtxo: input.id() });
 				}
 
-				output_amount += vtxo.amount();
+				// The exited VTXO amounts were issued by the server: checked,
+				// never the panicking `Add`. No real exit exceeds the supply.
+				output_amount = output_amount.checked_add(vtxo.amount())
+					.filter(|sum| *sum <= Amount::MAX_MONEY)
+					.ok_or_else(|| ExitError::InternalError {
+						error: "claim output amount exceeds the money supply".into(),
+					})?;
 
 				let clause = wallet.find_signable_clause(vtxo).await
 					.ok_or(ExitError::ClaimMissingSignableClause { vtxo: vtxo.id() })?;

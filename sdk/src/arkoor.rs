@@ -290,7 +290,10 @@ impl Wallet {
 			return Err(anyhow!("Cannot create arkoor to same address as change").into());
 		}
 
-		let total_input = inputs.iter().map(|v| v.amount()).sum::<Amount>();
+		// The stored input VTXOs were issued by the server: never `sum`, which
+		// panics on forged large amounts.
+		let total_input = crate::utils::checked_sum_amounts(inputs.iter().map(|v| v.amount()))
+			.context("arkoor input amounts overflow")?;
 		let change_amount = total_input.checked_sub(arkoor_dest.total_amount)
 			.ok_or_else(|| anyhow!("arkoor inputs ({}) don't cover destination ({})",
 				total_input, arkoor_dest.total_amount,
