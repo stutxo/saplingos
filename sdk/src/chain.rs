@@ -364,10 +364,14 @@ impl ChainSource {
 						Err(anyhow!("No rate returned from estimate_smart_fee for a {} confirmation target", target))
 					}
 				};
+				// A missing rate for any tier (routine on fresh or low-traffic
+				// nodes) propagates and lets `update_fee_rates` apply the
+				// configured fallback; panicking here would crash-loop the
+				// daemon sync task and bypass the fallback contract.
 				Ok(FeeRates {
 					fast: get_fee_rate(FEE_RATE_TARGET_CONF_FAST).await?,
-					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR).await.expect("should exist"),
-					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW).await.expect("should exist"),
+					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR).await?,
+					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW).await?,
 				})
 			},
 			ChainSourceClient::Esplora(client) => {
@@ -1337,6 +1341,119 @@ mod test {
 				Some((t, TxStatus::Confirmed(block)))
 					if *t == txid && block.hash == hash && block.height == BlockHeight::new(840000),
 			));
+		}
+	}
+
+	#[cfg(all(feature = "bitcoind-rpc", not(target_arch = "wasm32")))]
+	mod bitcoind_fee_rates {
+		use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		use super::*;
+
+		/// Loopback JSON-RPC stub answering `estimatesmartfee`: targets in
+		/// `data_targets` get a real feerate, the others get bitcoind's routine
+		/// insufficient-data body (fresh/restarted nodes, low-traffic networks).
+		/// Runs `update_fee_rates` against it and returns the chain source.
+		async fn run_with_fixture(data_targets: &[u16], fallback: Option<FeeRate>) -> ChainSource {
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let url = format!("http://{}", listener.local_addr().unwrap());
+			let data_targets = data_targets.to_vec();
+			let server = tokio::spawn(async move {
+				loop {
+					let (socket, _) = listener.accept().await.unwrap();
+					let data_targets = data_targets.clone();
+					tokio::spawn(async move {
+						let mut socket = BufReader::new(socket);
+						let mut line = String::new();
+						socket.read_line(&mut line).await.unwrap();
+						let mut content_length = 0;
+						loop {
+							line.clear();
+							assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+							if line == "\r\n" {
+								break;
+							}
+							if let Some((name, value)) = line.split_once(':') {
+								if name.eq_ignore_ascii_case("content-length") {
+									content_length = value.trim().parse::<usize>().unwrap();
+								}
+							}
+						}
+						let mut request = vec![0; content_length];
+						socket.read_exact(&mut request).await.unwrap();
+						let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+						assert_eq!(request["method"], "estimatesmartfee");
+						let target = request["params"][0].as_u64().unwrap() as u16;
+						let result = if data_targets.contains(&target) {
+							serde_json::json!({"feerate": 0.00002, "blocks": target})
+						} else {
+							serde_json::json!({
+								"errors": ["Insufficient data or no feerate found which meets threshold 0.00001000 BTC/kvB"],
+								"blocks": target,
+							})
+						};
+						let response = serde_json::json!({
+							"result": result,
+							"error": null,
+							"id": request["id"],
+						}).to_string();
+						socket.write_all(format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+							 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+							response.len(), response,
+						).as_bytes()).await.unwrap();
+						socket.shutdown().await.unwrap();
+					});
+				}
+			});
+			let auth = rpc::Auth::UserPass("user".into(), "password".into());
+			let fee = FeeRate::BROADCAST_MIN;
+			let chain = ChainSource {
+				inner: ChainSourceClient::Bitcoind {
+					sync: BitcoinRpcClient::new(&url, auth).unwrap(),
+					rpc: BitcoindClient::new(
+						url,
+						bitcoind_async_client::Auth::UserPass("user".into(), "password".into()),
+						None, None, None,
+					).unwrap(),
+				},
+				network: Network::Regtest,
+				zmq_endpoint: None,
+				fee_rates: RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee }),
+				fee_rates_fetched_at: RwLock::new(None),
+				tip_cache: RwLock::new(None),
+			};
+			chain.update_fee_rates(fallback).await.unwrap();
+			server.abort();
+			chain
+		}
+
+		/// Only the fast target has an estimate (fresh node state): the missing
+		/// regular/slow estimates must propagate as an error so the configured
+		/// fallback is applied to all tiers, not panic `update_fee_rates`.
+		#[tokio::test]
+		async fn partial_fee_estimates_apply_fallback_without_panicking() {
+			let fallback = FeeRate::from_sat_per_vb(10).unwrap();
+			let chain = run_with_fixture(&[FEE_RATE_TARGET_CONF_FAST], Some(fallback)).await;
+			assert_eq!(
+				chain.fee_rates().await,
+				FeeRates { fast: fallback, regular: fallback, slow: fallback },
+			);
+		}
+
+		/// Control: with estimates for all targets, the backend rates are adopted.
+		#[tokio::test]
+		async fn complete_fee_estimates_are_adopted() {
+			let chain = run_with_fixture(
+				&[FEE_RATE_TARGET_CONF_FAST, FEE_RATE_TARGET_CONF_REGULAR, FEE_RATE_TARGET_CONF_SLOW],
+				Some(FeeRate::from_sat_per_vb(10).unwrap()),
+			).await;
+			let estimate = FeeRate::from_amount_per_kvb_ceil(Amount::from_sat(2_000));
+			assert_eq!(
+				chain.fee_rates().await,
+				FeeRates { fast: estimate, regular: estimate, slow: estimate },
+			);
 		}
 	}
 
