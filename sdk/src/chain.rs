@@ -649,18 +649,28 @@ impl ChainSource {
 
 					if let Some(output_status) = output_status {
 						if output_status.spent {
+							// The backend is untrusted: a `spent` record that
+							// lacks the fields needed to conclude must be an
+							// error, not a panic.
+							let missing = |field| anyhow!(
+								"esplora outspend for {}:{} claims spent but carries no {}",
+								outpoint.txid, outpoint.vout, field,
+							);
 							let tx_status = {
-								let status = output_status.status.expect("Status should be valid if an outpoint is spent");
+								let status = output_status.status
+									.ok_or_else(|| missing("status"))?;
 								if status.confirmed {
 									TxStatus::Confirmed(BlockRef {
-										height: status.block_height.expect("Confirmed transaction missing block_height").into(),
-										hash: status.block_hash.expect("Confirmed transaction missing block_hash"),
+										height: status.block_height
+											.ok_or_else(|| missing("block_height"))?.into(),
+										hash: status.block_hash
+											.ok_or_else(|| missing("block_hash"))?,
 									})
 								} else {
 									TxStatus::Mempool
 								}
 							};
-							let txid = output_status.txid.expect("Txid should be valid if an outpoint is spent");
+							let txid = output_status.txid.ok_or_else(|| missing("txid"))?;
 							res.add(outpoint, txid, tx_status);
 						}
 					}
@@ -1221,6 +1231,112 @@ mod test {
 			] {
 				assert_original_error(broadcast(400, DUPLICATE, Some(readback)).await, DUPLICATE);
 			}
+		}
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	mod esplora_outspend {
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		use super::*;
+
+		/// Serve a single fixed `outspend` response body on loopback and query it
+		/// through the esplora branch of `txs_spending_inputs`.
+		async fn query_outspend(body: &str) -> (anyhow::Result<TxsSpendingInputsResult>, OutPoint) {
+			let outpoint = OutPoint::new(genesis_block(Network::Bitcoin).txdata[0].compute_txid(), 0);
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let url = format!("http://{}", listener.local_addr().unwrap());
+			let body = body.to_owned();
+			let server = tokio::spawn(async move {
+				let (socket, _) = listener.accept().await.unwrap();
+				let mut socket = BufReader::new(socket);
+				let mut line = String::new();
+				socket.read_line(&mut line).await.unwrap();
+				loop {
+					line.clear();
+					assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+					if line == "\r\n" {
+						break;
+					}
+				}
+				socket.write_all(format!(
+					"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+					 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+					body.len(), body,
+				).as_bytes()).await.unwrap();
+				socket.shutdown().await.unwrap();
+			});
+			let fee = FeeRate::BROADCAST_MIN;
+			let chain = ChainSource {
+				inner: ChainSourceClient::Esplora(
+					esplora_client::Builder::new(&url).max_retries(0).timeout(5)
+						.build_async().unwrap(),
+				),
+				network: Network::Bitcoin,
+				zmq_endpoint: None,
+				fee_rates: RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee }),
+				fee_rates_fetched_at: RwLock::new(None),
+				tip_cache: RwLock::new(None),
+			};
+			#[allow(deprecated)]
+			let result = chain.txs_spending_inputs(vec![outpoint], BlockHeight::new(0)).await;
+			server.await.unwrap();
+			(result, outpoint)
+		}
+
+		/// Spent records from a buggy or malicious esplora server that lack the
+		/// fields electrs normally serves must surface as typed errors, not
+		/// panics: daemon tasks stay alive to retry on the next iteration.
+		#[tokio::test]
+		async fn spent_record_missing_fields_is_error_not_panic() {
+			for (body, field) in [
+				(r#"{"spent": true}"#, "status"),
+				(r#"{"spent": true, "status": {"confirmed": true}}"#, "block_height"),
+				(
+					r#"{"spent": true, "status": {"confirmed": true, "block_height": 840000}}"#,
+					"block_hash",
+				),
+				(r#"{"spent": true, "status": {"confirmed": false}}"#, "txid"),
+			] {
+				let (result, outpoint) = query_outspend(body).await;
+				let err = result.err().unwrap_or_else(|| panic!("{} must fail", body));
+				let message = format!("{}", err);
+				assert!(
+					message.contains(&outpoint.txid.to_string())
+						&& message.contains(&format!("no {}", field)),
+					"unexpected error for {}: {}", body, message,
+				);
+			}
+		}
+
+		/// Well-formed spent records must still map, for both mempool and
+		/// confirmed spends.
+		#[tokio::test]
+		async fn well_formed_spent_records_still_map() {
+			let txid = Txid::from_str(
+				"1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+			let (result, outpoint) = query_outspend(&format!(
+				r#"{{"spent": true, "txid": "{}", "status": {{"confirmed": false}}}}"#, txid,
+			)).await;
+			let result = result.unwrap();
+			assert!(matches!(result.get(&outpoint), Some((t, TxStatus::Mempool)) if *t == txid));
+
+			let hash = BlockHash::from_str(
+				"0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+			let (result, outpoint) = query_outspend(&format!(
+				concat!(
+					r#"{{"spent": true, "txid": "{}", "status": {{"confirmed": true, "#,
+					r#""block_height": 840000, "block_hash": "{}"}}}}"#,
+				),
+				txid, hash,
+			)).await;
+			let result = result.unwrap();
+			assert!(matches!(
+				result.get(&outpoint),
+				Some((t, TxStatus::Confirmed(block)))
+					if *t == txid && block.hash == hash && block.height == BlockHeight::new(840000),
+			));
 		}
 	}
 
