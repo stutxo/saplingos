@@ -321,6 +321,9 @@ pub struct WalletProperties {
 pub struct WalletSeed {
 	master: bip32::Xpriv,
 	vtxo: bip32::Xpriv,
+	/// Counts VTXO key derivations so tests can assert recovery's scan budget.
+	#[cfg(test)]
+	vtxo_key_derivations: std::sync::atomic::AtomicUsize,
 }
 
 impl WalletSeed {
@@ -336,7 +339,12 @@ impl WalletSeed {
 		let vtxo = master.derive_priv(&SECP, &vtxo_path)
 			.expect("vtxo path is valid");
 
-		Self { master, vtxo }
+		Self {
+			master,
+			vtxo,
+			#[cfg(test)]
+			vtxo_key_derivations: std::sync::atomic::AtomicUsize::new(0),
+		}
 	}
 
 	/// Create a new [WalletSeed] from a given BIP-39 [Mnemonic]
@@ -349,7 +357,16 @@ impl WalletSeed {
 	}
 
 	fn derive_vtxo_keypair(&self, idx: u32) -> Keypair {
+		#[cfg(test)]
+		self.vtxo_key_derivations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		self.vtxo.derive_priv(&SECP, &[idx.into()]).unwrap().to_keypair(&SECP)
+	}
+
+	/// Number of VTXO key derivations performed so far, for tests asserting
+	/// how much key-space scanning a code path performs.
+	#[cfg(test)]
+	pub(crate) fn vtxo_key_derivation_count(&self) -> usize {
+		self.vtxo_key_derivations.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
 	fn to_mailbox_keypair(&self) -> Keypair {
