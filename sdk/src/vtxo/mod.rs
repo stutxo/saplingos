@@ -540,4 +540,43 @@ mod test {
 		let spec = hostile_spec(server, vtxos, vec![cosigner]);
 		assert_eq!(VtxoTreeSpec::deserialize(&spec.serialize()).unwrap(), spec);
 	}
+
+	/// Attackers control the leaf amounts of the trees we sign; amounts must
+	/// be bounded so tree building cannot overflow its value sums.
+	#[test]
+	fn vtxo_tree_spec_rejects_invalid_leaf_amounts() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let server = Keypair::new(&secp, &mut rng).public_key();
+		let cosigner = Keypair::new(&secp, &mut rng).public_key();
+
+		// zero and above-money-supply leaf amounts
+		for amount in [Amount::ZERO, Amount::MAX_MONEY + Amount::from_sat(1), Amount::from_sat(u64::MAX)] {
+			let spec = hostile_spec(server, vec![hostile_leaf(server, amount, None)], vec![cosigner]).serialize();
+			let err = VtxoTreeSpec::deserialize(&spec)
+				.expect_err("tree with out-of-range leaf amount must be rejected");
+			assert!(err.to_string().contains("leaf amount out of range"),
+				"unexpected error: {err}");
+		}
+
+		// a total exceeding the money supply used to overflow the panicking
+		// leaf-amount sum while building the unsigned tree
+		let spec = hostile_spec(server, vec![
+			hostile_leaf(server, Amount::MAX_MONEY, Some(cosigner)),
+			hostile_leaf(server, Amount::MAX_MONEY, None),
+		], vec![cosigner]).serialize();
+		let err = VtxoTreeSpec::deserialize(&spec)
+			.expect_err("tree with excessive total value must be rejected");
+		assert!(err.to_string().contains("total value exceeds maximum money"),
+			"unexpected error: {err}");
+
+		// control: the decoded valid spec builds an unsigned tree fine
+		let good = hostile_spec(server, vec![
+			hostile_leaf(server, Amount::from_int_btc(10_500_000), Some(cosigner)),
+			hostile_leaf(server, Amount::from_int_btc(10_500_000), None),
+		], vec![cosigner]);
+		let decoded = VtxoTreeSpec::deserialize(&good.serialize()).unwrap();
+		assert_eq!(decoded, good);
+		decoded.into_unsigned_tree(bitcoin::OutPoint::null());
+	}
 }

@@ -1553,6 +1553,11 @@ where
 	}
 
 	let amount = Amount::from_sat(r.read_u64()?);
+	if amount == Amount::ZERO || amount > Amount::MAX_MONEY {
+		return Err(ProtocolDecodingError::invalid(
+			"vtxo amount out of range",
+		));
+	}
 	let expiry_height = check_block_height(r.read_u32()?)
 		.map_err(|e| ProtocolDecodingError::invalid_err(e, "expiry_height"))?;
 	let server_pubkey = PublicKey::decode(r)?;

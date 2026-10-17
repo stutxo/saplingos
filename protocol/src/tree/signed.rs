@@ -11,7 +11,7 @@ use bitcoin::secp256k1::{schnorr, Keypair, PublicKey, XOnlyPublicKey};
 use bitcoin::sighash::{self, SighashCache, TapSighash, TapSighashType};
 use secp256k1_musig::musig::{AggregatedNonce, PartialSignature, PublicNonce, SecretNonce};
 
-use bitcoin_ext::{fee, BlockDelta, BlockHeight, TaprootSpendInfoExt, TransactionExt, TxOutExt};
+use bitcoin_ext::{fee, BlockDelta, BlockHeight, TaprootSpendInfoExt, TxOutExt};
 
 use crate::{musig, scripts, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy, VtxoRequest, SECP};
 use crate::encode::{
@@ -134,10 +134,17 @@ impl ProtocolEncoding for VtxoLeafSpec {
 	}
 
 	fn decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, ProtocolDecodingError> {
+		let policy = VtxoPolicy::decode(r)?;
+		let amount = Amount::from_sat(r.read_u64()?);
+		if amount == Amount::ZERO || amount > Amount::MAX_MONEY {
+			return Err(ProtocolDecodingError::invalid(
+				"vtxo leaf amount out of range",
+			));
+		}
 		Ok(VtxoLeafSpec {
 			vtxo: VtxoRequest {
-				policy: VtxoPolicy::decode(r)?,
-				amount: Amount::from_sat(r.read_u64()?),
+				policy,
+				amount,
 			},
 			cosign_pubkey: Option::<PublicKey>::decode(r)?,
 			unlock_hash: sha256::Hash::decode(r)?,
@@ -167,6 +174,24 @@ enum ChildSpec<'a> {
 		output_value: Amount,
 		agg_pk: PublicKey,
 	},
+}
+
+/// Validate that all leaf amounts are in the valid money range and that
+/// their total can be represented, so tree building never overflows when
+/// summing values.
+fn check_amounts(vtxos: &[VtxoLeafSpec]) -> Result<(), &'static str> {
+	let mut total = Amount::ZERO;
+	for leaf in vtxos {
+		if leaf.vtxo.amount == Amount::ZERO || leaf.vtxo.amount > Amount::MAX_MONEY {
+			return Err("vtxo leaf amount out of range");
+		}
+		total = total.checked_add(leaf.vtxo.amount)
+			.ok_or("vtxo tree spec total value overflows")?;
+	}
+	if total > Amount::MAX_MONEY {
+		return Err("vtxo tree spec total value exceeds maximum money");
+	}
+	Ok(())
 }
 
 /// Validate that no musig key aggregation performed while building or
@@ -202,6 +227,9 @@ impl VtxoTreeSpec {
 		global_cosign_pubkeys: Vec<PublicKey>,
 	) -> VtxoTreeSpec {
 		assert_ne!(vtxos.len(), 0);
+		if let Err(e) = check_amounts(&vtxos) {
+			panic!("{e}");
+		}
 		if let Err(e) = check_cosign_sets(&vtxos, &global_cosign_pubkeys) {
 			panic!("{e}");
 		}
@@ -261,7 +289,11 @@ impl VtxoTreeSpec {
 	/// This accounts for
 	/// - all vtxos getting their value
 	pub fn total_required_value(&self) -> Amount {
-		self.vtxos.iter().map(|d| d.vtxo.amount).sum::<Amount>()
+		// Leaf amounts and their total are bounded at construction time,
+		// so this sum cannot overflow.
+		self.vtxos.iter().map(|d| d.vtxo.amount)
+			.try_fold(Amount::ZERO, |acc, amt| acc.checked_add(amt))
+			.expect("vtxo tree spec total value overflow")
 	}
 
 	/// Calculate the taproot spend info for a leaf node
@@ -391,23 +423,38 @@ impl VtxoTreeSpec {
 
 		let cosign_agg_pks = self.cosign_agg_pks().collect::<Vec<_>>();
 
+		// Total output values per node, kept alongside the txs so internal
+		// node values are propagated with checked arithmetic instead of
+		// summing child tx outputs after the fact.
+		let mut node_values = Vec::<Amount>::with_capacity(tree.nb_nodes());
 		let mut txs = Vec::<Transaction>::with_capacity(tree.nb_nodes());
 		for node in tree.iter() {
 			let tx = if node.is_leaf() {
-				self.leaf_tx(&self.vtxos[node.idx()].vtxo).clone()
+				let spec = &self.vtxos[node.idx()];
+				node_values.push(spec.vtxo.amount);
+				self.leaf_tx(&spec.vtxo).clone()
 			} else {
 				let mut buf = [None; tree::RADIX];
+				let mut value = Amount::ZERO;
 				for (idx, child) in node.children().enumerate() {
-					let child = if let Some(spec) = self.vtxos.get(child) {
-						ChildSpec::Leaf { spec }
+					let (child, child_value) = if let Some(spec) = self.vtxos.get(child) {
+						(ChildSpec::Leaf { spec }, spec.vtxo.amount)
 					} else {
-						ChildSpec::Internal {
-							output_value: txs[child].output_value(),
+						(ChildSpec::Internal {
+							output_value: node_values[child],
 							agg_pk: cosign_agg_pks[child],
-						}
+						}, node_values[child])
 					};
+					// sums of validated leaf amounts (plus zero-value fee
+					// anchors) cannot exceed the money supply
+					value = value.checked_add(child_value)
+						.expect("vtxo tree node value overflow");
 					buf[idx] = Some(child);
 				}
+				// include the node's own zero-value fee anchor so this
+				// equals the node tx's total output value
+				node_values.push(value.checked_add(fee::fee_anchor().value)
+					.expect("fee anchor value overflow"));
 				self.node_tx(buf.iter().filter_map(|x| *x))
 			};
 			txs.push(tx.clone());
@@ -1927,6 +1974,10 @@ impl ProtocolEncoding for VtxoTreeSpec {
 				"vtxo tree spec must have at least one leaf",
 			));
 		}
+		// Reject trees whose total required value cannot be represented
+		// as a valid bitcoin amount; tree building sums these values.
+		check_amounts(&vtxos)
+			.map_err(ProtocolDecodingError::invalid)?;
 		// Reject trees that can never be cosigned because some musig
 		// key aggregate would be empty.
 		check_cosign_sets(&vtxos, &global_cosign_pubkeys)
@@ -1993,6 +2044,8 @@ mod test {
 	use bitcoin::secp256k1::{self, rand, Keypair};
 	use bitcoin::{absolute, transaction};
 	use rand::SeedableRng;
+
+	use bitcoin_ext::TransactionExt;
 
 	use crate::encode;
 	use crate::test_util::{encoding_roundtrip, json_roundtrip};
@@ -2560,6 +2613,71 @@ mod test {
 			).unwrap(),
 		};
 		VtxoTreeSpec::new(vec![leaf], pk, BlockHeight::new(100_000), BlockDelta::new(2016), vec![]);
+	}
+
+	#[test]
+	fn vtxo_tree_spec_rejects_invalid_leaf_amounts() {
+		let pk: PublicKey = "020aceb65eed0ee5c512d3718e6f4bd868a7efb58ede7899ffd9bcba09555d4eb8"
+			.parse().unwrap();
+		let hash = sha256::Hash::from_str(
+			"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+		).unwrap();
+
+		let leaf = |amount| VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount,
+				policy: VtxoPolicy::new_pubkey(pk),
+			},
+			cosign_pubkey: Some(pk),
+			unlock_hash: hash,
+		};
+		let spec = |vtxos| VtxoTreeSpec {
+			vtxos,
+			expiry_height: BlockHeight::new(100_000),
+			server_pubkey: pk,
+			exit_delta: BlockDelta::new(2016),
+			global_cosign_pubkeys: vec![pk],
+			hashlock_version: HashlockVersion::V1,
+		};
+
+		// zero, more than the money supply and u64::MAX leaf amounts
+		for amount in [Amount::ZERO, Amount::MAX_MONEY + Amount::from_sat(1), Amount::from_sat(u64::MAX)] {
+			let buf = spec(vec![leaf(amount)]).serialize();
+			let err = VtxoTreeSpec::deserialize(&buf)
+				.expect_err("spec with out-of-range leaf amount must be rejected");
+			let msg = err.to_string();
+			assert!(msg.contains("leaf amount out of range"), "unexpected error message: {msg}");
+		}
+
+		// a total exceeding the money supply, built from in-range leaves,
+		// used to overflow the panicking sum in total_required_value
+		let buf = spec(vec![leaf(Amount::MAX_MONEY), leaf(Amount::MAX_MONEY)]).serialize();
+		let err = VtxoTreeSpec::deserialize(&buf)
+			.expect_err("spec with excessive total value must be rejected");
+		let msg = err.to_string();
+		assert!(msg.contains("total value exceeds maximum money"), "unexpected error message: {msg}");
+
+		// control: in-range leaves totalling to the money supply are accepted
+		let half = Amount::from_int_btc(10_500_000);
+		encoding_roundtrip(&spec(vec![leaf(half), leaf(half)]));
+	}
+
+	#[test]
+	#[should_panic(expected = "vtxo leaf amount out of range")]
+	fn vtxo_tree_spec_new_panics_on_zero_amount() {
+		let pk: PublicKey = "020aceb65eed0ee5c512d3718e6f4bd868a7efb58ede7899ffd9bcba09555d4eb8"
+			.parse().unwrap();
+		let leaf = VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount: Amount::ZERO,
+				policy: VtxoPolicy::new_pubkey(pk),
+			},
+			cosign_pubkey: Some(pk),
+			unlock_hash: sha256::Hash::from_str(
+				"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+			).unwrap(),
+		};
+		VtxoTreeSpec::new(vec![leaf], pk, BlockHeight::new(100_000), BlockDelta::new(2016), vec![pk]);
 	}
 
 	#[test]
