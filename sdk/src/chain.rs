@@ -514,11 +514,7 @@ impl ChainSource {
 				let entry: rpc::json::GetMempoolEntryResult = rpc.call_raw(
 					"getmempoolentry", &[serde_json::to_value(txid).expect("serializable")],
 				).await?;
-				let err = || anyhow!("missing weight parameter from getmempoolentry");
-
-				result.total_fee = entry.fees.ancestor;
-				result.total_weight = Weight::from_wu(entry.weight.ok_or_else(err)?) +
-					Weight::from_vb(entry.ancestor_size).ok_or_else(err)?;
+				result = ancestor_info_from_mempool_entry(txid, entry)?;
 			},
 			ChainSourceClient::Esplora(client) => {
 				// We should first verify the transaction is in the mempool to maintain the same
@@ -884,6 +880,24 @@ impl TipSource for ChainSource {
 }
 
 // ----- bitcoind-rpc feature-gated helpers ---------------------------------
+
+/// Map a bitcoind `getmempoolentry` result onto [MempoolAncestorInfo].
+///
+/// Bitcoin Core reports `ancestorsize`/`ancestorfees` INCLUDING the
+/// transaction itself — exactly [MempoolAncestorInfo]'s "transaction and all
+/// of its unconfirmed ancestors" semantics — so the transaction's own weight
+/// must not be added on top of `ancestor_size`. Doing so double-counts it and
+/// understates the package fee rate, triggering spurious CPFP RBF bumps.
+#[cfg(feature = "bitcoind-rpc")]
+fn ancestor_info_from_mempool_entry(
+	txid: Txid, entry: rpc::json::GetMempoolEntryResult,
+) -> anyhow::Result<MempoolAncestorInfo> {
+	let mut result = MempoolAncestorInfo::new(txid);
+	result.total_fee = entry.fees.ancestor;
+	result.total_weight = Weight::from_vb(entry.ancestor_size).ok_or_else(||
+		anyhow!("invalid ancestorsize {} from getmempoolentry", entry.ancestor_size))?;
+	Ok(result)
+}
 
 /// Inspect upstream `bitcoind-async-client` JSON-RPC errors for the
 /// "transaction not found" code. Mirrors the sync-side `BitcoinRpcErrorExt`
@@ -1454,6 +1468,72 @@ mod test {
 				chain.fee_rates().await,
 				FeeRates { fast: estimate, regular: estimate, slow: estimate },
 			);
+		}
+	}
+
+	#[cfg(feature = "bitcoind-rpc")]
+	mod bitcoind_mempool_entry {
+		use super::*;
+
+		fn getmempoolentry(
+			own_weight_wu: u64, ancestor_size_vb: u64, ancestor_fee: Amount,
+		) -> rpc::json::GetMempoolEntryResult {
+			let wtxid = Txid::from_str(
+				"1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+			rpc::json::GetMempoolEntryResult {
+				vsize: own_weight_wu.div_ceil(4),
+				weight: Some(own_weight_wu),
+				time: 1_700_000_000,
+				height: 840_000,
+				descendant_count: 1,
+				descendant_size: own_weight_wu.div_ceil(4),
+				ancestor_count: 2,
+				ancestor_size: ancestor_size_vb,
+				wtxid,
+				fees: rpc::json::GetMempoolEntryResultFees {
+					base: Amount::from_sat(100),
+					modified: Amount::from_sat(100),
+					ancestor: ancestor_fee,
+					descendant: Amount::from_sat(100),
+				},
+				depends: vec![],
+				spent_by: vec![],
+				bip125_replaceable: false,
+				unbroadcast: Some(false),
+			}
+		}
+
+		/// Bitcoin Core's `ancestorsize`/`ancestorfees` already include the
+		/// transaction itself, so the total weight must come from `ancestorsize`
+		/// alone: adding the transaction's own `weight` again would double-count
+		/// it and understate the package fee rate used for CPFP RBF decisions.
+		#[test]
+		fn ancestor_mapping_uses_ancestor_size_including_self() {
+			// A package of 2000 vB total paying 1000 sat: the queried transaction
+			// itself weighs 2000 wu (500 vB), its ancestors the remaining 1500 vB.
+			let entry = getmempoolentry(2_000, 2_000, Amount::from_sat(1_000));
+			let txid = Txid::from_str(
+				"2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+			let info = ancestor_info_from_mempool_entry(txid, entry).unwrap();
+			assert_eq!(info.txid, txid);
+			// `fees.ancestor`, not the transaction's own fee, is the package fee.
+			assert_eq!(info.total_fee, Amount::from_sat(1_000));
+			// 2000 vB * 4, not 8000 + the transaction's own 2000 wu.
+			assert_eq!(info.total_weight, Weight::from_wu(8_000));
+			assert_eq!(info.effective_fee_rate(), Some(FeeRate::from_sat_per_kwu(125)));
+		}
+
+		/// The mapping result must be independent of the transaction's own
+		/// `weight` field, which `ancestorsize` already accounts for.
+		#[test]
+		fn ancestor_mapping_ignores_own_weight_field() {
+			let txid = Txid::from_str(
+				"2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+			let small = ancestor_info_from_mempool_entry(
+				txid, getmempoolentry(2_000, 2_000, Amount::from_sat(1_000))).unwrap();
+			let large = ancestor_info_from_mempool_entry(
+				txid, getmempoolentry(4_000, 2_000, Amount::from_sat(1_000))).unwrap();
+			assert_eq!(small, large);
 		}
 	}
 
