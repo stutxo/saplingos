@@ -16,13 +16,17 @@ use crate::exit::models::{
 };
 use crate::persist::WalletPersister;
 
-/// How deep a spend of an exit input must be buried before it ends the exit.
+/// How deep an on-chain spend must be buried before an exit may end because of it.
 ///
-/// Ending an exit is irreversible, so a spend that a reorg could still undo must not do it. It
-/// also bounds the block scan in [ExitTransactionManager::find_conflicting_spend]: a spend the
-/// scan doesn't find within this many blocks of the tip is older than the window, and therefore
-/// deep enough to act on.
-const SPEND_CONFIRMATIONS: BlockDelta = BlockDelta::new(6);
+/// Ending an exit is irreversible, so a spend that a reorg could still undo must not end it.
+/// This gates the `VtxoAlreadySpent`/`VtxoSwept` endings in
+/// [ExitTransactionManager::find_conflicting_spend] and the `Claimed` ending in the exit
+/// state machine (`crate::exit::progress::states`).
+///
+/// It also bounds the block scan in [ExitTransactionManager::find_conflicting_spend]: a spend
+/// the scan doesn't find within this many blocks of the tip is older than the window, and
+/// therefore deep enough to act on.
+pub(crate) const SPEND_CONFIRMATIONS: BlockDelta = BlockDelta::new(6);
 
 pub struct ExitTransactionManager {
 	persister: Arc<dyn WalletPersister>,

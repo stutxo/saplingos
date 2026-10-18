@@ -34,6 +34,12 @@ pub enum ExitState {
 	/// Terminal state: the exit is fully complete, and the VTXO has been claimed by the user or
 	/// spent by another user who owns a VTXO that is deeper in the tree than this one.
 	///
+	/// Only entered once the claim spend is at least `SPEND_CONFIRMATIONS` deep
+	/// ([crate::exit::transaction_manager]): reaching `Claimed` finalizes the movement as
+	/// `Successful` and drops the exit from live tracking, so it must not latch on a spend a
+	/// shallow reorg could still undo. States written by older versions may be shallower and
+	/// are still treated as final — see [ExitClaimedState].
+	///
 	/// Note: The circumstances in which the latter can occur are typically when the user has stale
 	/// data and is trying to exit an already-spent VTXO.
 	Claimed(ExitClaimedState),
@@ -194,12 +200,14 @@ impl ExitState {
 	pub fn new_claim_in_progress(
 		tip: BlockHeight,
 		claimable_since: BlockRef,
-		claim_txid: Txid
+		claim_txid: Txid,
+		claim_block: Option<BlockRef>,
 	) -> Self {
 		ExitState::ClaimInProgress(ExitClaimInProgressState {
 			tip_height: tip,
 			claimable_since,
 			claim_txid,
+			claim_block,
 		})
 	}
 
@@ -367,7 +375,7 @@ mod test {
 			ExitState::new_processing(tip, [txid(1)]),
 			ExitState::new_awaiting_delta(tip, block_ref, BlockDelta::new(10)),
 			ExitState::new_claimable(tip, block_ref, Some(block_ref)),
-			ExitState::new_claim_in_progress(tip, block_ref, txid(1)),
+			ExitState::new_claim_in_progress(tip, block_ref, txid(1), None),
 			ExitState::new_claimed(tip, txid(1), block_ref),
 			ExitState::new_vtxo_already_spent(tip),
 			ExitState::new_vtxo_swept(tip, vec![OutPoint::new(txid(1), 0)]),
