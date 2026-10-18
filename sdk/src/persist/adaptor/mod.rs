@@ -593,6 +593,18 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 		self.inner.write().await.put(record).await
 	}
 
+	async fn set_recovery_incomplete(&self, incomplete: bool) -> anyhow::Result<()> {
+		let mut properties = match self.read_properties().await? {
+			Some(properties) => properties,
+			None => bail!("wallet not initialized"),
+		};
+
+		properties.recovery_incomplete = incomplete;
+
+		let record = Record::from_data(partition::PROPERTIES, &[], None, &properties)?;
+		self.inner.write().await.put(record).await
+	}
+
 	#[cfg(feature = "onchain-bdk")]
 	async fn initialize_bdk_wallet(&self) -> anyhow::Result<ChangeSet> {
 		match self.inner.read().await.get(partition::BDK_CHANGESET, &[]).await? {

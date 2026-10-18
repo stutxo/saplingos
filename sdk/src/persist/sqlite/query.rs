@@ -90,6 +90,25 @@ pub (crate) fn set_server_mailbox_pubkey(
 	Ok(())
 }
 
+/// Set or clear the recovery-incomplete flag. Unlike the pubkeys this flag
+/// flips both ways, so there is no IS-NULL guard.
+pub (crate) fn set_recovery_incomplete(
+	conn: &Connection,
+	incomplete: bool,
+) -> anyhow::Result<()> {
+	let query = "UPDATE bark_properties SET recovery_incomplete = :incomplete
+		WHERE id = 1";
+	let mut statement = conn.prepare(query)?;
+
+	let rows = statement.execute(named_params! {
+		":incomplete": incomplete as i64,
+	})?;
+	ensure!(rows == 1, "failed to store recovery-incomplete flag: \
+		expected 1 row updated, got {rows} (wallet not initialised?)");
+
+	Ok(())
+}
+
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
 	let query = "SELECT * FROM bark_properties";
 	let mut statement = conn.prepare(query)?;
@@ -100,6 +119,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
+		let recovery_incomplete: i64 = row.get("recovery_incomplete")?;
 
 		let server_pubkey = server_pubkey
 			.map(|s| PublicKey::from_str(&s))
@@ -117,6 +137,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
+				recovery_incomplete: recovery_incomplete != 0,
 			}
 		))
 	} else {

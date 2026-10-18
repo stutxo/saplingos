@@ -282,6 +282,14 @@ pub struct OffchainBalance {
 	pub pending_exit: Amount,
 }
 
+/// Whether opening a wallet with these properties should run the seed
+/// recovery scan: always for a wallet created in this open, and afterwards
+/// while [`WalletProperties::recovery_incomplete`] from a previous,
+/// incomplete run is set.
+pub(crate) fn should_run_recovery(created_now: bool, properties: &WalletProperties) -> bool {
+	created_now || properties.recovery_incomplete
+}
+
 /// Read-only properties of the Sapling wallet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletProperties {
@@ -311,6 +319,19 @@ pub struct WalletProperties {
 	/// successful handshake. If the key changes, the wallet refuses to
 	/// connect until the user resolves the rotation.
 	pub server_mailbox_pubkey: Option<PublicKey>,
+
+	/// Whether the last seed-recovery mailbox scan ended incomplete.
+	///
+	/// Set when a recovery run finishes with unaccounted-for candidates
+	/// ([`crate::RecoveryReport::is_complete`] false) or errors out; cleared by
+	/// the first run that completes. While set, every wallet open re-runs the
+	/// scan: it re-reads the mailbox from checkpoint 0, but candidates previous
+	/// runs already processed are served from the wallet's own records, so each
+	/// run's candidate budget goes to the still-unprocessed tail. `false` also
+	/// for wallets created before this was tracked (they auto-recover on their
+	/// first open regardless).
+	#[serde(default)]
+	pub recovery_incomplete: bool,
 }
 
 /// Struct representing an extended private key derived from a
@@ -941,6 +962,7 @@ impl Wallet {
 			fingerprint: wallet_fingerprint,
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
+			recovery_incomplete: false,
 		};
 
 		// write the config to db
@@ -1065,7 +1087,14 @@ impl Wallet {
 		ret.inner.exit.load().await
 			.context("error loading exit system after opening wallet")?;
 
-		let recovery = if !created_now {
+		// A wallet restored from its seed needs a recovery scan on first open.
+		// So does any wallet whose last scan ended incomplete: the persisted
+		// `recovery_incomplete` marker makes the scan resumable across opens.
+		// Each run re-reads the mailbox from checkpoint 0, but candidates
+		// previous runs already processed are served from the wallet's own
+		// records, so successive runs spend the per-run candidate budget on the
+		// unprocessed tail until everything is accounted for.
+		let recovery = if !should_run_recovery(created_now, &properties) {
 			RecoveryStatus::NotRun
 		} else if args.skip_recovery {
 			info!("Seed-based wallet recovery explicitly skipped");
@@ -1076,10 +1105,16 @@ impl Wallet {
 			// funds may be missing — surface it loudly. Partial failures are
 			// logged inside the recovery call.
 			match ret.recover_from_mailbox().await {
-				Ok(report) => RecoveryStatus::Completed(report),
+				Ok(report) => {
+					// Persist the verdict so an incomplete run is resumed on the
+					// next open and a complete one stops re-running.
+					ret.record_recovery_verdict(report.is_complete()).await;
+					RecoveryStatus::Completed(report)
+				},
 				Err(e) => {
 					error!("VTXO recovery from the recovery mailbox failed; funds may be \
 						missing from this wallet until recovery succeeds: {:#}", e);
+					ret.record_recovery_verdict(false).await;
 					RecoveryStatus::Failed(e)
 				},
 			}

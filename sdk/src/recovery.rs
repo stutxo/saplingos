@@ -21,8 +21,11 @@
 //! status request) are re-checked in full — so successive runs keep making
 //! progress even when the mailbox re-reads from checkpoint 0 in the same
 //! order. A flooded mailbox degrades a run to an incomplete [`RecoveryReport`]
-//! (overflow counted, ids deliberately unrecorded) rather than stalling the
-//! wallet.
+//! (overflow counted; only a bounded id sample is recorded, as a manual
+//! `recover_vtxos` handle) rather than stalling the wallet — and the
+//! incomplete verdict is persisted
+//! ([`crate::WalletProperties::recovery_incomplete`]), so the scan resumes
+//! automatically on every later wallet open until it completes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -56,6 +59,11 @@ use crate::vtxo::{ServerStatusAdoption, VtxoState};
 /// budget, so successive runs keep making progress on the unprocessed tail.
 /// The value is far above any plausible genuine wallet history.
 const MAX_RECOVERY_CANDIDATES_PER_RUN: usize = 10_000;
+
+/// How many overflow ids the report keeps as a sample. Unbounded recording of
+/// a flood's ids is what the budget exists to prevent, but a small sample
+/// gives operators a manual handle: [`Wallet::recover_vtxos`] accepts ids.
+const RECOVERY_OVERFLOW_SAMPLE_SIZE: usize = 32;
 
 /// Bookkeeping for the per-run candidate cap: how many distinct candidates
 /// this run may still process. Overflow ids get no per-candidate bookkeeping
@@ -154,10 +162,13 @@ pub struct RecoveryReport {
 	/// VTXOs that have been fully exited on-chain.
 	exited: RecoveryReportEntry,
 	/// Count of mailbox candidates never processed because the run hit its
-	/// candidate budget. Their ids are deliberately not recorded — a flooded
-	/// mailbox can deliver millions — but a nonzero value means funds may be
-	/// missing just like `failed`/`foreign` do.
+	/// candidate budget. Their ids are deliberately not recorded beyond a
+	/// bounded sample — a flooded mailbox can deliver millions — but a nonzero
+	/// value means funds may be missing just like `failed`/`foreign` do.
 	budget_overflow: usize,
+	/// The first [`RECOVERY_OVERFLOW_SAMPLE_SIZE`] overflow ids, so operators
+	/// have a manual handle for [`Wallet::recover_vtxos`] on them.
+	budget_overflow_sample: Vec<VtxoId>,
 }
 
 impl RecoveryReport {
@@ -211,14 +222,30 @@ impl RecoveryReport {
 	}
 
 	/// How many mailbox candidates were left unprocessed because the run hit
-	/// its candidate budget. See the `budget_overflow` field for why no ids
-	/// are kept.
+	/// its candidate budget. See the `budget_overflow` field for why only a
+	/// sample of their ids is kept.
 	pub fn budget_overflow(&self) -> usize {
 		self.budget_overflow
 	}
 
-	fn push_budget_overflow(&mut self, n: usize) {
-		self.budget_overflow += n;
+	/// The first few unprocessed overflow ids: a manual
+	/// [`Wallet::recover_vtxos`] handle for operators, deliberately capped at
+	/// [`RECOVERY_OVERFLOW_SAMPLE_SIZE`] regardless of flood size.
+	pub fn budget_overflow_sample(&self) -> &[VtxoId] {
+		&self.budget_overflow_sample
+	}
+
+	fn overflow_sample_full(&self) -> bool {
+		self.budget_overflow_sample.len() >= RECOVERY_OVERFLOW_SAMPLE_SIZE
+	}
+
+	fn push_budget_overflow(&mut self, id: Option<VtxoId>) {
+		self.budget_overflow += 1;
+		if let Some(id) = id {
+			if !self.overflow_sample_full() {
+				self.budget_overflow_sample.push(id);
+			}
+		}
 	}
 
 	pub fn push_exited<G>(&mut self, vtxo: &Vtxo<G>) {
@@ -234,8 +261,10 @@ impl RecoveryReport {
 /// the callback staying silent: not running and failing are both stated.
 #[derive(Debug)]
 pub enum RecoveryStatus {
-	/// No scan was attempted: the wallet already existed, or the caller set
-	/// [`crate::OpenWalletArgs::skip_recovery`].
+	/// No scan was attempted: a previous recovery already completed, or the
+	/// caller set [`crate::OpenWalletArgs::skip_recovery`]. A wallet whose last
+	/// run ended incomplete re-runs the scan on open (see
+	/// [`crate::WalletProperties::recovery_incomplete`]).
 	NotRun,
 	/// The scan errored before it could produce a report. Nothing is known about
 	/// the mailbox's VTXOs, so funds may be missing until a retry succeeds.
@@ -401,7 +430,14 @@ impl Wallet {
 	) -> anyhow::Result<()> {
 		for raw in refs {
 			if budget.is_exhausted() {
-				report.push_budget_overflow(1);
+				// The gate runs before any other work; ids are decoded only
+				// while the bounded operator sample still has room.
+				let sample = if report.overflow_sample_full() {
+					None
+				} else {
+					VtxoId::from_bytes(raw.clone()).ok()
+				};
+				report.push_budget_overflow(sample);
 				continue;
 			}
 			let Ok(id) = VtxoId::from_bytes(raw.clone()) else {
@@ -441,7 +477,14 @@ impl Wallet {
 	) -> anyhow::Result<()> {
 		for raw in raws {
 			if budget.is_exhausted() {
-				report.push_budget_overflow(1);
+				// The gate runs before any other work; bodies are decoded only
+				// while the bounded operator sample still has room.
+				let sample = if report.overflow_sample_full() {
+					None
+				} else {
+					Vtxo::<Full>::from_bytes(raw.clone()).ok().map(|v| v.id())
+				};
+				report.push_budget_overflow(sample);
 				continue;
 			}
 			let Ok(vtxo) = Vtxo::<Full>::from_bytes(raw.clone()) else {
@@ -665,18 +708,36 @@ impl Wallet {
 		Ok(report)
 	}
 
+	/// Persist the verdict of a recovery run so the scan stays resumable across
+	/// opens: `complete` clears the marker, anything less sets it and every
+	/// later [`crate::Wallet::open`] re-runs the scan (candidates already
+	/// processed are served from the wallet's own records, so re-runs are
+	/// cheap and keep making progress on the unprocessed tail).
+	///
+	/// Best-effort: a failed write cannot strand funds — the worst case is the
+	/// next open re-running a scan that already completed.
+	pub(crate) async fn record_recovery_verdict(&self, complete: bool) {
+		if let Err(e) = self.inner.db.set_recovery_incomplete(!complete).await {
+			warn!("Could not persist the recovery-incomplete marker: {e:#}");
+		}
+	}
+
 	/// Rebuild the wallet's VTXO set from the seed-derived recovery mailbox and
 	/// the arkoor messages in the regular mailbox.
 	///
 	/// Both mailboxes are read from checkpoint 0, and every VTXO they reference
 	/// is resolved against the chain and the server as it is seen and stored
 	/// accordingly. Mailbox content is untrusted, so the run processes at most
-	/// [`MAX_RECOVERY_CANDIDATES_PER_RUN`] distinct candidates; overflow is
+	/// [`MAX_RECOVERY_CANDIDATES_PER_RUN`] unknown candidates; overflow is
 	/// counted in [`RecoveryReport::budget_overflow`], keeping the report
-	/// incomplete without recording flood ids. Because candidates an earlier
-	/// run already decided are counted from the wallet's own records, repeated
-	/// runs keep spending their budget on the unprocessed tail and are the
-	/// supported way to recover mailboxes larger than the cap. Returns a
+	/// incomplete without recording more than a bounded sample of its ids.
+	/// Because candidates an earlier run already stored are classified from the
+	/// wallet's own records without spending budget
+	/// ([`Wallet::classify_stored_candidate`]), repeated runs keep spending
+	/// their budget on the unprocessed tail until everything is accounted for —
+	/// the caller (`Wallet::open`) persists the incomplete verdict and re-runs
+	/// the scan on every later open in the meantime, so mailboxes larger than
+	/// the cap do recover, just over multiple opens. Returns a
 	/// [`RecoveryReport`] (see it for why recovered/skipped/failed matters).
 	pub(crate) async fn recover_from_mailbox(&self) -> anyhow::Result<RecoveryReport> {
 		let mut report = RecoveryReport::default();
@@ -695,9 +756,10 @@ impl Wallet {
 		if report.budget_overflow() > 0 {
 			warn!(
 				"Recovery processed its maximum of {MAX_RECOVERY_CANDIDATES_PER_RUN} candidates \
-				this run; {} further candidate(s) were delivered but left unprocessed, so the \
-				run is incomplete — re-run recovery to continue",
-				report.budget_overflow(),
+				this run; {} further candidate(s) were left unprocessed, so the run is \
+				incomplete — the wallet resumes the scan on every open until it completes. \
+				First unprocessed ids (recover_vtxos can process them manually): {:?}",
+				report.budget_overflow(), report.budget_overflow_sample(),
 			);
 		}
 
@@ -763,6 +825,7 @@ mod test {
 	use super::*;
 	use bitcoin::Amount;
 	use bitcoin::hashes::Hash;
+	use crate::WalletProperties;
 
 	fn dummy_id(vout: u32) -> VtxoId {
 		bitcoin::OutPoint::new(bitcoin::Txid::all_zeros(), vout).into()
@@ -780,6 +843,7 @@ mod test {
 			failed: RecoveryReportEntry(HashMap::new()),
 			exited: RecoveryReportEntry(HashMap::new()),
 			budget_overflow: 0,
+			budget_overflow_sample: Vec::new(),
 		};
 		assert!(clean.is_complete(),
 			"recovered and skipped VTXOs are clean decisions, not failures");
@@ -808,11 +872,44 @@ mod test {
 		assert!(budget.is_exhausted(), "the cap stays shut once hit");
 
 		let mut report = RecoveryReport::default();
-		report.push_budget_overflow(3);
+		report.push_budget_overflow(Some(dummy_id(0)));
+		report.push_budget_overflow(Some(dummy_id(1)));
+		report.push_budget_overflow(None);
 		assert_eq!(report.budget_overflow(), 3);
 		assert!(!report.is_complete(), "overflow alone means funds may be missing");
 		assert!(report.failed().is_empty(),
 			"overflow is counted, never recorded per id — a flood must not fill memory");
+		assert_eq!(report.budget_overflow_sample(), &[dummy_id(0), dummy_id(1)],
+			"only a bounded sample of overflow ids is kept, as an operator handle");
+
+		// The sample never outgrows its cap no matter how large the flood.
+		for vout in 0..(RECOVERY_OVERFLOW_SAMPLE_SIZE as u32 + 8) {
+			report.push_budget_overflow(Some(dummy_id(vout)));
+		}
+		assert_eq!(report.budget_overflow_sample().len(), RECOVERY_OVERFLOW_SAMPLE_SIZE);
+	}
+
+	/// The resume decision: a freshly created wallet always scans; after that,
+	/// only the persisted incomplete marker keeps the scan running on open.
+	#[test]
+	fn recovery_resumes_while_incomplete_marker_is_set() {
+		let fresh = WalletProperties {
+			network: bitcoin::Network::Regtest,
+			fingerprint: Default::default(),
+			server_pubkey: None,
+			server_mailbox_pubkey: None,
+			recovery_incomplete: false,
+		};
+		assert!(crate::should_run_recovery(true, &fresh),
+			"first open after seed creation always scans, marker or not");
+		assert!(!crate::should_run_recovery(false, &fresh),
+			"a completed past run is not re-scanned");
+
+		let marked = WalletProperties { recovery_incomplete: true, ..fresh.clone() };
+		assert!(crate::should_run_recovery(false, &marked),
+			"an incomplete past run resumes on reopen");
+		assert!(crate::should_run_recovery(true, &marked),
+			"the marker is irrelevant on a first open");
 	}
 
 	/// Wallet-backed tests for the batched ownership scan. The chain source is
@@ -832,7 +929,7 @@ mod test {
 		use ark::vtxo::Full;
 
 		use super::super::{CandidateRecord, RecoveryCandidateBudget, RecoveryReport};
-		use crate::{Config, Wallet, WalletInner, WalletSeed, SECP};
+		use crate::{Config, Wallet, WalletInner, WalletProperties, WalletSeed, SECP};
 		use crate::chain::ChainSource;
 		use crate::exit::Exit;
 		use crate::lock_manager::memory::MemoryLockManager;
@@ -1038,9 +1135,8 @@ mod test {
 			let mut seen = HashSet::new();
 			let mut budget = RecoveryCandidateBudget::new(2);
 
-			let bodies = (0..5).map(fabricated_candidate)
-				.map(|v| v.serialize())
-				.collect::<Vec<_>>();
+			let vtxos = (0..5).map(fabricated_candidate).collect::<Vec<_>>();
+			let bodies = vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>();
 			let mut page = Vec::new();
 			wallet.intake_vtxo_bodies(&mut report, &bodies, &mut seen, &mut budget, &mut page).await.unwrap();
 
@@ -1048,6 +1144,35 @@ mod test {
 			assert_eq!(page.len(), 2, "only the remaining budget is processed");
 			assert_eq!(report.budget_overflow(), 3, "the excess is counted, not processed");
 			assert_eq!(seen.len(), 2, "overflow ids get no per-id records");
+			assert_eq!(report.budget_overflow_sample(),
+				&vtxos[2..].iter().map(|v| v.id()).collect::<Vec<_>>()[..],
+				"a bounded id sample leaves operators a manual recover_vtxos handle");
+		}
+
+		/// The run verdict is persisted as the wallet's recovery-incomplete
+		/// marker, which is what makes an incomplete scan resume on the next
+		/// open (see [`crate::should_run_recovery`]): an incomplete run sets
+		/// it, a complete run clears it.
+		#[tokio::test]
+		async fn recovery_verdict_controls_open_resume_marker() {
+			let wallet = offline_wallet(6).await;
+			wallet.inner.db.init_wallet(&WalletProperties {
+				network: Network::Regtest,
+				fingerprint: Default::default(),
+				server_pubkey: None,
+				server_mailbox_pubkey: None,
+				recovery_incomplete: false,
+			}).await.unwrap();
+
+			let marker = async || wallet.inner.db.read_properties().await
+				.unwrap().unwrap().recovery_incomplete;
+
+			assert!(!marker().await, "a fresh wallet has no resumption pending");
+			wallet.record_recovery_verdict(false).await;
+			assert!(marker().await,
+				"an incomplete run sets the marker so the next open resumes");
+			wallet.record_recovery_verdict(true).await;
+			assert!(!marker().await, "a complete run clears the marker");
 		}
 	}
 }

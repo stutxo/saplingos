@@ -118,6 +118,12 @@ impl WalletPersister for SqliteClient {
 		Ok(())
 	}
 
+	async fn set_recovery_incomplete(&self, incomplete: bool) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::set_recovery_incomplete(&conn, incomplete)?;
+		Ok(())
+	}
+
 	async fn create_new_movement(&self,
 		status: MovementStatus,
 		subsystem: &MovementSubsystem,
@@ -765,10 +771,13 @@ mod test {
 		db.store_vtxo_key(0, ordinary_key).await.unwrap();
 		// Removing the additive program tables and their version markers
 		// reconstructs the schema immediately before program persistence.
+		// The recovery_incomplete column is additive too, so it must go for
+		// its migration to replay cleanly.
 		db.connect().unwrap().execute_batch(
 			"DROP TABLE bark_program_key;
 			DROP TABLE bark_program_recovery;
 			DROP TABLE bark_program_recovery_reservation;
+			ALTER TABLE bark_properties DROP COLUMN recovery_incomplete;
 			DELETE FROM migrations WHERE value >= 43;"
 		).unwrap();
 		drop(db);
@@ -907,7 +916,8 @@ mod test {
 		// migrate forward before taking over. The new table is purely additive.
 		db.connect().unwrap().execute_batch(
 			"DROP TABLE bark_program_recovery_reservation;
-			DELETE FROM migrations WHERE value = 44;"
+			ALTER TABLE bark_properties DROP COLUMN recovery_incomplete;
+			DELETE FROM migrations WHERE value >= 44;"
 		).unwrap();
 		drop(db);
 		let db = SqliteClient::open(&path).unwrap();
