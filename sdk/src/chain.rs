@@ -498,11 +498,9 @@ impl ChainSource {
 				let entry: rpc::json::GetMempoolEntryResult = rpc.call_raw(
 					"getmempoolentry", &[serde_json::to_value(txid).expect("serializable")],
 				).await?;
-				let err = || anyhow!("missing weight parameter from getmempoolentry");
-
-				result.total_fee = entry.fees.ancestor;
-				result.total_weight = Weight::from_wu(entry.weight.ok_or_else(err)?) +
-					Weight::from_vb(entry.ancestor_size).ok_or_else(err)?;
+				let (fee, weight) = parse_mempool_entry_package(&entry)?;
+				result.total_fee = fee;
+				result.total_weight = weight;
 			},
 			ChainSourceClient::Esplora(client) => {
 				// We should first verify the transaction is in the mempool to maintain the same
@@ -916,6 +914,30 @@ pub struct FeeRates {
 	pub slow: FeeRate,
 }
 
+/// Map a `getmempoolentry` response onto the package's total fee and
+/// weight.
+///
+/// The node response is untrusted input: doctored entries with
+/// near-`u64::MAX` weight values must produce an error here instead of
+/// panicking on (or wrapping) the overflowing sum of the transaction's
+/// weight and its ancestors'.
+#[cfg(feature = "bitcoind-rpc")]
+fn parse_mempool_entry_package(
+	entry: &rpc::json::GetMempoolEntryResult,
+) -> anyhow::Result<(Amount, Weight)> {
+	let missing = || anyhow!("missing weight parameter from getmempoolentry");
+	let tx_weight = Weight::from_wu(entry.weight.ok_or_else(missing)?);
+	let ancestors = Weight::from_vb(entry.ancestor_size)
+		.ok_or_else(|| anyhow!(
+			"ancestor vsize {} from getmempoolentry does not fit in a weight",
+			entry.ancestor_size,
+		))?;
+	let total_weight = tx_weight.to_wu().checked_add(ancestors.to_wu())
+		.map(Weight::from_wu)
+		.ok_or_else(|| anyhow!("package weight from getmempoolentry overflows u64"))?;
+	Ok((entry.fees.ancestor, total_weight))
+}
+
 /// Contains the fee information for an unconfirmed transaction found in the mempool.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolAncestorInfo {
@@ -1068,6 +1090,61 @@ fn classify_submit_package_errors<'a>(
 mod test {
 	use super::*;
 	use std::str::FromStr;
+
+	/// `getmempoolentry` responses are untrusted node input: a response
+	/// carrying near-`u64::MAX` weight values must produce an error from
+	/// the package mapping, not a panic or a wrapped total.
+	#[cfg(feature = "bitcoind-rpc")]
+	mod bitcoind_mempool_entry {
+		use bitcoin::hashes::Hash as _;
+
+		use super::*;
+
+		fn entry(weight: Option<u64>, ancestor_size: u64) -> rpc::json::GetMempoolEntryResult {
+			rpc::json::GetMempoolEntryResult {
+				vsize: 200,
+				weight,
+				time: 0,
+				height: 0,
+				descendant_count: 1,
+				descendant_size: 200,
+				ancestor_count: 2,
+				ancestor_size,
+				wtxid: Txid::all_zeros(),
+				fees: rpc::json::GetMempoolEntryResultFees {
+					base: Amount::from_sat(500),
+					modified: Amount::from_sat(500),
+					ancestor: Amount::from_sat(1_000),
+					descendant: Amount::from_sat(1_000),
+				},
+				depends: Vec::new(),
+				spent_by: Vec::new(),
+				bip125_replaceable: false,
+				unbroadcast: None,
+			}
+		}
+
+		#[test]
+		fn sane_values_map_correctly() {
+			let entry = entry(Some(800), 400);
+			let (fee, weight) = parse_mempool_entry_package(&entry).unwrap();
+			assert_eq!(fee, Amount::from_sat(1_000));
+			// 400 vbytes of ancestors are 1600 wu.
+			assert_eq!(weight, Weight::from_wu(800 + 1600));
+		}
+
+		#[test]
+		fn extreme_values_error_instead_of_wrapping() {
+			// Tx weight near the ceiling plus 400 vb (1600 wu) of ancestors
+			// overflows the sum.
+			assert!(parse_mempool_entry_package(&entry(Some(u64::MAX - 100), 400)).is_err());
+			// An ancestor vsize that does not even fit as a weight errors as well.
+			assert!(parse_mempool_entry_package(&entry(Some(800), u64::MAX)).is_err());
+			// Missing weight keeps its dedicated error.
+			let err = parse_mempool_entry_package(&entry(None, 400)).unwrap_err();
+			assert!(err.to_string().contains("missing weight"), "{err:#}");
+		}
+	}
 
 	#[cfg(not(target_arch = "wasm32"))]
 	mod esplora_broadcast {
