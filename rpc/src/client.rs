@@ -47,6 +47,44 @@ use crate::{
 	MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
 
+/// Cap on rendered length for untrusted text in log lines.
+const MAX_UNTRUSTED_LOG_CHARS: usize = 256;
+
+/// Render untrusted, server-controlled text safe for a single log line:
+/// escape control characters (so newlines can't forge log entries) and
+/// cap the length.
+fn sanitize_untrusted_for_log(text: &str) -> String {
+	let mut out = String::new();
+	for (i, c) in text.chars().enumerate() {
+		if i >= MAX_UNTRUSTED_LOG_CHARS {
+			out.push_str("...");
+			break;
+		}
+		if c.is_control() {
+			out.extend(c.escape_default());
+		} else {
+			out.push(c);
+		}
+	}
+	out
+}
+
+/// Render a SOCKS5 proxy URI for logging with any authority userinfo
+/// (i.e. credentials like `user:pass@`) stripped.
+fn redact_proxy_userinfo(uri: &http::Uri) -> String {
+	let authority = match uri.host() {
+		Some(host) => match uri.port() {
+			Some(port) => format!("{host}:{port}"),
+			None => host.to_owned(),
+		},
+		None => "<unknown>".to_owned(),
+	};
+	match uri.scheme_str() {
+		Some(scheme) => format!("{scheme}://{authority}"),
+		None => authority,
+	}
+}
+
 
 #[cfg(all(feature = "tonic-native", feature = "tonic-web"))]
 compile_error!("features `tonic-native` and `tonic-web` are mutually exclusive");
@@ -112,6 +150,11 @@ mod transport {
 
 		let endpoint = create_endpoint(address)?;
 		let proxy_uri = proxy.parse::<Uri>().map_err(CreateEndpointError::InvalidProxyUri)?;
+		info!(
+			"Connecting to Ark server via SOCKS5 proxy {}...",
+			// Never log userinfo: proxy URIs may carry credentials.
+			crate::client::redact_proxy_userinfo(&proxy_uri),
+		);
 		let connector = {
 			// TLS is handled by tonic's `tls_config()` on the endpoint, so this connector only
 			// needs to establish the SOCKS5 tunnel.
@@ -123,7 +166,6 @@ mod transport {
 				connector: http,
 			}
 		};
-		info!("Connecting to Ark server via SOCKS5 proxy {}...", proxy);
 		Ok(endpoint.connect_with_connector(connector).await?)
 	}
 
@@ -569,7 +611,9 @@ impl<I: Interceptor> ArkServiceClientExt for ArkServiceClient<InterceptedService
 
 fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectError> {
 	if let Some(ref msg) = handshake.psa {
-		warn!("Message from Ark server: \"{}\"", msg);
+		// The message is fully server-controlled: escape control chars
+		// and truncate before it reaches the logs.
+		warn!("Message from Ark server: \"{}\"", sanitize_untrusted_for_log(msg));
 	}
 
 	if MAX_PROTOCOL_VERSION < handshake.min_protocol_version {
@@ -592,6 +636,8 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Mutex;
+
 	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
 
 	#[test]
@@ -600,5 +646,84 @@ mod tests {
 		assert_eq!(err.to_string(), NO_TRANSPORT_BACKEND_MESSAGE);
 		assert!(err.to_string().contains("bark-server-rpc/tonic-native"));
 		assert!(err.to_string().contains("bark-server-rpc/tonic-web"));
+	}
+
+	/// Records every log record so tests can assert on emitted lines.
+	struct Capture;
+
+	static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+	static CAPTURE: Capture = Capture;
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool { true }
+		fn log(&self, record: &log::Record) {
+			RECORDED.lock().unwrap().push(format!("{}", record.args()));
+		}
+		fn flush(&self) {}
+	}
+
+	#[test]
+	fn sanitize_untrusted_for_log_escapes_control_chars() {
+		let hostile = "first\nsecond\r\x00\x1b[31mred\x1b[0m\tend";
+		let out = super::sanitize_untrusted_for_log(hostile);
+		assert_eq!(out, "first\\nsecond\\r\\u{0}\\u{1b}[31mred\\u{1b}[0m\\tend");
+		for c in out.chars() {
+			assert!(!c.is_control(), "log line still has control char: {out:?}");
+		}
+	}
+
+	#[test]
+	fn sanitize_untrusted_for_log_truncates_long_input() {
+		let long = "a".repeat(super::MAX_UNTRUSTED_LOG_CHARS + 10);
+		let out = super::sanitize_untrusted_for_log(&long);
+		assert_eq!(out.len(), super::MAX_UNTRUSTED_LOG_CHARS + 3);
+		assert!(out.ends_with("..."));
+	}
+
+	/// A hostile server handshake must not smuggle newlines or ANSI/control
+	/// bytes into our logs: the psa field is fully server-controlled.
+	#[test]
+	fn hostile_server_message_cannot_inject_log_lines() {
+		// Tolerate another logger already being installed by a sibling test.
+		let _ = log::set_logger(&CAPTURE);
+		log::set_max_level(log::LevelFilter::Trace);
+
+		let hostile = "system ready\nFAKE ERROR injected by server\n\x1b[2J\x00cleared";
+		let handshake = super::protos::HandshakeResponse {
+			psa: Some(hostile.to_owned()),
+			min_protocol_version: super::MIN_PROTOCOL_VERSION,
+			max_protocol_version: super::MAX_PROTOCOL_VERSION,
+			..Default::default()
+		};
+		let pver = super::check_handshake(handshake).unwrap();
+		assert_eq!(pver, super::MAX_PROTOCOL_VERSION);
+
+		let line = RECORDED.lock().unwrap().iter()
+			.find(|r| r.contains("Message from Ark server"))
+			.expect("psa message must be logged")
+			.clone();
+		for c in line.chars() {
+			assert!(!c.is_control(), "log line has injected control char: {line:?}");
+		}
+		assert!(
+			line.contains("\\nFAKE ERROR"),
+			"newline must be escaped, not emitted: {line:?}",
+		);
+	}
+
+	#[test]
+	fn proxy_uri_log_line_never_contains_userinfo() {
+		for (raw, want) in [
+			("socks5://user:s3cret-pw@127.0.0.1:9050", "socks5://127.0.0.1:9050"),
+			("socks5://alice:hunter2@proxy.example", "socks5://proxy.example"),
+			("socks5://127.0.0.1:9050", "socks5://127.0.0.1:9050"),
+		] {
+			let uri: http::Uri = raw.parse().unwrap();
+			let logged = super::redact_proxy_userinfo(&uri);
+			assert_eq!(logged, want);
+			assert!(!logged.contains("user"), "userinfo leaked: {logged}");
+			assert!(!logged.contains("s3cret-pw"), "password leaked: {logged}");
+			assert!(!logged.contains("hunter2"), "password leaked: {logged}");
+		}
 	}
 }
