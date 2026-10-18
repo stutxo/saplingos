@@ -4,7 +4,9 @@
 //! Same shape as [`super::pid_flock::FlockPidLockManager`] — one
 //! OS-level lock on `<datadir>/LOCK` held for the manager's lifetime,
 //! all per-key locking delegated to an internal
-//! [`MemoryLockManager`]. The only
+//! [`super::internal_memory::InternalMemoryLockManager`] (per-instance
+//! keyspace, so managers guarding unrelated directories never falsely
+//! contend). The only
 //! difference is the OS primitive: this variant uses POSIX
 //! `fcntl(F_SETLK)` instead of `flock(2)`.
 //!
@@ -39,7 +41,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Context;
 
 use super::{LockGuard, LockManager, PidLockError};
-use super::memory::MemoryLockManager;
+use super::internal_memory::InternalMemoryLockManager;
 
 /// File name used for the datadir-level PID lock.
 pub const LOCK_FILE: &str = "LOCK";
@@ -82,7 +84,7 @@ pub struct FcntlPidLockManager {
 	// subsequent `new()` can re-acquire.
 	_registration: Registration,
 	datadir: PathBuf,
-	in_process: MemoryLockManager,
+	in_process: InternalMemoryLockManager,
 }
 
 impl FcntlPidLockManager {
@@ -129,7 +131,7 @@ impl FcntlPidLockManager {
 			_pid_file: file,
 			_registration: registration,
 			datadir,
-			in_process: MemoryLockManager::new(),
+			in_process: InternalMemoryLockManager::new(),
 		})
 	}
 
@@ -252,5 +254,28 @@ mod test {
 		assert!(g2.is_some(), "different key should be free");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// Regression test for the per-key locking flake. The in-process
+	/// map was once the process-wide [`MemoryLockManager`] shared
+	/// static, so this test and its `pid_flock` twin — running
+	/// concurrently in the same test process with the same keys —
+	/// spuriously blocked each other (`g.is_some()` failed
+	/// intermittently under parallel load). With a per-instance map,
+	/// two managers can hold the same key without contending.
+	#[tokio::test]
+	async fn managers_for_distinct_datadirs_dont_contend() {
+		let dir_a = tmp_dir();
+		let dir_b = tmp_dir();
+		let mgr_a = FcntlPidLockManager::new(&dir_a).unwrap();
+		let mgr_b = FcntlPidLockManager::new(&dir_b).unwrap();
+
+		let ga = mgr_a.try_lock("foo").await;
+		assert!(ga.is_some());
+		let gb = mgr_b.try_lock("foo").await;
+		assert!(gb.is_some(), "unrelated datadirs must not share keys");
+
+		let _ = fs::remove_dir_all(&dir_a);
+		let _ = fs::remove_dir_all(&dir_b);
 	}
 }

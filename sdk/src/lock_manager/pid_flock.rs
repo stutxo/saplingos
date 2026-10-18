@@ -12,7 +12,10 @@
 //! From that point on, all per-key locking is in-memory: by
 //! construction, this is the only process touching `datadir`, so the
 //! cross-process semantics of file-based per-key locking would be
-//! redundant.
+//! redundant. The in-memory map is **per manager instance**
+//! ([`super::internal_memory::InternalMemoryLockManager`]) — unlike
+//! the process-wide [`super::memory::MemoryLockManager`] — so keys of
+//! managers guarding unrelated directories never falsely contend.
 //!
 //! # Platform support
 //!
@@ -31,7 +34,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::{LockGuard, LockManager, PidLockError};
-use super::memory::MemoryLockManager;
+use super::internal_memory::InternalMemoryLockManager;
 
 /// File name used for the datadir-level PID lock.
 pub const LOCK_FILE: &str = "LOCK";
@@ -52,7 +55,7 @@ pub struct FlockPidLockManager {
 	// drop of the manager — at which point the OS releases the lock.
 	_pid_file: File,
 	datadir: PathBuf,
-	in_process: MemoryLockManager,
+	in_process: InternalMemoryLockManager,
 }
 
 impl FlockPidLockManager {
@@ -106,7 +109,7 @@ impl FlockPidLockManager {
 		Ok(Self {
 			_pid_file: file,
 			datadir,
-			in_process: MemoryLockManager::new(),
+			in_process: InternalMemoryLockManager::new(),
 		})
 	}
 
@@ -207,5 +210,28 @@ mod test {
 		assert!(g2.is_some(), "different key should be free");
 
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	/// Regression test for the per-key locking flake. The in-process
+	/// map was once the process-wide [`MemoryLockManager`] shared
+	/// static, so this test and its `pid_fcntl` twin — running
+	/// concurrently in the same test process with the same keys —
+	/// spuriously blocked each other (`g.is_some()` failed
+	/// intermittently under parallel load). With a per-instance map,
+	/// two managers can hold the same key without contending.
+	#[tokio::test]
+	async fn managers_for_distinct_datadirs_dont_contend() {
+		let dir_a = tmp_dir();
+		let dir_b = tmp_dir();
+		let mgr_a = FlockPidLockManager::new(&dir_a).unwrap();
+		let mgr_b = FlockPidLockManager::new(&dir_b).unwrap();
+
+		let ga = mgr_a.try_lock("foo").await;
+		assert!(ga.is_some());
+		let gb = mgr_b.try_lock("foo").await;
+		assert!(gb.is_some(), "unrelated datadirs must not share keys");
+
+		let _ = fs::remove_dir_all(&dir_a);
+		let _ = fs::remove_dir_all(&dir_b);
 	}
 }
