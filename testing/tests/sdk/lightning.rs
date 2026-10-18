@@ -647,6 +647,16 @@ async fn confirm_signed_successor_exit(
 	assert_eq!(ctx.bitcoind().get_received_by_address(&payout), amount - fee);
 	assert!(ctx.bitcoind().transaction_confirmation(claim_txid)
 		.unwrap().confirmations.unwrap_or(0) > 0);
+	// One confirmation must not finish an exit anymore: the SDK only latches Claimed once
+	// the claim is buried under SPEND_CONFIRMATIONS (6) blocks, so a shallow reorg cannot
+	// take a finished exit back. The claim is tracked as in-progress until then.
+	for id in &ids {
+		assert!(matches!(wallet.exit_mgr().get_exit_vtxo(*id).await.unwrap().state(),
+			ExitState::ClaimInProgress(_)),
+			"a 1-conf claim must be tracked, not finished");
+	}
+	ctx.generate_blocks(5).await;
+	wallet.progress_exits().await.unwrap();
 	for id in ids {
 		assert!(matches!(wallet.exit_mgr().get_exit_vtxo(id).await.unwrap().state(),
 			ExitState::Claimed(state) if state.txid == claim_txid));
