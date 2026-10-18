@@ -385,7 +385,7 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	// If an exit has progressed beyond the abortable stage, server-side
 	// registration can no longer succeed: finish the movement and stop.
 	if vtxo.state.kind() == VtxoStateKind::Exited {
-		wallet.inner.movements.finish_movement(board.movement_id, MovementStatus::Failed).await
+		fail_board_movement(&wallet.inner.movements, board.movement_id).await
 			.context("failed to finalize exited board movement")?;
 		return Ok(Advance::Done);
 	}
@@ -768,6 +768,59 @@ mod test {
 		// them identically.
 		assert_eq!(v1.funding_txid().unwrap(), v2.funding_txid().unwrap());
 	}
+
+	/// A board that exits before registration left through its own exit
+	/// movement, so failing the board movement must zero the +amount
+	/// effective balance committed at board start — same as the spent
+	/// (double-spent funding) arm. Regression: the Exited arm finished
+	/// the movement Failed without clearing it.
+	#[tokio::test]
+	async fn failed_board_movement_zeroes_effective_balance() {
+		use std::sync::Arc;
+
+		use crate::notification::NotificationDispatch;
+		use crate::persist::WalletPersister;
+		use crate::persist::adaptor::StorageAdaptorWrapper;
+		use crate::subsystem::Subsystem;
+
+		let db = Arc::new(StorageAdaptorWrapper::new_memory());
+		let movements = crate::movement::manager::MovementManager::new(
+			db.clone(), NotificationDispatch::new(),
+		);
+		movements.register_subsystem(Subsystem::BOARD).await.unwrap();
+		// Mirror board start: the board's value committed as a positive
+		// effective balance.
+		let id = movements.new_movement_with_update(
+			Subsystem::BOARD, "board",
+			MovementUpdate::new()
+				.effective_balance(Amount::from_sat(2_000).to_signed().unwrap()),
+		).await.unwrap();
+
+		fail_board_movement(&movements, id).await.unwrap();
+
+		let movement = db.get_movement_by_id(id).await.unwrap();
+		assert_eq!(movement.status, MovementStatus::Failed);
+		assert_eq!(
+			movement.effective_balance, SignedAmount::ZERO,
+			"a failed board movement that never moved funds must report zero",
+		);
+	}
+}
+
+/// Fail a board movement whose funds never settled through the board:
+/// either the funding never materialized (double-spend) or the vtxo
+/// left through an exit, which its own exit movement already accounts.
+/// In both cases the +amount effective balance committed at board
+/// start must be zeroed — a failed movement with no value change
+/// reports [SignedAmount::ZERO].
+async fn fail_board_movement(
+	movements: &crate::movement::manager::MovementManager,
+	movement_id: MovementId,
+) -> anyhow::Result<()> {
+	movements.finish_movement_with_update(
+		movement_id, MovementStatus::Failed,
+		MovementUpdate::new().effective_balance(SignedAmount::ZERO),
+	).await.context("failed to finalize failed board movement")
 }
 
 /// Fail a board whose funding tx can never confirm: mark its vtxo spent and close
