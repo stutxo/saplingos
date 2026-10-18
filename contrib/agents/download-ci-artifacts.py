@@ -180,6 +180,32 @@ def download_testdata(url, dest_dir):
         print("  WARNING: wget not found, skipping testdata download")
 
 
+SAFE_JOB_NAME = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def sanitize_job_name(job_name):
+    """Validate a remote CI job name before using it as a path component.
+
+    Job names come from the CI server, i.e. untrusted input: a hostile
+    name like "../.." or "a/b" would escape OUTPUT_BASE or splice in
+    nested directories. Allow-list [a-zA-Z0-9._-] only.
+    """
+    if not SAFE_JOB_NAME.match(job_name) or job_name in (".", ".."):
+        raise ValueError(
+            f"unsafe CI job name for use as path component: {job_name!r}"
+        )
+    return job_name
+
+
+def output_dir_for(pipeline_id, job_name):
+    """Per-job output directory, guaranteed to stay inside OUTPUT_BASE."""
+    outdir = OUTPUT_BASE / f"{pipeline_id}-{sanitize_job_name(job_name)}"
+    resolved = outdir.resolve()
+    base = OUTPUT_BASE.resolve()
+    assert resolved.parent == base, f"{resolved} escapes OUTPUT_BASE {base}"
+    return outdir
+
+
 def process_job(repo, job):
     """Download logs and artifacts for a single job."""
     job_id = job["id"]
@@ -189,7 +215,7 @@ def process_job(repo, job):
     print()
     print(f"========== {job_name} (job {job_id}) ==========")
 
-    outdir = OUTPUT_BASE / f"{pipeline_id}-{job_name}"
+    outdir = output_dir_for(pipeline_id, job_name)
     outdir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {outdir}")
 
@@ -267,5 +293,28 @@ def main():
     print("===== All downloads complete =====")
 
 
+def _self_test():
+    """Plain assert-driven tests: python3 download-ci-artifacts.py --self-test"""
+    # Allowed: alphanumerics, dot, dash, underscore — the GitLab job-name charset.
+    for ok in ["build-x86_64", "test.integration.v2", "a", "x" * 255]:
+        assert sanitize_job_name(ok) == ok
+    # Rejected: anything that could alter the output path.
+    for bad in ["", ".", "..", "../etc", "a/b", "a\\b", "a b", "a;b", "a:b",
+                "*", "a\x00b", "a\nb", "name?x=1"]:
+        try:
+            sanitize_job_name(bad)
+            raise AssertionError(f"accepted unsafe name: {bad!r}")
+        except ValueError:
+            pass
+    # Sanitized names resolve to a direct child of OUTPUT_BASE.
+    out = output_dir_for(42, "job-1_x.y")
+    assert out == OUTPUT_BASE / "42-job-1_x.y"
+    assert out.resolve().parent == OUTPUT_BASE.resolve()
+    print("self-test OK")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        _self_test()
+    else:
+        main()
