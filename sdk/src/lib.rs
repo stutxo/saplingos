@@ -64,7 +64,7 @@ pub use self::vtxo::WalletVtxo;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -603,6 +603,24 @@ pub struct Wallet {
 	inner: Arc<WalletInner>,
 }
 
+/// Create a fresh datadir and harden it owner-only (`0700`; no-op on
+/// non-unix platforms via [crate::fs_perms::harden]).
+///
+/// [Wallet::open] runs this before instantiating the platform-default lock
+/// manager: those managers lay down their pid lock file at construction, so
+/// creating and hardening here is the only point where a fresh datadir is
+/// guaranteed to be `0700` before anything lands in it.
+#[cfg(not(target_arch = "wasm32"))]
+async fn create_and_harden_datadir(datadir: &Path) -> anyhow::Result<()> {
+	tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
+		"failed to create datadir at {}", datadir.display(),
+	))?;
+	crate::fs_perms::harden(datadir, 0o700).with_context(|| format!(
+		"failed to harden datadir at {}", datadir.display(),
+	))?;
+	Ok(())
+}
+
 impl Wallet {
 	pub async fn network(&self) -> anyhow::Result<Network> {
 		Ok(self.properties().await?.network)
@@ -954,6 +972,19 @@ impl Wallet {
 		}
 
 		let fingerprint = seed.fingerprint();
+
+		// Create and harden the datadir before the lock manager is
+		// instantiated: platform-default lock managers create the datadir
+		// and their pid lock file at construction, so this is the only
+		// point where a fresh datadir can be made owner-only before any
+		// file lands in it.
+		if let Some(ref datadir) = args.datadir {
+			#[cfg(not(target_arch = "wasm32"))]
+			if !datadir.exists() && args.create_if_not_exists {
+				create_and_harden_datadir(datadir).await?;
+			}
+		}
+
 		let lock_manager = if let Some(lm) = args.lock_manager {
 			lm
 		} else {
@@ -964,14 +995,6 @@ impl Wallet {
 		let db = if let Some(db) = args.persister {
 			db
 		} else {
-			if let Some(ref datadir) = args.datadir {
-				#[cfg(not(target_arch = "wasm32"))]
-				if !datadir.exists() && args.create_if_not_exists {
-					tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
-						"failed to create datadir at {}", datadir.display(),
-					))?;
-				}
-			}
 			crate::persist::platform_default(args.datadir.as_ref(), Some(fingerprint)).await
 				.context("failed to instantiate platform default persister")?
 		};
@@ -2340,6 +2363,29 @@ mod tests {
 		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
 		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
 		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+	}
+
+	/// A datadir created on the [Wallet::open] path must be owner-only
+	/// before the lock manager lays down its LOCK file: manager
+	/// instantiation is when the pid lock file is created, so hardening
+	/// must happen first and the manager must not loosen the directory.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn datadir_created_owner_only_before_lock_manager() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let parent = tempfile::tempdir().unwrap();
+		let datadir = parent.path().join("wallet");
+
+		super::create_and_harden_datadir(&datadir).await.unwrap();
+
+		// Lock manager construction creates the LOCK file inside the
+		// already-protected directory and leaves the dir mode untouched.
+		let _locks = crate::lock_manager::platform_default(Some(&datadir), None).unwrap();
+
+		let mode = std::fs::metadata(&datadir).unwrap().permissions().mode();
+		assert_eq!(mode & 0o777, 0o700,
+			"fresh datadir must be owner-only, got {:o}", mode & 0o777);
 	}
 
 }
