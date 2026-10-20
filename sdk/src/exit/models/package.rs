@@ -21,11 +21,18 @@ pub struct ExitCpfpRequest {
 }
 
 /// Constraints a CPFP replacement transaction must satisfy to evict an existing one via RBF.
+///
+/// When the values originate from chain-backend mempool data (rather than from a child the
+/// wallet built and signed itself) they are unverified; producers clamp the rate to the
+/// fee-rate ingestion ceiling and cap `current_package_fee` against the rescued VTXO
+/// value before exposing them, dropping implausible reports entirely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RbfRequirement {
 	/// The effective fee rate of the existing package. A replacement must exceed this.
 	pub min_fee_rate: FeeRate,
 	/// The total fee paid by the existing package. A replacement must pay strictly more.
+	/// For backend-derived reports this is capped to at most one tenth of the rescued
+	/// value (with a 10,000 sat floor for near-dust exits).
 	pub current_package_fee: Amount,
 }
 
@@ -65,4 +72,67 @@ pub struct FeeInfo {
 	/// 0.1 sat/vB) multiplied by the replacement weight on top of this amount.
 	#[serde(rename = "total_fee_sat", with = "bitcoin::amount::serde::as_sat")]
 	pub total_fee: Amount,
+	/// Provenance: `true` when the fee was derived locally from a child the wallet (or its
+	/// operator, via the CPFP API) built and signed itself — we know what we signed. `false`
+	/// when read from the configured chain backend's mempool data: both the fee and the
+	/// weights behind `fee_rate` are then unverified, server-supplied fields, and consumers
+	/// must sanitize them (rate ceiling, package-fee cap against the rescued value) before
+	/// they may steer RBF decisions or signing.
+	#[serde(default)]
+	pub trusted: bool,
+}
+
+impl FeeInfo {
+	/// Marks the fee info as locally derived; called on any fee info provided at child
+	/// registration time ([crate::exit::Exit::provide_cpfp_tx_with_fee_info]), where the
+	/// registrant asserts it knows what it signed.
+	///
+	/// Registration-time values are bounded too (`None` on absurd input): a buggy caller
+	/// could otherwise hand us a `total_fee` above [Amount::MAX_MONEY] — which overflows
+	/// the pinned CPFP builder's panicking relay-floor addition — or a `fee_rate` above
+	/// the ingestion ceiling, whose weight multiplication cannot be represented.
+	pub(crate) fn try_into_trusted(self) -> Option<FeeInfo> {
+		if self.total_fee > Amount::MAX_MONEY
+			|| self.fee_rate > crate::chain::MAX_PLAUSIBLE_FEE_RATE
+		{
+			return None;
+		}
+		Some(FeeInfo { trusted: true, ..self })
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn plausible() -> FeeInfo {
+		FeeInfo {
+			fee_rate: FeeRate::from_sat_per_kwu(2_500),
+			total_fee: Amount::from_sat(3_000),
+			trusted: false,
+		}
+	}
+
+	#[test]
+	fn try_into_trusted_rejects_absurd_registration_time_info() {
+		// Registration-time fee info feeds the pinned CPFP builder verbatim once trusted:
+		// a total_fee above representable money would overflow its panicking relay-floor
+		// addition, and an above-ceiling rate overflows its weight multiplication. Neither
+		// describes a real signed child, so both are refused at the chokepoint.
+		let absurd_fee = FeeInfo { total_fee: Amount::from_sat(u64::MAX), ..plausible() };
+		assert_eq!(absurd_fee.try_into_trusted(), None);
+		let absurd_rate = FeeInfo { fee_rate: FeeRate::from_sat_per_kwu(1 << 54), ..plausible() };
+		assert_eq!(absurd_rate.try_into_trusted(), None);
+	}
+
+	#[test]
+	fn try_into_trusted_tags_plausible_info() {
+		let fi = plausible();
+		assert_eq!(fi.try_into_trusted(), Some(FeeInfo { trusted: true, ..fi }));
+		// Boundary values remain usable.
+		let max_fee = FeeInfo { total_fee: Amount::MAX_MONEY, ..fi };
+		assert!(max_fee.try_into_trusted().is_some());
+		let max_rate = FeeInfo { fee_rate: crate::chain::MAX_PLAUSIBLE_FEE_RATE, ..fi };
+		assert!(max_rate.try_into_trusted().is_some());
+	}
 }

@@ -516,7 +516,10 @@ pub(crate) async fn start_offboard(
 					srv.ark_info().await.max_offboard_inputs, vtxos.len(),
 				);
 			}
-			let vtxos_amount = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
+			// The input VTXOs were issued by the server: never `sum`, which
+			// panics on forged large amounts.
+			let vtxos_amount = crate::utils::checked_sum_amounts(vtxos.iter().map(|v| v.amount()))
+				.context("offboard input amounts overflow")?;
 			let fee = ark.fees.offboard.calculate(
 				&destination_spk, vtxos_amount, offboard_feerate,
 				vtxos.iter().map(|v| VtxoFeeInfo::from_vtxo_and_tip(v, tip)),
@@ -545,7 +548,10 @@ pub(crate) async fn start_offboard(
 			let (_, change_key_index) = wallet.derive_store_next_signing_key().await
 				.context("failed to create change signing key")?;
 
-			let input_total = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
+			// The selected input VTXOs were issued by the server: never `sum`,
+			// which panics on forged large amounts.
+			let input_total = crate::utils::checked_sum_amounts(vtxos.iter().map(|v| v.amount()))
+				.context("selected input amounts overflow")?;
 			let change = input_total.checked_sub(amount + fee)
 				.context("selected inputs don't cover amount plus fee")?;
 

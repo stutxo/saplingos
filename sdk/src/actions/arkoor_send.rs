@@ -309,7 +309,10 @@ pub(crate) async fn start_arkoor_send(
 		.select(wallet.spendable_vtxos().await?, amount)?;
 	let input_vtxo_ids = inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 
-	let total_input = inputs.iter().map(|v| v.amount()).sum::<Amount>();
+	// The selected input VTXOs were issued by the server: never `sum`, which
+	// panics on forged large amounts.
+	let total_input = crate::utils::checked_sum_amounts(inputs.iter().map(|v| v.amount()))
+		.context("selected input amounts overflow")?;
 	let change = total_input.checked_sub(amount)
 		.context("selected inputs don't cover amount")?;
 

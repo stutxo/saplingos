@@ -431,11 +431,19 @@ impl ExitTransactionManager {
 		Ok(deeply_spent)
 	}
 
+	/// Registers a child the wallet (or its operator, via the public API) supplied, along
+	/// with the fee the child commits to when the caller built and signed it itself.
+	///
+	/// A locally derived `fee_info` is trusted: the child is our own construction. `None`
+	/// (unknown, e.g. an externally crafted child) makes the next sync back-fill from
+	/// `mempool_ancestor_info` — unverified backend data that consumers must sanitize
+	/// before it steers any signing (see `crate::exit::sanitize_fee_info`).
 	pub async fn set_wallet_child_tx(
 		&mut self,
 		exit_txid: Txid,
 		child_tx: Transaction,
 		origin: ExitTxOrigin,
+		fee_info: Option<FeeInfo>,
 	) -> anyhow::Result<Txid, ExitError> {
 		let package = self.get_package(exit_txid)?;
 		let child_txid = child_tx.compute_txid();
@@ -445,10 +453,22 @@ impl ExitTransactionManager {
 				tx: child_tx.clone(),
 			},
 			origin,
-			// Populated by the next sync via [calculate_fee_params] once the child is in the
-			// mempool. Not provided here because the API doesn't immediately require it and having
-			// devs provide it could lead to incorrect data
-			fee_info: None,
+			// Fee info supplied at child-registration time is operator/wallet-asserted
+			// ("I built and signed this child, I know its fee"): mark it locally derived
+			// so later consumers skip the chain-backend sanitization they apply to
+			// unverified mempool reports. Absurd registration-time values are dropped —
+			// they cannot describe a real signed child and would break the pinned CPFP
+			// fee math downstream; the next sync then back-fills (sanitized) backend data.
+			fee_info: fee_info.and_then(|fi| match fi.try_into_trusted() {
+				Some(fi) => Some(fi),
+				None => {
+					warn!(
+						"Ignoring absurd registration-time fee info for the CPFP child of exit tx {} (claimed fee {}, rate {})",
+						exit_txid, fi.total_fee, fi.fee_rate,
+					);
+					None
+				},
+			}),
 		});
 		self.index.insert(child_txid, Arc::downgrade(&package));
 		self.status.insert(exit_txid, TxStatus::Mempool);
@@ -496,12 +516,13 @@ impl ExitTransactionManager {
 		exit_txid: Txid,
 		child_tx: Transaction,
 		origin: ExitTxOrigin,
+		fee_info: Option<FeeInfo>,
 	) -> Result<bool, ExitError> {
 		let parent_tx = self.get_package(exit_txid)?.read().await.exit.tx.clone();
 		match self.chain_source.broadcast_package(&[&parent_tx, &child_tx]).await {
 			Ok(()) => {
 				info!("Successfully broadcast exit package: {}", exit_txid);
-				self.set_wallet_child_tx(exit_txid, child_tx, origin).await?;
+				self.set_wallet_child_tx(exit_txid, child_tx, origin, fee_info).await?;
 				Ok(true)
 			},
 			// An input is already spent by a confirmed tx, so this CPFP can never confirm —
@@ -523,7 +544,7 @@ impl ExitTransactionManager {
 				warn!("CPFP broadcast conflict for {}: {} — another CPFP may already be in \
 					mempool", exit_txid, e,
 				);
-				self.set_wallet_child_tx(exit_txid, child_tx, origin).await?;
+				self.set_wallet_child_tx(exit_txid, child_tx, origin, fee_info).await?;
 				Ok(true)
 			},
 			Err(e) => Err(ExitError::ExitPackageBroadcastFailure { txid: exit_txid, error: e }),
@@ -720,6 +741,12 @@ impl ExitTransactionManager {
 	}
 
 	/// Query the chain source for a tx's effective fee rate and total package fee.
+	///
+	/// The result is unverified backend data — the fee and per-tx weight fields are both
+	/// server-supplied, so a lying backend can dial each independently. It must be
+	/// sanitized (rate ceiling, package-fee cap against the rescued value) before it may
+	/// steer RBF decisions or signing; children we built ourselves carry a locally derived
+	/// fee info instead (see [ExitTransactionManager::set_wallet_child_tx]).
 	async fn calculate_fee_params(&self, txid: Txid) -> Result<FeeInfo, ExitError> {
 		debug!("Getting mempool ancestor information for {}", txid);
 		let info = self.chain_source
@@ -733,7 +760,7 @@ impl ExitTransactionManager {
 				txid,
 				error: format!("unable to calculate fee rate for {}", txid),
 			})?;
-		Ok(FeeInfo { fee_rate, total_fee: info.total_fee })
+		Ok(FeeInfo { fee_rate, total_fee: info.total_fee, trusted: false })
 	}
 
 	/// Best-effort variant of [`calculate_fee_params`]: returns `None` (and logs) when the
