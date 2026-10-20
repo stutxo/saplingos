@@ -170,6 +170,19 @@ pub trait WalletPersister: Send + Sync + 'static {
 	/// - Returns an error if the update fails.
 	async fn set_server_mailbox_pubkey(&self, server_mailbox_pubkey: PublicKey) -> anyhow::Result<()>;
 
+	/// Set whether the last seed-recovery mailbox scan ended incomplete.
+	///
+	/// The wallet sets this when a recovery run leaves candidates unaccounted
+	/// for and clears it once a run completes; while set, every wallet open
+	/// re-runs the scan.
+	///
+	/// Parameters:
+	/// - incomplete: Whether recovery is incomplete.
+	///
+	/// Errors:
+	/// - Returns an error if the update fails or the wallet is not initialised.
+	async fn set_recovery_incomplete(&self, incomplete: bool) -> anyhow::Result<()>;
+
 	/// Creates a new movement in the given state, ready to be updated.
 	///
 	/// Parameters:

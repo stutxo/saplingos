@@ -68,6 +68,7 @@ macro_rules! bark_persister_tests {
 			test_init_and_read_properties,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
+			test_set_recovery_incomplete,
 
 			test_mailbox_checkpoint_empty_db,
 			test_mailbox_checkpoint_roundtrip,
@@ -149,6 +150,7 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
+		recovery_incomplete: false,
 	}
 }
 
@@ -417,6 +419,23 @@ pub async fn test_set_server_mailbox_pubkey(db: &impl WalletPersister) {
 
 	let read = db.read_properties().await.expect("read_properties").expect("properties present");
 	assert_eq!(read, WalletProperties { server_mailbox_pubkey: Some(pk), ..test_properties() });
+}
+
+/// The recovery-incomplete flag flips both ways: an incomplete scan sets it
+/// (so the next wallet open resumes the scan) and a complete one clears it.
+pub async fn test_set_recovery_incomplete(db: &impl WalletPersister) {
+	db.init_wallet(&test_properties()).await.expect("init_wallet");
+
+	let read = db.read_properties().await.expect("read_properties").expect("properties present");
+	assert!(!read.recovery_incomplete, "fresh wallets start complete");
+
+	db.set_recovery_incomplete(true).await.expect("set incomplete");
+	let read = db.read_properties().await.expect("read_properties").expect("properties present");
+	assert_eq!(read, WalletProperties { recovery_incomplete: true, ..test_properties() });
+
+	db.set_recovery_incomplete(false).await.expect("clear incomplete");
+	let read = db.read_properties().await.expect("read_properties").expect("properties present");
+	assert_eq!(read, test_properties(), "clearing restores the initial state");
 }
 
 // ---------------------------------------------------------------------------
