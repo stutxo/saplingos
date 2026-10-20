@@ -976,6 +976,7 @@ mod test {
 			anti_dos_token: None,
 			claim_destination: None,
 			key_index: 0,
+			fee: None,
 			progress,
 		}
 	}

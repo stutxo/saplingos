@@ -71,6 +71,7 @@ fn sanitize_untrusted_for_log(text: &str) -> String {
 
 /// Render a SOCKS5 proxy URI for logging with any authority userinfo
 /// (i.e. credentials like `user:pass@`) stripped.
+#[cfg(feature = "socks5-proxy")]
 fn redact_proxy_userinfo(uri: &http::Uri) -> String {
 	let authority = match uri.host() {
 		Some(host) => match uri.port() {
@@ -725,6 +726,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(feature = "socks5-proxy")]
 	#[test]
 	fn proxy_uri_log_line_never_contains_userinfo() {
 		for (raw, want) in [
@@ -740,6 +742,8 @@ mod tests {
 			assert!(!logged.contains("hunter2"), "password leaked: {logged}");
 		}
 	}
+
+	#[test]
 	fn handshake_inverted_range_errors_without_panicking() {
 		// A malicious or buggy server can advertise an inverted range whose
 		// endpoints lie inside the client range; it must be rejected, not panic.

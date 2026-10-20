@@ -46,6 +46,13 @@ TOKEN = os.environ.get("GITLAB_TOKEN")
 # "+" flag marks the continuation of a line that GitLab wrapped.
 LOG_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z \d\d[OE]([ +])")
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# OSC and DCS sequences carry their own payload (clipboard, title, etc.) and
+# must be removed whole, not just their ESC introducer.
+OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+DCS = re.compile(r"\x1bP[^\x1b]*\x1b\\")
+# Everything else that can drive a terminal: remaining C0/C1 controls other
+# than newline and tab. CI job output is untrusted input.
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def http_get(url, what):
@@ -141,7 +148,9 @@ def clean_trace(trace):
         else:
             lines.append(line[match.end():])
 
-    return ANSI.sub("", "\n".join(lines))
+    text = "\n".join(lines)
+    text = DCS.sub("", OSC.sub("", ANSI.sub("", text)))
+    return CONTROL.sub("", text)
 
 
 def parse_ref(value, kind):
@@ -306,6 +315,10 @@ def _self_test():
             raise AssertionError(f"accepted unsafe name: {bad!r}")
         except ValueError:
             pass
+    # OSC/terminal controls from CI logs are removed, not printed.
+    cleaned = clean_trace("\x1b]52;c;AAAA\x07\x1b[2Jtext")
+    assert "\x1b" not in cleaned and "\x07" not in cleaned
+    assert cleaned == "text"
     # Sanitized names resolve to a direct child of OUTPUT_BASE.
     out = output_dir_for(42, "job-1_x.y")
     assert out == OUTPUT_BASE / "42-job-1_x.y"

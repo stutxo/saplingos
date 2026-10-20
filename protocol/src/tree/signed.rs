@@ -194,9 +194,18 @@ fn check_amounts(vtxos: &[VtxoLeafSpec]) -> Result<(), &'static str> {
 	Ok(())
 }
 
+/// Maximum `internal nodes × (global cosigners + 1)` key aggregations
+/// accepted for one tree.
+///
+/// Every internal node aggregates all global cosigners, so a server-supplied
+/// tree with both counts near the vector size cap would burn billions of
+/// curve operations. Honest rounds are orders of magnitude below this bound.
+const MAX_COSIGN_KEY_AGGREGATIONS: usize = 4_000_000;
+
 /// Validate that no musig key aggregation performed while building or
 /// signing a tree with these leaves and global cosigners ever sees an
-/// empty key set, because [musig::combine_keys] panics on an empty set.
+/// empty key set, because [musig::combine_keys] panics on an empty set,
+/// and that the total aggregation work is bounded.
 ///
 /// With at least one global cosign pubkey every node aggregate contains
 /// that key. Without any, at least one leaf must cosign (for the funding
@@ -205,6 +214,12 @@ fn check_cosign_sets(
 	vtxos: &[VtxoLeafSpec],
 	global_cosign_pubkeys: &[PublicKey],
 ) -> Result<(), &'static str> {
+	let internal = Tree::new(vtxos.len()).nb_internal_nodes();
+	let work = internal.checked_mul(global_cosign_pubkeys.len().saturating_add(1))
+		.ok_or("vtxo tree spec cosign work overflows")?;
+	if work > MAX_COSIGN_KEY_AGGREGATIONS {
+		return Err("vtxo tree spec cosign work exceeds the allowed bound");
+	}
 	if global_cosign_pubkeys.is_empty() {
 		if vtxos.iter().all(|v| v.cosign_pubkey.is_none()) {
 			return Err("vtxo tree spec must have at least one cosign pubkey");
@@ -639,6 +654,7 @@ impl UnsignedVtxoTree {
 			}.into());
 		}
 
+		let secret_nonce_count = cosign_sec_nonces.len();
 		let mut nonce_iter = cosign_sec_nonces.into_iter().enumerate();
 		let mut ret = Vec::with_capacity(self.tree.root().level().saturating_add(1));
 		// skip the leaf
@@ -648,7 +664,12 @@ impl UnsignedVtxoTree {
 			// musig requires us to use the owned SecNonce type to prevent footgun
 			// by reusing secret nonces.
 			let sec_nonce = loop {
-				let next = nonce_iter.next().expect("level overflow");
+				let next = nonce_iter.next().ok_or(
+					CosignBranchError::InsufficientSecretNonces {
+						required_level: node.internal_level(),
+						provided: secret_nonce_count,
+					},
+				)?;
 				if next.0 == node.internal_level() {
 					break next.1;
 				}
@@ -2690,6 +2711,29 @@ mod test {
 	}
 
 	#[test]
+	fn vtxo_tree_spec_rejects_excessive_cosign_work() {
+		let pk: PublicKey = "020aceb65eed0ee5c512d3718e6f4bd868a7efb58ede7899ffd9bcba09555d4eb8"
+			.parse().unwrap();
+		let leaf = VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(1_000),
+				policy: VtxoPolicy::new_pubkey(pk),
+			},
+			cosign_pubkey: Some(pk),
+			unlock_hash: sha256::Hash::from_byte_array([9u8; 32]),
+		};
+		// ~1000 internal nodes × 5001 keys exceeds the work bound.
+		let leaves = vec![leaf.clone(); 3_000];
+		let globals = vec![pk; 5_000];
+		let err = check_cosign_sets(&leaves, &globals)
+			.expect_err("excessive aggregation work must be rejected");
+		assert!(err.contains("cosign work"), "unexpected error: {err}");
+
+		// Control: the same tree with one global cosigner is accepted.
+		check_cosign_sets(&leaves, &[pk]).unwrap();
+	}
+
+	#[test]
 	fn cosign_branch_rejects_truncated_agg_nonces() {
 		let secp = secp256k1::Secp256k1::new();
 		let mut rand = rand::rngs::StdRng::seed_from_u64(43);
@@ -2732,6 +2776,52 @@ mod test {
 		let sigs = unsigned.cosign_branch(&[agg_nonce], 0, &cosign_key, vec![sec_nonce])
 			.expect("cosigning with the correct nonce count");
 		assert_eq!(sigs.len(), 1);
+	}
+
+	/// The tree shape is server-controlled; a branch needing a secret nonce at
+	/// an internal level the client did not provision must error, not panic.
+	#[test]
+	fn cosign_branch_rejects_insufficient_secret_nonces() {
+		let secp = secp256k1::Secp256k1::new();
+		let mut rand = rand::rngs::StdRng::seed_from_u64(44);
+		let server_key = Keypair::new(&secp, &mut rand);
+		let cosign_key = Keypair::new(&secp, &mut rand);
+		let user_key = Keypair::new(&secp, &mut rand);
+
+		let leaf = || VtxoLeafSpec {
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(100_000),
+				policy: VtxoPolicy::new_pubkey(user_key.public_key()),
+			},
+			cosign_pubkey: Some(cosign_key.public_key()),
+			unlock_hash: sha256::Hash::from_byte_array([7u8; 32]),
+		};
+		// Six leaves form two internal levels; the root sits at internal
+		// level 1, so signing leaf 0 needs a secret nonce at index 1.
+		let spec = VtxoTreeSpec::new(
+			(0..6).map(|_| leaf()).collect(),
+			server_key.public_key(),
+			BlockHeight::new(1_000),
+			BlockDelta::new(10),
+			vec![server_key.public_key()],
+		);
+		assert_eq!(spec.nb_internal_nodes(), 2);
+		let unsigned = spec.into_unsigned_tree(bitcoin::OutPoint::null());
+
+		let agg_nonce = || {
+			let (_sec, pub_nonce) = musig::nonce_pair(&cosign_key);
+			let (_gsec, gpub_nonce) = musig::nonce_pair(&server_key);
+			musig::nonce_agg(&[&pub_nonce, &gpub_nonce])
+		};
+		let agg_nonces = vec![agg_nonce(), agg_nonce()];
+		let (sec_nonce, _) = musig::nonce_pair(&cosign_key);
+
+		let err = unsigned.cosign_branch(&agg_nonces, 0, &cosign_key, vec![sec_nonce])
+			.expect_err("a missing level nonce must be rejected");
+		assert!(matches!(
+			err,
+			CosignBranchError::InsufficientSecretNonces { required_level: 1, provided: 1 },
+		), "unexpected error: {err}");
 	}
 
 	#[test]

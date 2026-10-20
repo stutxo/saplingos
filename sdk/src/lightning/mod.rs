@@ -77,6 +77,11 @@ fn validate_lnurl_destination(url: &str, has_proxy: bool) -> anyhow::Result<()> 
 	let is_onion = host.ends_with(".onion");
 	// `Url::host_str` keeps the brackets on IPv6 literals ([::1]).
 	let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+	// `localhost` is exempt from the proxy's local-address bypass in
+	// `proxy_for_url`, so it would otherwise reach the host directly.
+	let lower = host.to_ascii_lowercase();
+	ensure!(lower != "localhost" && !lower.ends_with(".localhost"),
+		"lnurl url targets localhost");
 	match url.scheme() {
 		"https" => {},
 		"http" if is_onion && has_proxy => {},
@@ -375,6 +380,9 @@ mod test {
 			// IPv6 ULA and link-local literals are equally internal
 			"https://[fd00::1]/internal",
 			"https://[fe80::1]/",
+			// `localhost` bypasses proxy_for_url's local exemption
+			"https://localhost/callback",
+			"https://wallet.localhost/callback",
 			// IPv4-mapped IPv6 forms must not bypass the IPv4 checks
 			"https://[::ffff:127.0.0.1]/callback",
 			"https://[::ffff:169.254.169.254]/",

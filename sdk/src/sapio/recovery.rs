@@ -1304,12 +1304,25 @@ async fn broadcast_with_fees(tx: &Transaction, chain: &ChainSource,
 		// exceeds it — the existing child stays in the mempool and recovery can be retried.
 		let recovered = tx.output.iter().try_fold(Amount::ZERO, |acc, o| acc.checked_add(o.value))
 			.context("recovery claim output values overflow")?;
-		let Some(current_package_fee) = crate::onchain::cap_backend_package_fee(recovered, info.total_fee)
+		// Never use the backend's absolute fee claim as the signing floor: derive
+		// it from the (clamped) reported rate over the locally known parent +
+		// canonical CPFP-child weight, then cap it against the rescued value.
+		let rate = info.effective_fee_rate().unwrap_or(fee_rate)
+			.min(crate::chain::MAX_PLAUSIBLE_FEE_RATE);
+		let local_weight = tx.weight()
+			.checked_add(crate::exit::estimate::canonical_cpfp_child_weight())
+			.context("recovery package weight overflow")?;
+		let Some(derived_fee) = rate.checked_mul_by_weight(local_weight) else {
+			log::warn!("Recovery fee rate {} over weight {} overflows; skipping the bump",
+				rate, local_weight);
+			return Ok(funded_state);
+		};
+		let Some(current_package_fee) = crate::onchain::cap_backend_package_fee(recovered, derived_fee)
 		else {
 			log::warn!(
-				"Chain backend reports a {} package fee for the recovery child of {} rescuing at most {}; \
-				skipping the fee bump this round instead of signing over an implausible fee",
-				info.total_fee, tx.compute_txid(), recovered,
+				"Derived {} package fee for the recovery child of {} rescuing at most {}; \
+				skipping the fee bump this round",
+				derived_fee, tx.compute_txid(), recovered,
 			);
 			return Ok(funded_state);
 		};

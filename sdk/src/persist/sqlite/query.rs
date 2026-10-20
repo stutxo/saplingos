@@ -38,8 +38,11 @@ pub (crate) fn set_properties(
 	properties: &WalletProperties,
 ) -> anyhow::Result<()> {
 	let query =
-		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey)
-		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey)";
+		"INSERT INTO bark_properties (
+			id, network, fingerprint, server_pubkey, server_mailbox_pubkey, recovery_incomplete
+		) VALUES (
+			1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :recovery_incomplete
+		)";
 	let mut statement = conn.prepare(query)?;
 
 	statement.execute(named_params! {
@@ -47,6 +50,7 @@ pub (crate) fn set_properties(
 		":fingerprint": properties.fingerprint.to_string(),
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
+		":recovery_incomplete": properties.recovery_incomplete as i64,
 	})?;
 
 	Ok(())

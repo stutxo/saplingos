@@ -60,24 +60,51 @@ pub struct SqliteClient {
 /// sidecars (this codebase never enables WAL) inherit the db file's mode.
 #[cfg(unix)]
 fn create_owner_only_if_missing(path: &Path) -> anyhow::Result<()> {
-	use std::os::unix::fs::OpenOptionsExt;
+	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 	// In-memory and URI connection strings are not filesystem paths here.
 	let Some(name) = path.as_os_str().to_str() else {
 		return Ok(());
 	};
-	if name == ":memory:" || name.starts_with("file:") || path.exists() {
+	if name == ":memory:" || name.starts_with("file:") {
 		return Ok(());
 	}
 
+	let check_existing = |meta: &std::fs::Metadata| -> anyhow::Result<()> {
+		anyhow::ensure!(!meta.file_type().is_symlink(),
+			"refusing symlinked database path {}", path.display());
+		anyhow::ensure!(meta.is_file(),
+			"database path {} is not a regular file", path.display());
+		anyhow::ensure!(meta.nlink() == 1,
+			"database path {} has multiple hard links", path.display());
+		Ok(())
+	};
+	match std::fs::symlink_metadata(path) {
+		Ok(meta) => return check_existing(&meta),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+		Err(e) => return Err(e)
+			.with_context(|| format!("failed to inspect database {}", path.display())),
+	}
+
 	let mut options = std::fs::OpenOptions::new();
-	options.write(true).create_new(true).mode(0o600);
+	options.write(true).create_new(true).mode(0o600)
+		// Do not follow a symlink planted in the creation race.
+		.custom_flags(libc::O_NOFOLLOW);
 	match options.open(path) {
-		Ok(_) => Ok(()),
-		// Another process won the creation race; SQLite opens the file.
-		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-		Err(e) => Err(e),
-	}.with_context(|| format!("failed to create database {}", path.display()))
+		Ok(file) => {
+			let meta = file.metadata()
+				.with_context(|| format!("failed to inspect database {}", path.display()))?;
+			check_existing(&meta)
+		},
+		// Another process won the creation race; re-check what appeared.
+		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+			let meta = std::fs::symlink_metadata(path)
+				.with_context(|| format!("failed to inspect database {}", path.display()))?;
+			check_existing(&meta)
+		},
+		Err(e) => Err(e)
+			.with_context(|| format!("failed to create database {}", path.display())),
+	}
 }
 
 #[cfg(not(unix))]
@@ -92,7 +119,11 @@ impl SqliteClient {
 
 		debug!("Opening database at {}", path.display());
 		create_owner_only_if_missing(&path)?;
-		let mut conn = rusqlite::Connection::open(&path)
+		// SQLITE_OPEN_NOFOLLOW closes the remaining check/open race: a
+		// symlink planted after the pre-check is still refused.
+		let flags = rusqlite::OpenFlags::default()
+			| rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+		let mut conn = rusqlite::Connection::open_with_flags(&path, flags)
 			.with_context(|| format!("Error connecting to database {}", path.display()))?;
 
 		// Defense in depth for older or externally-created dbs: warn rather
@@ -1152,6 +1183,24 @@ mod test {
 		let one: i64 = db.connect().unwrap()
 			.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
 		assert_eq!(one, 1);
+	}
+
+	/// A symlink planted where the wallet database belongs must be refused,
+	/// not followed: SQLite would create/overwrite the link target.
+	#[cfg(unix)]
+	#[test]
+	fn symlinked_db_path_is_refused() {
+		use std::os::unix::fs::symlink;
+
+		let directory = tempfile::tempdir().unwrap();
+		let victim = directory.path().join("victim");
+		std::fs::write(&victim, b"do not touch").unwrap();
+		let link = directory.path().join("wallet.sqlite");
+		symlink(&victim, &link).unwrap();
+
+		let err = SqliteClient::open(&link).unwrap_err();
+		assert!(format!("{err:#}").contains("symlink"), "unexpected error: {err:#}");
+		assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
 	}
 
 	/// A pre-existing loose db keeps working and keeps its mode:

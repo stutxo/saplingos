@@ -274,6 +274,8 @@ impl ExitTransactionManager {
 				})?,
 				fee_info: child.fee_info,
 				origin: child.origin,
+				parent_weight: guard.exit.tx.weight(),
+				child_weight: child.info.tx.weight(),
 			}))
 		} else {
 			Ok(None)
@@ -319,6 +321,13 @@ impl ExitTransactionManager {
 			self.status.insert(txid, status.clone());
 			Ok(status)
 		}
+	}
+
+	/// Whether a reported spend is older than the `SPEND_CONFIRMATIONS` scan
+	/// window. Esplora reports spends at any height, so the depth decision must
+	/// use the reported block height rather than "found in the scan".
+	fn spend_is_deep(status: &TxStatus, scan_start: BlockHeight) -> bool {
+		matches!(status, TxStatus::Confirmed(block) if block.height < scan_start)
 	}
 
 	/// Returns the inputs of `exit_txid` that something else has already spent, which makes
@@ -396,19 +405,22 @@ impl ExitTransactionManager {
 		let mut deeply_spent = Vec::with_capacity(to_scan.len());
 		for input in to_scan {
 			match spends.get(&input) {
-				Some((txid, TxStatus::Confirmed(_) | TxStatus::Mempool)) => {
-					warn!("Exit tx {} has a spend of input {} by {} within the last {} blocks, \
-						too recent to end the exit on", exit_txid, input, txid, SPEND_CONFIRMATIONS,
+				// An esplora backend reports a confirmed spend at its actual
+				// height, however old: classify by that height instead of
+				// assuming "found in the scan" means "inside the window".
+				Some((txid, status)) if Self::spend_is_deep(status, scan_start) => {
+					debug!("Exit tx {} has a deep spend of input {} by {}", exit_txid, input, txid);
+					deeply_spent.push(input);
+				},
+				Some((txid, status)) => {
+					warn!("Exit tx {} has a spend of input {} by {} ({:?}) within the last {} \
+						blocks, too recent to end the exit on",
+						exit_txid, input, txid, status, SPEND_CONFIRMATIONS,
 					);
 				},
 				// The scan only records spends it found, so it never reports this. Spelled out
 				// rather than folded into a catch-all so that changing that is a compile error
 				// here: a status we can't interpret must not end an exit.
-				Some((_, TxStatus::NotFound)) => {
-					warn!("Exit tx {} got an unexpected NotFound spend status for input {}, \
-						leaving the exit running", exit_txid, input,
-					);
-				},
 				None => deeply_spent.push(input),
 			}
 		}
@@ -831,6 +843,15 @@ mod test {
 		let db = SqliteClient::open(path).unwrap();
 		let chain = Arc::new(ChainSource::offline_for_test(Network::Regtest));
 		(ExitTransactionManager::new(Arc::new(db), chain).unwrap(), conn)
+	}
+
+	#[test]
+	fn spend_depth_uses_the_reported_height() {
+		let scan_start = BlockHeight::new(94);
+		assert!(!ExitTransactionManager::spend_is_deep(&confirmed(94), scan_start));
+		assert!(!ExitTransactionManager::spend_is_deep(&confirmed(100), scan_start));
+		assert!(ExitTransactionManager::spend_is_deep(&confirmed(93), scan_start));
+		assert!(!ExitTransactionManager::spend_is_deep(&TxStatus::Mempool, scan_start));
 	}
 
 	#[tokio::test]

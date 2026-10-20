@@ -115,7 +115,7 @@
 
 mod models;
 mod vtxo;
-mod estimate;
+pub(crate) mod estimate;
 pub mod bdk;
 pub(crate) mod progress;
 pub(crate) mod transaction_manager;
@@ -201,13 +201,24 @@ pub(crate) fn checked_fee_at_rate(rate: FeeRate, weight: Weight) -> Result<Amoun
 /// Locally derived fee info ([FeeInfo::trusted] — children the wallet or its operator
 /// built and signed itself) passes through verbatim and uncapped: we know what we signed,
 /// so an honest above-cap package keeps bumping instead of being stranded.
-pub(crate) fn sanitize_fee_info(fi: FeeInfo, value_at_stake: Amount) -> Option<FeeInfo> {
+pub(crate) fn sanitize_fee_info(
+	fi: FeeInfo,
+	value_at_stake: Amount,
+	local_package_weight: Weight,
+) -> Option<FeeInfo> {
 	if fi.trusted {
 		return Some(fi);
 	}
-	let total_fee = crate::onchain::cap_backend_package_fee(value_at_stake, fi.total_fee)?;
+	// The reported absolute fee is attacker-dialed independently of the rate.
+	// Derive the floor from the (clamped) reported rate over the locally known
+	// parent+child package instead, then apply the rescued-value cap as a
+	// second line of defence. A low rate cannot then demand a large burn, and
+	// an honest report keeps roughly its actual package fee.
+	let rate = fi.fee_rate.min(crate::chain::MAX_PLAUSIBLE_FEE_RATE);
+	let derived_fee = rate.checked_mul_by_weight(local_package_weight)?;
+	let total_fee = crate::onchain::cap_backend_package_fee(value_at_stake, derived_fee)?;
 	Some(FeeInfo {
-		fee_rate: fi.fee_rate.min(crate::chain::MAX_PLAUSIBLE_FEE_RATE),
+		fee_rate: rate,
 		total_fee,
 		trusted: fi.trusted,
 	})
@@ -222,7 +233,8 @@ fn sanitized_child_fee_info(
 	exit_txid: Txid,
 ) -> Option<FeeInfo> {
 	child.fee_info.and_then(|fi| {
-		let sanitized = sanitize_fee_info(fi, value_at_stake);
+		let local_weight = child.parent_weight + child.child_weight;
+		let sanitized = sanitize_fee_info(fi, value_at_stake, local_weight);
 		if sanitized.is_none() {
 			warn!(
 				"Ignoring implausible chain-backend fee report for the CPFP child of exit tx {} (claimed total fee {} for a rescued value of {}); treating the committed fee as unknown",
@@ -953,7 +965,8 @@ impl Exit {
 									// floor against the rescued value and refuse to sign
 									// over implausible claims. Locally derived (trusted)
 									// fees pass through verbatim.
-									match sanitize_fee_info(fi, ev.amount()) {
+									let local_weight = c.parent_weight + c.child_weight;
+									match sanitize_fee_info(fi, ev.amount(), local_weight) {
 										Some(fi) => Some(RbfRequirement {
 											min_fee_rate: fi.fee_rate,
 											current_package_fee: fi.total_fee,
@@ -1379,25 +1392,59 @@ mod test {
 	}
 
 	#[test]
-	fn sanitize_fee_info_drops_99_btc_backend_package_claim() {
-		// The audited payload: a chain backend claiming a 99 BTC package fee for an exit
-		// rescuing 1 BTC must produce no RBF signal — nothing to sign over, ever.
+	fn sanitize_fee_info_ignores_fabricated_absolute_fee() {
+		// The audited payload: a chain backend claiming a 99 BTC package fee for
+		// an exit rescuing 1 BTC. The absolute claim is ignored; the floor is
+		// derived from the rate over the local package.
 		let fi = FeeInfo {
 			fee_rate: FeeRate::from_sat_per_kwu(1_000),
 			total_fee: Amount::from_sat(99_000_000_000),
 			trusted: false,
 		};
-		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(100_000_000)), None);
+		assert_eq!(
+			sanitize_fee_info(fi, Amount::from_sat(100_000_000), Weight::from_wu(1_000)),
+			Some(FeeInfo {
+				fee_rate: FeeRate::from_sat_per_kwu(1_000),
+				total_fee: Amount::from_sat(1_000),
+				trusted: false,
+			}),
+		);
 	}
 
 	#[test]
-	fn sanitize_fee_info_passes_plausible_backend_reports_bit_exact() {
+	fn sanitize_fee_info_derives_floor_from_rate_not_reported_fee() {
+		// A tiny rate with a fabricated large fee must yield a tiny floor: the
+		// reported fee cannot become the replacement's signing floor.
+		let fi = FeeInfo {
+			fee_rate: FeeRate::from_sat_per_kwu(1),
+			total_fee: Amount::from_sat(10_000_000),
+			trusted: false,
+		};
+		assert_eq!(
+			sanitize_fee_info(fi, Amount::from_sat(100_000_000), Weight::from_wu(1_000)),
+			Some(FeeInfo {
+				fee_rate: FeeRate::from_sat_per_kwu(1),
+				total_fee: Amount::from_sat(1),
+				trusted: false,
+			}),
+		);
+	}
+
+	#[test]
+	fn sanitize_fee_info_derives_plausible_floor_from_local_weight() {
 		let fi = FeeInfo {
 			fee_rate: FeeRate::from_sat_per_kwu(2_500),
 			total_fee: Amount::from_sat(3_000),
 			trusted: false,
 		};
-		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(100_000_000)), Some(fi));
+		assert_eq!(
+			sanitize_fee_info(fi, Amount::from_sat(100_000_000), Weight::from_wu(2_000)),
+			Some(FeeInfo {
+				fee_rate: FeeRate::from_sat_per_kwu(2_500),
+				total_fee: Amount::from_sat(5_000),
+				trusted: false,
+			}),
+		);
 	}
 
 	#[test]
@@ -1409,11 +1456,14 @@ mod test {
 			total_fee: Amount::from_sat(1_000),
 			trusted: false,
 		};
-		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(100_000_000)), Some(FeeInfo {
-			fee_rate: crate::chain::MAX_PLAUSIBLE_FEE_RATE,
-			total_fee: Amount::from_sat(1_000),
-			trusted: false,
-		}));
+		assert_eq!(
+			sanitize_fee_info(fi, Amount::from_sat(100_000_000), Weight::from_wu(1_000)),
+			Some(FeeInfo {
+				fee_rate: crate::chain::MAX_PLAUSIBLE_FEE_RATE,
+				total_fee: Amount::from_sat(1_000_000),
+				trusted: false,
+			}),
+		);
 	}
 
 	#[test]
@@ -1426,6 +1476,9 @@ mod test {
 			total_fee: Amount::from_sat(500_000),
 			trusted: true,
 		};
-		assert_eq!(sanitize_fee_info(fi, Amount::from_sat(1_000_000)), Some(fi));
+		assert_eq!(
+			sanitize_fee_info(fi, Amount::from_sat(1_000_000), Weight::from_wu(1_000)),
+			Some(fi),
+		);
 	}
 }

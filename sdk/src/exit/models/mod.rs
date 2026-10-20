@@ -17,7 +17,7 @@ pub use self::states::{
 use std::fmt;
 
 use ark::VtxoId;
-use bitcoin::{OutPoint, Txid};
+use bitcoin::{OutPoint, Txid, Weight};
 
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, TxStatus};
 
@@ -345,6 +345,10 @@ pub struct ExitChildStatus {
 	pub status: TxStatus,
 	pub origin: ExitTxOrigin,
 	pub fee_info: Option<FeeInfo>,
+	/// Weight of the zero-fee exit parent, and of this CPFP child: the
+	/// locally known package the backend's fee report must be consistent with.
+	pub parent_weight: Weight,
+	pub child_weight: Weight,
 }
 
 #[cfg(test)]

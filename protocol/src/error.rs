@@ -39,4 +39,14 @@ pub enum CosignBranchError {
 		/// The number of aggregate cosign nonces provided.
 		provided: usize,
 	},
+	/// The branch being signed needs a secret nonce at an internal level the
+	/// caller did not provide. The server controls the tree shape, so this is
+	/// caller input that must fail rather than index out of bounds.
+	#[error("branch needs a cosign secret nonce at internal level {required_level}, but only {provided} were provided")]
+	InsufficientSecretNonces {
+		/// The internal level (leaves-to-root) of the node being signed.
+		required_level: usize,
+		/// The number of secret nonces provided for the branch.
+		provided: usize,
+	},
 }

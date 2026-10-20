@@ -60,6 +60,20 @@ use crate::vtxo::{ServerStatusAdoption, VtxoState};
 /// The value is far above any plausible genuine wallet history.
 const MAX_RECOVERY_CANDIDATES_PER_RUN: usize = 10_000;
 
+/// How many fetched candidate bodies a run holds before validating and
+/// scanning the batch.
+///
+/// The per-page key-scan batching must not turn one mailbox page into an
+/// unbounded body buffer: a server can answer every id with a large
+/// decodable body, so the page is flushed in bounded batches (keeping the
+/// one-scan-per-batch saving while capping peak memory).
+const MAX_RECOVERY_CANDIDATE_BATCH: usize = 64;
+
+/// Hard cap on a single recovery VTXO body. Honest VTXO histories are a few
+/// KiB; a server-supplied body near the 64 MiB gRPC limit must be rejected
+/// before it is decoded into an in-memory `Vtxo<Full>`.
+const MAX_RECOVERY_VTXO_BODY: usize = 1024 * 1024;
+
 /// How many overflow ids the report keeps as a sample. Unbounded recording of
 /// a flood's ids is what the budget exists to prevent, but a small sample
 /// gives operators a manual handle: [`Wallet::recover_vtxos`] accepts ids.
@@ -347,10 +361,10 @@ impl Wallet {
 				// A message references its vtxos either by id or by full body.
 				match &msg.message {
 					Some(Message::RecoveryVtxoIds(m)) => {
-						self.intake_id_refs(report, &m.vtxo_ids, seen, budget, &mut page).await?;
+						self.intake_id_refs(report, &m.vtxo_ids, seen, budget, &mut page, gap_limit).await?;
 					},
 					Some(Message::Arkoor(m)) => {
-						self.intake_vtxo_bodies(report, &m.vtxos, seen, budget, &mut page).await?;
+						self.intake_vtxo_bodies(report, &m.vtxos, seen, budget, &mut page, gap_limit).await?;
 					},
 					Some(Message::RoundParticipationCompleted(_)) |
 					Some(Message::IncomingLightningPayment(_)) |
@@ -390,8 +404,21 @@ impl Wallet {
 			vtxo_id: id.to_bytes().to_vec(),
 		}).await.with_context(|| format!("error fetching vtxo {id} from server"))?.into_inner();
 
-		Vtxo::<Full>::deserialize(&resp.vtxo)
-			.with_context(|| format!("server returned an undecodable vtxo for {id}"))
+		// Bound the body before decoding: the response size is server-chosen
+		// and decode allocations would otherwise be bounded only by the
+		// transport's 64 MiB message limit.
+		ensure!(resp.vtxo.len() <= MAX_RECOVERY_VTXO_BODY,
+			"server returned an oversized vtxo body ({} bytes) for {id}",
+			resp.vtxo.len(),
+		);
+		let vtxo = Vtxo::<Full>::deserialize(&resp.vtxo)
+			.with_context(|| format!("server returned an undecodable vtxo for {id}"))?;
+		// The server may answer with a different valid VTXO; callers index
+		// reports and stores by the requested id, so the body must match it.
+		ensure!(vtxo.id() == id,
+			"server returned vtxo {} for requested vtxo {id}", vtxo.id(),
+		);
+		Ok(vtxo)
 	}
 
 	/// Check if a VTXO is confirmed on-chain.
@@ -442,6 +469,7 @@ impl Wallet {
 		seen: &mut HashSet<VtxoId>,
 		budget: &mut RecoveryCandidateBudget,
 		page: &mut Vec<Vtxo<Full>>,
+		gap_limit: u32,
 	) -> anyhow::Result<()> {
 		for raw in refs {
 			if budget.is_exhausted() {
@@ -470,12 +498,30 @@ impl Wallet {
 				CandidateRecord::Unknown => budget.consume(),
 			}
 			match self.fetch_vtxo(id).await {
-				Ok(vtxo) => page.push(vtxo),
+				Ok(vtxo) => {
+					page.push(vtxo);
+					self.flush_recovery_page(report, page, gap_limit).await?;
+				},
 				Err(e) => {
 					warn!("Could not fetch recovery vtxo {id}: {:#}", e);
 					report.push_failed(id, None);
 				},
 			}
+		}
+		Ok(())
+	}
+
+	/// Validate and scan a full batch, keeping peak memory bounded while
+	/// retaining one key-scan window per batch.
+	async fn flush_recovery_page(
+		&self,
+		report: &mut RecoveryReport,
+		page: &mut Vec<Vtxo<Full>>,
+		gap_limit: u32,
+	) -> anyhow::Result<()> {
+		if page.len() >= MAX_RECOVERY_CANDIDATE_BATCH {
+			let batch = std::mem::take(page);
+			self.recover_candidates(report, batch, gap_limit).await?;
 		}
 		Ok(())
 	}
@@ -489,6 +535,7 @@ impl Wallet {
 		seen: &mut HashSet<VtxoId>,
 		budget: &mut RecoveryCandidateBudget,
 		page: &mut Vec<Vtxo<Full>>,
+		gap_limit: u32,
 	) -> anyhow::Result<()> {
 		for raw in raws {
 			if budget.is_exhausted() {
@@ -500,6 +547,13 @@ impl Wallet {
 					Vtxo::<Full>::from_bytes(raw.clone()).ok().map(|v| v.id())
 				};
 				report.push_budget_overflow(sample);
+				continue;
+			}
+			if raw.len() > MAX_RECOVERY_VTXO_BODY {
+				warn!("Ignoring oversized recovery vtxo body ({} bytes)", raw.len());
+				// No id is available without decoding, so count it as an
+				// unprocessed candidate to keep the report incomplete.
+				report.push_budget_overflow(None);
 				continue;
 			}
 			let Ok(vtxo) = Vtxo::<Full>::from_bytes(raw.clone()) else {
@@ -516,6 +570,7 @@ impl Wallet {
 				CandidateRecord::Unknown => budget.consume(),
 			}
 			page.push(vtxo);
+			self.flush_recovery_page(report, page, gap_limit).await?;
 		}
 		Ok(())
 	}
@@ -943,7 +998,10 @@ mod test {
 		use ark::test_util::dummy::DummyTestVtxoSpec;
 		use ark::vtxo::Full;
 
-		use super::super::{CandidateRecord, RecoveryCandidateBudget, RecoveryReport};
+		use super::super::{
+			CandidateRecord, RecoveryCandidateBudget, RecoveryReport,
+			MAX_RECOVERY_CANDIDATE_BATCH,
+		};
 		use crate::{Config, Wallet, WalletInner, WalletProperties, WalletSeed, SECP};
 		use crate::chain::ChainSource;
 		use crate::exit::Exit;
@@ -1131,7 +1189,7 @@ mod test {
 			let mut budget = RecoveryCandidateBudget::new(10);
 			let mut page = Vec::new();
 			wallet.intake_id_refs(&mut report, std::slice::from_ref(&provisional.id().to_bytes().to_vec()),
-				&mut seen, &mut budget, &mut page).await.unwrap();
+				&mut seen, &mut budget, &mut page, 1).await.unwrap();
 			assert_eq!(budget.remaining, 10, "re-checking stored candidates costs no budget");
 			assert!(report.recovered().is_empty());
 			assert!(report.failed().ids().any(|i| i == provisional.id()),
@@ -1153,7 +1211,7 @@ mod test {
 			let vtxos = (0..5).map(fabricated_candidate).collect::<Vec<_>>();
 			let bodies = vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>();
 			let mut page = Vec::new();
-			wallet.intake_vtxo_bodies(&mut report, &bodies, &mut seen, &mut budget, &mut page).await.unwrap();
+			wallet.intake_vtxo_bodies(&mut report, &bodies, &mut seen, &mut budget, &mut page, 4).await.unwrap();
 
 			assert!(budget.is_exhausted());
 			assert_eq!(page.len(), 2, "only the remaining budget is processed");
@@ -1162,6 +1220,31 @@ mod test {
 			assert_eq!(report.budget_overflow_sample(),
 				&vtxos[2..].iter().map(|v| v.id()).collect::<Vec<_>>()[..],
 				"a bounded id sample leaves operators a manual recover_vtxos handle");
+		}
+
+		/// A page larger than one batch is validated/scan-flushed in bounded
+		/// batches instead of accumulating every body before validation.
+		#[tokio::test]
+		async fn recovery_bodies_flush_in_bounded_batches() {
+			let wallet = offline_wallet(8).await;
+			let total = MAX_RECOVERY_CANDIDATE_BATCH * 2 + 5;
+			let vtxos = (0..total as u32).map(fabricated_candidate).collect::<Vec<_>>();
+			let bodies = vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>();
+
+			let mut report = RecoveryReport::default();
+			let mut seen = HashSet::new();
+			let mut budget = RecoveryCandidateBudget::new(total + 10);
+			let mut page = Vec::new();
+			wallet.intake_vtxo_bodies(
+				&mut report, &bodies, &mut seen, &mut budget, &mut page, 4,
+			).await.unwrap();
+
+			let remainder = total % MAX_RECOVERY_CANDIDATE_BATCH;
+			assert_eq!(page.len(), remainder,
+				"only the unflushed tail may remain buffered");
+			assert_eq!(report.failed().len(), total - remainder,
+				"every flushed candidate was validated in its batch");
+			assert_eq!(seen.len(), total);
 		}
 
 		/// The run verdict is persisted as the wallet's recovery-incomplete

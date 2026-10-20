@@ -404,15 +404,20 @@ impl MovementManager {
 		}
 
 		let movement_lock = {
-			// Acquire a write lock and check if another thread already loaded the movement.
-			let active_guard = self.active_movements.write().await;
+			// Acquire a write lock and check if another thread already loaded
+			// the movement. The new handle must be inserted: callers rely on
+			// the per-movement mutex to serialize updates, and unloading must
+			// remove it again.
+			let mut active_guard = self.active_movements.write().await;
 			if let Some(lock) = active_guard.get(&id).cloned() {
 				lock
 			} else {
-				Arc::new(Mutex::new(
+				let movement = Arc::new(Mutex::new(
 					self.db.get_movement_by_id(id).await
 						.map_err(|e| MovementError::LoadError { id, e })?
-				))
+				));
+				active_guard.insert(id, movement.clone());
+				movement
 			}
 		};
 		Ok(movement_lock.lock_owned().await)

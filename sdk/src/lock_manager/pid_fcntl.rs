@@ -47,13 +47,24 @@ use super::internal_memory::InternalMemoryLockManager;
 pub const LOCK_FILE: &str = "LOCK";
 
 fn open_lock_file(path: &Path) -> anyhow::Result<File> {
-	File::options()
+	use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+	let file = File::options()
 		.read(true)
 		.write(true)
 		.create(true)
 		.truncate(false)
+		// Never follow a symlink planted where the lock belongs: the holder
+		// truncates and writes this file.
+		.custom_flags(libc::O_NOFOLLOW)
 		.open(path)
-		.with_context(|| format!("failed to open lock file {}", path.display()))
+		.with_context(|| format!("failed to open lock file {}", path.display()))?;
+	let metadata = file.metadata()
+		.with_context(|| format!("failed to inspect lock file {}", path.display()))?;
+	anyhow::ensure!(metadata.is_file(),
+		"lock path {} is not a regular file", path.display());
+	anyhow::ensure!(metadata.nlink() == 1,
+		"lock path {} has multiple hard links", path.display());
+	Ok(file)
 }
 
 /// Attempt a non-blocking POSIX write lock on the whole file.
@@ -104,6 +115,13 @@ impl FcntlPidLockManager {
 			.with_context(|| format!("failed to create datadir {}", datadir.display()))
 			.map_err(&setup)?;
 
+		// Key the registry and lock path on the canonical directory: two
+		// spellings of the same path (`wallet`, `./wallet`, an absolute path
+		// or a symlink) must not defeat same-process exclusion.
+		let datadir = fs::canonicalize(&datadir)
+			.with_context(|| format!("failed to canonicalize datadir {}", datadir.display()))
+			.map_err(&setup)?;
+
 		// POSIX fcntl locks are scoped to (process, inode), so a second
 		// `fcntl(F_SETLK)` from the same process on the same file would
 		// silently succeed. Track which datadirs this process already
@@ -115,7 +133,8 @@ impl FcntlPidLockManager {
 
 		if !try_fcntl_lock(&file).map_err(&setup)? {
 			let mut holder = String::new();
-			let _ = file.read_to_string(&mut holder);
+			// The file is attacker-influenced; bound the diagnostic read.
+			let _ = (&file).take(64).read_to_string(&mut holder);
 			let pid = holder.trim().parse::<u32>().ok();
 			return Err(PidLockError::AlreadyHeld { datadir, pid });
 		}
@@ -277,5 +296,23 @@ mod test {
 
 		let _ = fs::remove_dir_all(&dir_a);
 		let _ = fs::remove_dir_all(&dir_b);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn symlinked_lock_file_is_refused() {
+		use std::os::unix::fs::symlink;
+
+		let dir = tmp_dir();
+		fs::create_dir_all(&dir).unwrap();
+		let victim = dir.join("victim");
+		fs::write(&victim, b"do not touch").unwrap();
+		symlink(&victim, dir.join(LOCK_FILE)).unwrap();
+
+		let err = FcntlPidLockManager::new(&dir).unwrap_err();
+		assert!(matches!(err, PidLockError::SetupFailed { .. }), "{err:?}");
+		assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+
+		let _ = fs::remove_dir_all(&dir);
 	}
 }

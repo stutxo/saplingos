@@ -21,7 +21,7 @@ use ark::lightning::{Bolt11InvoiceExt, PaymentHash, Preimage};
 use ark::sapio::protocol::{OwnershipProof, OwnershipRequest};
 use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy};
 use ark::vtxo::Full;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
 use server_rpc::protos;
 use server_rpc::protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos;
 
@@ -68,6 +68,25 @@ fn validate_bolt11_payment_hash(
 	Ok(())
 }
 
+/// Validate that a server-minted receive invoice is the one we asked for.
+///
+/// BOLT11 signing does not bind a third party, and the server mints this
+/// invoice itself: it can keep our payment hash while substituting any amount
+/// (including zero), and the claim-time check would then compare against the
+/// substituted invoice. Bind both fields before handing it out.
+fn validate_bolt11_request(
+	invoice: &Bolt11Invoice,
+	expected_payment_hash: PaymentHash,
+	expected_amount: Amount,
+) -> anyhow::Result<()> {
+	validate_bolt11_payment_hash(invoice, expected_payment_hash)?;
+	ensure!(invoice.amount_milli_satoshis() == Some(expected_amount.to_msat()),
+		"Ark server returned invoice for {:?} msat, expected {} msat",
+		invoice.amount_milli_satoshis(), expected_amount.to_msat(),
+	);
+	Ok(())
+}
+
 /// An incoming lightning payment, persisted as a single checkpoint row
 /// stored at invoice creation time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +102,11 @@ pub struct LightningReceive {
 	/// Index of the wallet key backing the HTLC-recv vtxo and, for local
 	/// receives, the claim output.
 	pub key_index: u32,
+	/// The server fee quoted when the invoice was created. Claiming compares
+	/// against this committed fee, not a possibly-changed later schedule.
+	/// `None` only for checkpoints persisted before this field existed.
+	#[serde(default)]
+	pub fee: Option<Amount>,
 
 	// Mutable state:
 	pub progress: Progress,
@@ -375,7 +399,7 @@ pub(crate) async fn start_lightning_receive(
 
 	let invoice = Bolt11Invoice::from_str(&resp.bolt11)
 		.context("invalid bolt11 invoice returned by Ark server")?;
-	validate_bolt11_payment_hash(&invoice, payment_hash)?;
+	validate_bolt11_request(&invoice, payment_hash, amount)?;
 
 	Ok(LightningReceive {
 		invoice,
@@ -385,6 +409,7 @@ pub(crate) async fn start_lightning_receive(
 		anti_dos_token: token,
 		claim_destination,
 		key_index,
+		fee: Some(fee),
 		progress: Progress::AwaitingPayment,
 	})
 }
@@ -593,16 +618,30 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 	let invoice_amount = recv.invoice.get_payment_amount(None)
 		.context("ln receive invoice should have amount")?;
 	let server_received_amount = res.receive.map(|r| Amount::from_sat(r.amount_sat));
-	let fee = {
-		let fee = server_received_amount
-			.and_then(|a| ark_info.fees.lightning_receive.calculate(a));
-		match (server_received_amount, fee) {
-			(Some(amount), Some(fee)) if htlc_amount + fee == amount => fee,
-			_ => ark_info.fees.lightning_receive.calculate(invoice_amount)
-				.expect("we previously validated this"),
-		}
+	let fee = match recv.fee {
+		// New checkpoints: use the fee committed when the invoice was
+		// created, so a server that raises its schedule later cannot turn a
+		// tiny grant into an accepted claim.
+		Some(fee) => fee,
+		// Legacy checkpoints have no committed fee; preserve the old
+		// reconstruction but with checked arithmetic.
+		None => {
+			let candidate = server_received_amount
+				.and_then(|a| ark_info.fees.lightning_receive.calculate(a))
+				.filter(|fee| {
+					htlc_amount.checked_add(*fee).filter(|sum| *sum <= Amount::MAX_MONEY)
+						== server_received_amount
+				});
+			match candidate {
+				Some(fee) => fee,
+				None => ark_info.fees.lightning_receive.calculate(invoice_amount)
+					.context("lightning receive fee overflow")?,
+			}
+		},
 	};
-	let received = htlc_amount + fee;
+	let received = htlc_amount.checked_add(fee)
+		.filter(|sum| *sum <= Amount::MAX_MONEY)
+		.context("HTLC amount plus fee exceeds the money supply")?;
 	if received < invoice_amount {
 		return Err(anyhow!("Server didn't return enough VTXOs to cover invoice amount").into());
 	}
@@ -1036,6 +1075,19 @@ mod tests {
 
 	fn test_bolt11() -> Bolt11Invoice {
 		Bolt11Invoice::from_str(TEST_INVOICE_STR).expect("valid test invoice")
+	}
+
+	#[test]
+	fn validate_bolt11_request_binds_the_amount() {
+		let invoice = test_bolt11();
+		let payment_hash = PaymentHash::from(&invoice);
+		let amount = Amount::from_msat_ceil(invoice.amount_milli_satoshis().unwrap());
+
+		validate_bolt11_request(&invoice, payment_hash, amount).unwrap();
+		// A substituted invoice amount with the same payment hash is refused.
+		let other = Amount::from_sat(amount.to_sat() + 1);
+		validate_bolt11_request(&invoice, payment_hash, other)
+			.expect_err("a different invoice amount must be rejected");
 	}
 
 	#[test]

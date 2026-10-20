@@ -47,6 +47,13 @@ const TIP_CACHE_TTL: Duration = Duration::from_secs(1);
 /// than this buys nothing while costing one HTTP round trip per sync tick.
 const FEE_RATES_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum unconfirmed ancestors walked for one mempool package report.
+///
+/// Bitcoin Core's mempool policy caps ancestry at 25; a backend that returns
+/// an endless fabricated vin chain must not make the client traverse it until
+/// it runs out of memory.
+const MAX_MEMPOOL_ANCESTORS: usize = 128;
+
 /// Sanity ceiling for fee rates accepted from a configured chain backend:
 /// 1,000,000 sat/kwu, i.e. 4,000 sat/vB — far above any historically observed
 /// block-space rate, so clamping can only ever misfire on data that lies.
@@ -569,6 +576,13 @@ impl ChainSource {
 				let mut info_map: HashMap<Txid, esplora_client::Tx> = HashMap::new();
 				let mut set = HashSet::from([txid]);
 				while !set.is_empty() {
+					let pending = set.iter()
+						.filter(|txid| !info_map.contains_key(*txid))
+						.count();
+					anyhow::ensure!(
+						info_map.len().saturating_add(pending) <= MAX_MEMPOOL_ANCESTORS,
+						"esplora mempool ancestry exceeds {MAX_MEMPOOL_ANCESTORS} transactions",
+					);
 					// Start requests asynchronously
 					let requests = set.iter().filter_map(|txid| if info_map.contains_key(txid) {
 						None

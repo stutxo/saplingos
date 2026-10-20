@@ -571,6 +571,43 @@ impl<S: StorageAdaptor> StorageAdaptorWrapper<S> {
 			inner: tokio::sync::RwLock::new(inner),
 		}
 	}
+
+	/// Read-modify-write the properties record through the backend's atomic
+	/// compare-and-commit, so two wallet contexts sharing one database cannot
+	/// lose each other's field updates (e.g. reset a pinned server key or the
+	/// recovery-incomplete marker).
+	async fn update_properties(
+		&self,
+		update: impl Fn(&mut WalletProperties) -> anyhow::Result<()>,
+	) -> anyhow::Result<()> {
+		const MAX_RETRIES: usize = 32;
+		for _ in 0..MAX_RETRIES {
+			let mut lock = self.inner.write().await;
+			let previous = lock.get(partition::PROPERTIES, &[]).await?
+				.context("wallet not initialized")?;
+			let mut properties = previous.to_data::<WalletProperties>()?;
+			update(&mut properties)?;
+			let updated = Record::from_data(
+				partition::PROPERTIES, &[], None, &properties,
+			)?;
+			let Err(e) = lock.put_batch_checked(
+				vec![RecordUpdate {
+					previous: Some(previous.clone()),
+					updated: Some(updated),
+				}],
+				&[],
+			).await else {
+				return Ok(());
+			};
+			// Only a properties record changed by another context is
+			// retried; an unchanged record means the write failed for a
+			// reason a retry cannot fix.
+			if lock.get(partition::PROPERTIES, &[]).await?.as_ref() == Some(&previous) {
+				return Err(e.context("failed to update wallet properties"));
+			}
+		}
+		anyhow::bail!("wallet properties update conflicted after {MAX_RETRIES} retries")
+	}
 }
 
 /// Blanket implementation of `WalletPersister` for any type implementing `StorageAdaptor`.
@@ -585,7 +622,15 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 			None,
 			properties,
 		)?;
-		self.inner.write().await.put(record).await
+		// A CAS with no previous record refuses to overwrite an existing
+		// wallet even when two contexts race the initialization check.
+		let mut lock = self.inner.write().await;
+		anyhow::ensure!(lock.get(partition::PROPERTIES, &[]).await?.is_none(),
+			"cannot overwrite already existing config");
+		lock.put_batch_checked(
+			vec![RecordUpdate { previous: None, updated: Some(record) }],
+			&[],
+		).await
 	}
 
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
@@ -596,39 +641,28 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 	}
 
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
-		let mut properties = match self.read_properties().await? {
-			Some(properties) => properties,
-			None => bail!("wallet not initialized"),
-		};
-
-		properties.server_pubkey = Some(server_pubkey);
-
-		let record = Record::from_data(partition::PROPERTIES, &[], None, &properties)?;
-		self.inner.write().await.put(record).await
+		self.update_properties(|properties| {
+			anyhow::ensure!(properties.server_pubkey.is_none(),
+				"server pubkey is already set and cannot be changed");
+			properties.server_pubkey = Some(server_pubkey);
+			Ok(())
+		}).await
 	}
 
 	async fn set_server_mailbox_pubkey(&self, server_mailbox_pubkey: PublicKey) -> anyhow::Result<()> {
-		let mut properties = match self.read_properties().await? {
-			Some(properties) => properties,
-			None => bail!("wallet not initialized"),
-		};
-
-		properties.server_mailbox_pubkey = Some(server_mailbox_pubkey);
-
-		let record = Record::from_data(partition::PROPERTIES, &[], None, &properties)?;
-		self.inner.write().await.put(record).await
+		self.update_properties(|properties| {
+			anyhow::ensure!(properties.server_mailbox_pubkey.is_none(),
+				"server mailbox pubkey is already set and cannot be changed");
+			properties.server_mailbox_pubkey = Some(server_mailbox_pubkey);
+			Ok(())
+		}).await
 	}
 
 	async fn set_recovery_incomplete(&self, incomplete: bool) -> anyhow::Result<()> {
-		let mut properties = match self.read_properties().await? {
-			Some(properties) => properties,
-			None => bail!("wallet not initialized"),
-		};
-
-		properties.recovery_incomplete = incomplete;
-
-		let record = Record::from_data(partition::PROPERTIES, &[], None, &properties)?;
-		self.inner.write().await.put(record).await
+		self.update_properties(|properties| {
+			properties.recovery_incomplete = incomplete;
+			Ok(())
+		}).await
 	}
 
 	#[cfg(feature = "onchain-bdk")]
@@ -1754,6 +1788,41 @@ mod tests {
 		let counter = adaptor.get(partition::LAST_IDS, &[partition::MOVEMENT])
 			.await.unwrap().expect("counter exists after allocations");
 		assert_eq!(counter.to_data::<u32>().unwrap(), (2 * ALLOCATIONS) as u32);
+	}
+
+	/// Two contexts sharing one database must not lose each other's property
+	/// field: the updates are CAS-checked and retried, not whole-record
+	/// read-modify-writes.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn property_updates_survive_concurrent_contexts() {
+		use std::str::FromStr;
+
+		let adaptor = SharedAutoCommitAdaptor::default();
+		let context_a = StorageAdaptorWrapper::new(adaptor.clone());
+		let context_b = StorageAdaptorWrapper::new(adaptor.clone());
+		let properties = WalletProperties {
+			network: bitcoin::Network::Regtest,
+			fingerprint: Default::default(),
+			server_pubkey: None,
+			server_mailbox_pubkey: None,
+			recovery_incomplete: false,
+		};
+		context_a.init_wallet(&properties).await.unwrap();
+
+		let pk = PublicKey::from_str(
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		).unwrap();
+		let (pin, marker) = tokio::join!(
+			context_a.set_server_pubkey(pk),
+			context_b.set_recovery_incomplete(true),
+		);
+		pin.unwrap();
+		marker.unwrap();
+
+		let properties = context_a.read_properties().await.unwrap().unwrap();
+		assert_eq!(properties.server_pubkey, Some(pk));
+		assert!(properties.recovery_incomplete);
 	}
 
 	#[derive(Clone, Copy)]

@@ -156,6 +156,12 @@ fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyh
 	ensure!(ark_info.nb_round_nonces > 0,
 		"server-advertised nb_round_nonces is 0; refusing to connect",
 	);
+	// Network-independent: every requested output derives this many musig
+	// nonce pairs, so a huge value would exhaust memory/CPU on any chain.
+	ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
+		"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
+		ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
+	);
 	if ark_info.network == Network::Bitcoin {
 		// No upper bound: a long lifetime is safe because unilateral exit is
 		// always available before the server-only timeout leaf activates.
@@ -168,10 +174,6 @@ fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyh
 			"server-advertised vtxo_exit_delta {} is below the mainnet minimum of {} \
 			 blocks; refusing to connect",
 			ark_info.vtxo_exit_delta, MIN_MAINNET_VTXO_EXIT_DELTA,
-		);
-		ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
-			"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
-			ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
 		);
 	}
 	Ok(())
@@ -653,9 +655,35 @@ async fn create_and_harden_datadir(datadir: &Path) -> anyhow::Result<()> {
 	tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
 		"failed to create datadir at {}", datadir.display(),
 	))?;
+	// `create_dir_all` follows a symlink; verify what actually exists.
+	let meta = tokio::fs::symlink_metadata(datadir).await.with_context(|| format!(
+		"failed to inspect datadir at {}", datadir.display(),
+	))?;
+	ensure!(meta.file_type().is_dir(),
+		"datadir path {} is not a directory", datadir.display());
 	crate::fs_perms::harden(datadir, 0o700).with_context(|| format!(
 		"failed to harden datadir at {}", datadir.display(),
 	))?;
+	Ok(())
+}
+
+/// Refuse an existing datadir that is a symlink or not a directory, and warn
+/// if its permissions allow other users to replace its contents.
+#[cfg(not(target_arch = "wasm32"))]
+async fn check_existing_datadir(datadir: &Path) -> anyhow::Result<()> {
+	match tokio::fs::symlink_metadata(datadir).await {
+		Ok(meta) => {
+			ensure!(meta.file_type().is_dir(),
+				"datadir path {} is not a directory (symlinks are refused)",
+				datadir.display(),
+			);
+			crate::fs_perms::warn_if_loose(datadir, 0o700);
+		},
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+		Err(e) => return Err(e).with_context(|| format!(
+			"failed to inspect datadir at {}", datadir.display(),
+		)),
+	}
 	Ok(())
 }
 
@@ -980,7 +1008,11 @@ impl Wallet {
 			fingerprint: wallet_fingerprint,
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
-			recovery_incomplete: false,
+			// A created wallet has not scanned its recovery mailbox yet. This
+			// matters for the documented create-then-open flow (which would
+			// otherwise skip recovery) and makes a crash before the first scan
+			// resumable. The first completed scan clears it.
+			recovery_incomplete: true,
 		};
 
 		// write the config to db
@@ -1017,10 +1049,13 @@ impl Wallet {
 		// and their pid lock file at construction, so this is the only
 		// point where a fresh datadir can be made owner-only before any
 		// file lands in it.
-		if let Some(ref datadir) = args.datadir {
+		if let Some(datadir) = &args.datadir {
 			#[cfg(not(target_arch = "wasm32"))]
-			if !datadir.exists() && args.create_if_not_exists {
-				create_and_harden_datadir(datadir).await?;
+			{
+				check_existing_datadir(datadir).await?;
+				if !datadir.exists() && args.create_if_not_exists {
+					create_and_harden_datadir(datadir).await?;
+				}
 			}
 		}
 
@@ -2413,12 +2448,52 @@ mod tests {
 
 	#[test]
 	fn ark_info_over_nb_round_nonces_cap_is_rejected() {
+		// The cap is network-independent: non-mainnet servers must not be
+		// able to force an unbounded nonce allocation either.
 		let mut ai = ark_info_with_lifetime(4032, 6);
-		ai.network = Network::Bitcoin;
-		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
 		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
 		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
 		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+	}
+
+	/// A created wallet has not scanned its recovery mailbox yet. The
+	/// documented create-then-open flow must still run recovery, and a crash
+	/// before the first scan must resume on the next open, so creation records
+	/// the pending scan rather than the "completed" default.
+	#[tokio::test]
+	async fn wallet_create_marks_recovery_pending() {
+		use crate::persist::WalletPersister;
+		use crate::persist::adaptor::StorageAdaptorWrapper;
+
+		let db = StorageAdaptorWrapper::new_memory();
+		let lock_manager = crate::lock_manager::memory::MemoryLockManager::new();
+		let seed = super::WalletSeed::new_from_seed(Network::Regtest, &[0x42; 64]);
+		let config = crate::Config::network_default(Network::Regtest);
+
+		super::Wallet::create(
+			Network::Regtest, &seed, &config, &db, &lock_manager, true,
+		).await.expect("offline wallet creation");
+
+		let properties = db.read_properties().await.unwrap()
+			.expect("created wallet must have properties");
+		assert!(properties.recovery_incomplete,
+			"a created wallet must run recovery on its first open");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn symlinked_datadir_is_refused() {
+		use std::os::unix::fs::symlink;
+
+		let parent = tempfile::tempdir().unwrap();
+		let real = parent.path().join("real");
+		tokio::fs::create_dir(&real).await.unwrap();
+		let link = parent.path().join("wallet");
+		symlink(&real, &link).unwrap();
+
+		let err = super::check_existing_datadir(&link).await
+			.expect_err("a symlinked datadir must be refused");
+		assert!(err.to_string().contains("not a directory"), "{err:#}");
 	}
 
 	/// A datadir created on the [Wallet::open] path must be owner-only

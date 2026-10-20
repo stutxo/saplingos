@@ -30,7 +30,7 @@ CREATE TABLE bark_properties (
 
 				network TEXT NOT NULL,
 				fingerprint TEXT NOT NULL
-			, server_pubkey TEXT, server_mailbox_pubkey TEXT, recovery_incomplete INTEGER NOT NULL DEFAULT 0);
+			, server_pubkey TEXT, server_mailbox_pubkey TEXT, recovery_incomplete INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE bark_exit_states (
 				vtxo_id TEXT PRIMARY KEY,
 				state TEXT NOT NULL,

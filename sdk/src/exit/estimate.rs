@@ -253,7 +253,7 @@ impl Exit {
 
 /// The weight of a canonical CPFP child: one P2A anchor input, one P2TR key-spend funding input,
 /// and one P2TR change output.
-fn canonical_cpfp_child_weight() -> Weight {
+pub(crate) fn canonical_cpfp_child_weight() -> Weight {
 	const P2TR_SPK_LEN: usize = 34;
 	predict_weight(
 		[

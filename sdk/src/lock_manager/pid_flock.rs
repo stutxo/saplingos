@@ -40,13 +40,40 @@ use super::internal_memory::InternalMemoryLockManager;
 pub const LOCK_FILE: &str = "LOCK";
 
 fn open_lock_file(path: &Path) -> anyhow::Result<File> {
-	File::options()
-		.read(true)
-		.write(true)
-		.create(true)
-		.truncate(false)
-		.open(path)
-		.with_context(|| format!("failed to open lock file {}", path.display()))
+	let mut options = File::options();
+	options.read(true).write(true).create(true).truncate(false);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		// Never follow a symlink planted where the lock belongs: the holder
+		// truncates and writes this file.
+		options.custom_flags(libc::O_NOFOLLOW);
+	}
+	let file = options.open(path)
+		.with_context(|| format!("failed to open lock file {}", path.display()))?;
+	let metadata = file.metadata()
+		.with_context(|| format!("failed to inspect lock file {}", path.display()))?;
+	anyhow::ensure!(metadata.is_file(),
+		"lock path {} is not a regular file", path.display());
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		anyhow::ensure!(metadata.nlink() == 1,
+			"lock path {} has multiple hard links", path.display());
+	}
+	Ok(file)
+}
+
+/// Reject a caller-chosen lock file name that is not a single normal path
+/// component (absolute paths and `..` would escape the datadir).
+fn validate_lock_file(lock_file: &str) -> anyhow::Result<()> {
+	use std::path::Component;
+	let mut components = Path::new(lock_file).components();
+	anyhow::ensure!(
+		matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+		"invalid lock file name {lock_file:?}: expected a single path component",
+	);
+	Ok(())
 }
 
 
@@ -77,6 +104,7 @@ impl FlockPidLockManager {
 			datadir: datadir.clone(),
 			source,
 		};
+		validate_lock_file(lock_file).map_err(&setup)?;
 
 		fs::create_dir_all(&datadir)
 			.with_context(|| format!("failed to create datadir {}", datadir.display()))
@@ -89,7 +117,8 @@ impl FlockPidLockManager {
 			Ok(()) => {}
 			Err(TryLockError::WouldBlock) => {
 				let mut holder = String::new();
-				let _ = file.read_to_string(&mut holder);
+				// The file is attacker-influenced; bound the diagnostic read.
+				let _ = (&file).take(64).read_to_string(&mut holder);
 				let pid = holder.trim().parse::<u32>().ok();
 				return Err(PidLockError::AlreadyHeld { datadir, pid });
 			}
@@ -233,5 +262,33 @@ mod test {
 
 		let _ = fs::remove_dir_all(&dir_a);
 		let _ = fs::remove_dir_all(&dir_b);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn symlinked_lock_file_is_refused() {
+		use std::os::unix::fs::symlink;
+
+		let dir = tmp_dir();
+		fs::create_dir_all(&dir).unwrap();
+		let victim = dir.join("victim");
+		fs::write(&victim, b"do not touch").unwrap();
+		symlink(&victim, dir.join(LOCK_FILE)).unwrap();
+
+		let err = FlockPidLockManager::new(&dir).unwrap_err();
+		assert!(matches!(err, PidLockError::SetupFailed { .. }), "{err:?}");
+		assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn lock_file_name_must_be_a_single_component() {
+		let dir = tmp_dir();
+		for bad in ["../escape", "/tmp/escape", "a/b", "."] {
+			let err = FlockPidLockManager::new_with_lock_file(&dir, bad).unwrap_err();
+			assert!(matches!(err, PidLockError::SetupFailed { .. }), "{bad}: {err:?}");
+		}
+		let _ = fs::remove_dir_all(&dir);
 	}
 }

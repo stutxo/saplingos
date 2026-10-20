@@ -225,12 +225,20 @@ pub enum CheckAmountError {
 #[error("invalid invoice signature: {0}")]
 pub struct CheckSignatureError(pub String);
 
+/// Error returned when an invoice commits to a chain this library does not
+/// understand. The chain is payee/server-controlled wire data.
+#[derive(Debug, thiserror::Error)]
+#[error("invoice is for an unsupported chain: {0:?}")]
+pub struct UnsupportedChainError(pub ChainHash);
+
 /// Error returned when a BOLT12 invoice fetched from an offer doesn't
 /// match the invoice we asked for.
 #[derive(Debug, thiserror::Error)]
 pub enum ValidateIssuanceError {
 	#[error(transparent)]
 	Signature(#[from] CheckSignatureError),
+	#[error(transparent)]
+	UnsupportedChain(#[from] UnsupportedChainError),
 	#[error("invoice amount doesn't match the requested amount: \
 		invoice={invoice_msat} msat, requested={requested_msat} msat")]
 	AmountMismatch { invoice_msat: u64, requested_msat: u64 },
@@ -251,18 +259,29 @@ impl Invoice {
 		}
 	}
 
-	pub fn network(&self) -> Network {
+	/// The invoice's network, or an error for a BOLT12 chain this library
+	/// does not know. Prefer this over [Invoice::network] for invoice bytes
+	/// received from a peer or server.
+	pub fn try_network(&self) -> Result<Network, UnsupportedChainError> {
 		match self {
-			Invoice::Bolt11(invoice) => invoice.network(),
+			Invoice::Bolt11(invoice) => Ok(invoice.network()),
 			Invoice::Bolt12(invoice) => match invoice.chain() {
-				ChainHash::BITCOIN => Network::Bitcoin,
-				ChainHash::TESTNET3 => Network::Testnet,
-				ChainHash::TESTNET4 => Network::Testnet4,
-				ChainHash::SIGNET => Network::Signet,
-				ChainHash::REGTEST => Network::Regtest,
-				_ => panic!("unsupported network"),
+				ChainHash::BITCOIN => Ok(Network::Bitcoin),
+				ChainHash::TESTNET3 => Ok(Network::Testnet),
+				ChainHash::TESTNET4 => Ok(Network::Testnet4),
+				ChainHash::SIGNET => Ok(Network::Signet),
+				ChainHash::REGTEST => Ok(Network::Regtest),
+				other => Err(UnsupportedChainError(other)),
 			},
 		}
+	}
+
+	/// The invoice's network.
+	///
+	/// Panics for a BOLT12 invoice on an unknown chain. Invoice bytes from an
+	/// untrusted peer must use [Invoice::try_network] instead.
+	pub fn network(&self) -> Network {
+		self.try_network().expect("invoice is for an unsupported chain")
 	}
 
 	/// Get the amount to be paid. It checks both user and invoice
@@ -427,6 +446,13 @@ pub trait Bolt12InvoiceExt: Borrow<Bolt12Invoice> {
 	fn validate_issuance(&self, offer: &Offer, requested_amount: Amount)
 		-> Result<(), ValidateIssuanceError>
 	{
+		// A payee-controlled invoice may commit to any 32-byte chain hash;
+		// reject unknown chains before any caller can ask for its network.
+		match self.borrow().chain() {
+			ChainHash::BITCOIN | ChainHash::TESTNET3 | ChainHash::TESTNET4
+				| ChainHash::SIGNET | ChainHash::REGTEST => {},
+			other => return Err(UnsupportedChainError(other).into()),
+		}
 		self.validate_signing_key(offer)?;
 
 		// The invoice request always sets an amount, so BOLT 12 demands exact

@@ -49,6 +49,18 @@ use crate::vtxo::VtxoValidationError;
 /// only happen for users with more than 1000 pending items.)
 pub(crate) const MAX_MAILBOX_REQUEST_BURST: usize = 10;
 
+/// Maximum VTXO bodies processed from one arkoor mailbox message.
+///
+/// A 64 MiB message can carry hundreds of thousands of minimal bodies, each
+/// costing a chain-anchor lookup and persistence work. Honest packages are far
+/// below this bound; excess is logged and the message checkpoint still advances
+/// (a malicious server can withhold messages anyway, and refusing forever
+/// would wedge the mailbox).
+const MAX_ARKOOR_VTXOS_PER_MESSAGE: usize = 1024;
+
+/// Maximum raw VTXO bytes retained in quarantine movement metadata.
+const MAX_QUARANTINE_RAW_BYTES: usize = 4096;
+
 /// Number of low bits in a server mailbox checkpoint that hold a
 /// per-millisecond counter; the upper bits are milliseconds since the Unix
 /// epoch.
@@ -330,7 +342,11 @@ impl Wallet {
 		loop {
 			let mut stream = {
 				let Some(wallet) = upgrade() else { return Ok(()) };
-				wallet.subscribe_mailbox_messages(since_checkpoint).await?
+				futures::select! {
+					res = wallet.subscribe_mailbox_messages(since_checkpoint).fuse()
+						=> res?,
+					_ = shutdown.cancelled().fuse() => return Ok(()),
+				}
 			};
 			trace!("Connected to mailbox stream with server");
 
@@ -471,10 +487,16 @@ impl Wallet {
 		let tip = self.inner.chain.tip().await
 			.context("cannot vet received arkoor VTXOs, no chain tip")?;
 
+		if raw_vtxos.len() > MAX_ARKOOR_VTXOS_PER_MESSAGE {
+			error!(
+				"Arkoor mailbox message carries {} VTXOs; processing only the first {}",
+				raw_vtxos.len(), MAX_ARKOOR_VTXOS_PER_MESSAGE,
+			);
+		}
 		let mut invalid_vtxos = Vec::with_capacity(raw_vtxos.len());
 		let mut valid_vtxos = Vec::with_capacity(raw_vtxos.len());
 
-		for bytes in &raw_vtxos {
+		for bytes in raw_vtxos.iter().take(MAX_ARKOOR_VTXOS_PER_MESSAGE) {
 			let vtxo = match Vtxo::<Full>::deserialize(&bytes) {
 				Ok(vtxo) => vtxo,
 				Err(e) => {
@@ -763,13 +785,19 @@ impl Wallet {
 		if self.inner.db.get_wallet_vtxo(vtxo.id()).await?.is_some() {
 			return Ok(());
 		}
+		// Diagnostic bytes are attacker-supplied; keep only a bounded prefix.
+		let retained = &raw[..raw.len().min(MAX_QUARANTINE_RAW_BYTES)];
+		let mut raw_hex = retained.as_hex().to_string();
+		if retained.len() < raw.len() {
+			raw_hex.push_str(&format!("... ({} bytes truncated)", raw.len() - retained.len()));
+		}
 		let movement = self.inner.movements.get_or_create_movement_with_action(
 			Subsystem::ARKOOR,
 			"program-receive-quarantine",
 			&format!("program-quarantine.{}", vtxo.id()),
 			MovementUpdate::new().metadata([
 				("reason".into(), serde_json::Value::String(reason.to_owned())),
-				("raw_vtxo".into(), serde_json::Value::String(raw.as_hex().to_string())),
+				("raw_vtxo".into(), serde_json::Value::String(raw_hex)),
 			]),
 		).await?;
 		warn!("Quarantined unsafe program deposit {} (movement {}): {}", vtxo.id(), movement, reason);

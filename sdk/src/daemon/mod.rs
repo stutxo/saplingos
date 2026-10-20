@@ -179,7 +179,10 @@ impl DaemonProcess {
 		let mut events = {
 			let Some(wallet) = self.wallet() else { return Ok(()) };
 			trace!("Daemon subscribing to round event stream");
-			wallet.subscribe_round_events().await?
+			futures::select! {
+				res = wallet.subscribe_round_events().fuse() => res?,
+				_ = self.shutdown.cancelled().fuse() => return Ok(()),
+			}
 		};
 		trace!("Daemon connected to round event stream");
 
@@ -392,7 +395,10 @@ impl DaemonProcess {
 		// daemon tasks so they don't race the first connection check and
 		// skip their initial iteration with `connected = false` (which
 		// would delay mailbox subscription by `slow_interval`).
-		let result = wallet.refresh_server().await;
+		let result = futures::select! {
+			res = wallet.refresh_server().fuse() => res,
+			_ = self.shutdown.cancelled().fuse() => return,
+		};
 		if let Err(ref e) = result {
 			warn!("Ark server refresh failed: {:#}", e);
 		}
@@ -400,7 +406,10 @@ impl DaemonProcess {
 		self.connected.store(connected, Ordering::Relaxed);
 
 		if !self.manual_sync {
-			wallet.sync().await;
+			futures::select! {
+				_ = wallet.sync().fuse() => {},
+				_ = self.shutdown.cancelled().fuse() => return,
+			}
 		}
 	}
 
