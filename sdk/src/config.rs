@@ -182,6 +182,12 @@ pub struct Config {
 	/// and to prevent DNS leaks. We don't allow `socks5://` to be used to preserve privacy.
 	///
 	/// Example: `socks5h://127.0.0.1:9050` for a local Tor daemon.
+	///
+	/// Note: the bitcoind backend cannot route its RPC traffic through a SOCKS5
+	/// proxy (the upstream RPC clients have no proxy support). If a proxy is
+	/// configured together with a non-local bitcoind chain source, wallet
+	/// construction fails loudly instead of silently bypassing the proxy.
+	/// The Esplora backend honours this setting.
 	#[cfg(feature = "socks5-proxy")]
 	pub socks5_proxy: Option<String>,
 

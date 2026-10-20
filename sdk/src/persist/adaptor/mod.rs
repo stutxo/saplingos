@@ -398,20 +398,46 @@ pub trait StorageAdaptor: Send + Sync + 'static {
 	async fn get_all(&self, partition: u8) -> anyhow::Result<Vec<Record>>;
 
 	/// Increments the last partition id, then stores and returns the new id.
+	///
+	/// The read-modify-write runs through the backend's atomic
+	/// compare-and-commit batch so that two concurrently opened contexts on
+	/// one shared database (e.g. two same-origin tabs on IndexedDB, which
+	/// commits each adaptor request as its own transaction) cannot allocate
+	/// the same id: `put_batch_checked` compares `previous` inside a single
+	/// transaction and fails when another context moved the counter first,
+	/// in which case the counter is re-read and the allocation retried.
 	async fn incremental_id(&mut self, partition: u8) -> anyhow::Result<u32> {
-		let last_partition_id = self.get(partition::LAST_IDS, &[partition]).await?
-			.map(|r| r.to_data::<u32>()).unwrap_or(Ok(0))?;
-		let next_partition_id = last_partition_id + 1;
+		// A failed compare-and-commit on a contended counter costs one extra
+		// read to tell "another context moved it" from a real backend error,
+		// so the budget is sized for the two reads per attempt under the
+		// IndexedDB-style per-request auto-commit model.
+		const MAX_RETRIES: usize = 128;
+		for _ in 0..MAX_RETRIES {
+			let previous = self.get(partition::LAST_IDS, &[partition]).await?;
+			let next_partition_id = previous.as_ref()
+				.map(|r| r.to_data::<u32>()).transpose()?.unwrap_or(0) + 1;
+			let updated = Record::from_data(
+				partition::LAST_IDS,
+				&[partition],
+				None,
+				&next_partition_id,
+			)?;
 
-		let record = Record::from_data(
-			partition::LAST_IDS,
-			&[partition],
-			None,
-			&next_partition_id,
-		)?;
-
-		self.put(record).await?;
-		Ok(next_partition_id)
+			let update = RecordUpdate { previous: previous.clone(), updated: Some(updated) };
+			let Err(e) = self.put_batch_checked(vec![update], &[]).await else {
+				return Ok(next_partition_id);
+			};
+			// Only a counter moved by another context is retried: an
+			// unchanged counter means the batch failed for another reason
+			// (I/O, validation), which retrying cannot fix.
+			if self.get(partition::LAST_IDS, &[partition]).await? == previous {
+				return Err(e.context(format!(
+					"incremental_id for partition {partition}: compare-and-commit failed"
+				)));
+			}
+			// Another context committed the counter first; retry.
+		}
+		anyhow::bail!("incremental_id for partition {partition}: counter contention after {MAX_RETRIES} retries")
 	}
 }
 
@@ -807,15 +833,6 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 
 		for (vtxo, state) in vtxos {
 			let previous = lock.get(partition::VTXO, &vtxo.id().to_bytes()).await?;
-			if let Some(record) = &previous {
-				let existing = record.to_data::<SerdeVtxo>()?;
-				if matches!(existing.current_state(), Some(VtxoState::Spent | VtxoState::Exited)) {
-					anyhow::ensure!(matches!(state, VtxoState::Spent | VtxoState::Exited),
-						"cannot restore a terminal VTXO to a live state");
-					// Replay never replaces the signed bytes or terminal state.
-					continue;
-				}
-			}
 			if !matches!(state, VtxoState::Spent | VtxoState::Exited) {
 				absent.insert((partition::PROGRAM_RECOVERY_RESERVATION,
 					recovery_vtxo_key(vtxo.id()).into_bytes()));
@@ -834,6 +851,16 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 							recovery_vtxo_key(ancestor).into_bytes()));
 					}
 				}
+			}
+			// Contract: 'For each VTXO that already exists: no-op for that
+			// VTXO.' The reservation guard above still ran for live states,
+			// mirroring SQLite's unconditional guard before INSERT OR IGNORE.
+			// An existing record keeps its current state, full state history,
+			// registered flag and signed bytes; in particular a live retry
+			// landing on a terminal record is a silent no-op, never an error
+			// or a resurrection.
+			if previous.is_some() {
+				continue;
 			}
 			let serde_vtxo = SerdeVtxo {
 				vtxo: (*vtxo).clone(),
@@ -1277,7 +1304,21 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 	}
 
 	async fn store_mailbox_checkpoint(&self, checkpoint: u64) -> anyhow::Result<()> {
+		// Read-compare-write under the write lock, mirroring the SQLite
+		// backend and the WalletPersister contract: the mailbox cursor must
+		// never rewind. A stale or replayed lower value would re-serve
+		// already-processed messages and invalidate the monotone-cursor
+		// assumption the mailbox no-bury logic relies on.
 		let mut lock = self.inner.write().await;
+		let current = match lock.get(partition::MAILBOX_CHECKPOINT, &[]).await? {
+			Some(record) => record.to_data::<u64>()?,
+			None => 0,
+		};
+		anyhow::ensure!(
+			checkpoint > current,
+			"mailbox checkpoint not advanced: refusing to store {checkpoint} \
+				over the current cursor {current}",
+		);
 		let record = Record::from_data(
 			partition::MAILBOX_CHECKPOINT,
 			&[],
@@ -1537,6 +1578,8 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 #[cfg(test)]
 mod tests {
 	use std::collections::HashMap;
+	#[cfg(not(target_arch = "wasm32"))]
+	use std::sync::Arc;
 
 	use ark::test_util::VTXO_VECTORS;
 
@@ -1560,6 +1603,146 @@ mod tests {
 	}
 
 	bark_persister_tests!(setup);
+
+	/// Shares one backing store between independently constructed adaptors,
+	/// committing every request separately the way IndexedDB auto-commit
+	/// transactions do: nothing spans the read and the write of one logical
+	/// operation, so a parallel context can always interleave between them.
+	/// This is the layout `persist::platform_default` produces on wasm32,
+	/// where each open wallet context gets its own wrapper (and its own
+	/// wrapper lock) over one shared database.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[derive(Clone, Default)]
+	struct SharedAutoCommitAdaptor {
+		store: Arc<std::sync::Mutex<HashMap<u8, BTreeMap<Vec<u8>, Record>>>>,
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+	impl StorageAdaptor for SharedAutoCommitAdaptor {
+		async fn put(&mut self, record: Record) -> anyhow::Result<()> {
+			let mut store = self.store.lock().unwrap();
+			store.entry(record.partition).or_default().insert(record.pk.clone(), record);
+			Ok(())
+		}
+
+		async fn put_batch_checked(
+			&mut self, updates: Vec<RecordUpdate>, absent: &[(u8, Vec<u8>)],
+		) -> anyhow::Result<()> {
+			validate_record_updates(&updates)?;
+			let mut store = self.store.lock().unwrap();
+			for (partition, pk) in absent {
+				anyhow::ensure!(store.get(partition).and_then(|p| p.get(pk)).is_none(),
+					"record inserted during atomic update");
+			}
+			for update in &updates {
+				let record = update.record()?;
+				anyhow::ensure!(
+					store.get(&record.partition).and_then(|p| p.get(&record.pk))
+						== update.previous.as_ref(),
+					"record changed during atomic update",
+				);
+			}
+			for update in updates {
+				if let Some(record) = update.updated {
+					store.entry(record.partition).or_default().insert(record.pk.clone(), record);
+				} else if let Some(previous) = update.previous {
+					if let Some(partition) = store.get_mut(&previous.partition) {
+						partition.remove(&previous.pk);
+					}
+				}
+			}
+			Ok(())
+		}
+
+		async fn get(&self, partition: u8, pk: &[u8]) -> anyhow::Result<Option<Record>> {
+			// The read is its own committed transaction; yielding before
+			// returning the snapshot lets a parallel context commit between
+			// this read and the caller's follow-up write, as IndexedDB's
+			// per-request auto-commit always allows.
+			let value = self.store.lock().unwrap().get(&partition).and_then(|p| p.get(pk).cloned());
+			tokio::task::yield_now().await;
+			Ok(value)
+		}
+
+		async fn delete(&mut self, partition: u8, pk: &[u8]) -> anyhow::Result<Option<Record>> {
+			Ok(self.store.lock().unwrap().get_mut(&partition).and_then(|p| p.remove(pk)))
+		}
+
+		async fn query_sorted<R: QueryRange>(&self, query: Query<R>)
+			-> anyhow::Result<Vec<Record>>
+		{
+			let store = self.store.lock().unwrap();
+			let Some(partition) = store.get(&query.partition) else {
+				return Ok(Vec::new());
+			};
+			let mut results: Vec<_> = partition.values()
+				.filter(|r| r.sort_key.as_ref().is_some_and(|sk| query.range.contains(sk)))
+				.cloned()
+				.collect();
+			results.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+			if let Some(limit) = query.limit {
+				results.truncate(limit);
+			}
+			Ok(results)
+		}
+
+		async fn get_all(&self, partition: u8) -> anyhow::Result<Vec<Record>> {
+			let store = self.store.lock().unwrap();
+			Ok(store.get(&partition)
+				.map(|p| p.values().cloned().collect()).unwrap_or_default())
+		}
+	}
+
+	/// Two wallet contexts over one shared store must never allocate the
+	/// same MovementId/RoundStateId: movement records are keyed by id, so a
+	/// duplicate silently overwrites the first context's ledger entry. The
+	/// yield inside [`SharedAutoCommitAdaptor::get`] makes a non-atomic
+	/// read-then-write allocator collide deterministically here (~196/400
+	/// in the finding's reproduction); only the atomic compare-and-commit
+	/// batch keeps the ids unique.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn incremental_id_allocates_unique_ids_across_contexts() {
+		const ALLOCATIONS: usize = 100;
+
+		async fn allocate(
+			context: StorageAdaptorWrapper<SharedAutoCommitAdaptor>,
+			barrier: Arc<tokio::sync::Barrier>,
+		) -> Vec<u32> {
+			let mut ids = Vec::with_capacity(ALLOCATIONS);
+			barrier.wait().await;
+			for _ in 0..ALLOCATIONS {
+				let mut guard = context.inner.write().await;
+				ids.push(guard.incremental_id(partition::MOVEMENT).await
+					.expect("id allocation must survive contention"));
+			}
+			ids
+		}
+
+		let adaptor = SharedAutoCommitAdaptor::default();
+		// Two independently opened contexts on one shared database, each
+		// with its own wrapper lock: only the store can serialize them.
+		let context_a = StorageAdaptorWrapper::new(adaptor.clone());
+		let context_b = StorageAdaptorWrapper::new(adaptor.clone());
+		let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+		let a = tokio::spawn(allocate(context_a, barrier.clone()));
+		let b = tokio::spawn(allocate(context_b, barrier));
+		let ids_a = a.await.unwrap();
+		let ids_b = b.await.unwrap();
+
+		let unique: std::collections::BTreeSet<u32> =
+			ids_a.iter().chain(&ids_b).copied().collect();
+		assert_eq!(unique.len(), 2 * ALLOCATIONS,
+			"concurrent contexts allocated duplicate ids");
+
+		// Every allocation committed exactly once: the counter reaches the
+		// total and no commit was lost.
+		let counter = adaptor.get(partition::LAST_IDS, &[partition::MOVEMENT])
+			.await.unwrap().expect("counter exists after allocations");
+		assert_eq!(counter.to_data::<u32>().unwrap(), (2 * ALLOCATIONS) as u32);
+	}
 
 	#[derive(Clone, Copy)]
 	enum BatchFailure {

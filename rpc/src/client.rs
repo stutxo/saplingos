@@ -572,6 +572,13 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 		warn!("Message from Ark server: \"{}\"", msg);
 	}
 
+	// Reject malformed (inverted/empty) ranges before any compatibility math:
+	// the server is untrusted and an empty range must never panic the client.
+	if handshake.min_protocol_version > handshake.max_protocol_version {
+		return Err(ConnectError::ProtocolVersionMismatchServerTooOld {
+			client_min: MIN_PROTOCOL_VERSION, server_max: handshake.max_protocol_version,
+		});
+	}
 	if MAX_PROTOCOL_VERSION < handshake.min_protocol_version {
 		return Err(ConnectError::ProtocolVersionMismatchClientTooOld {
 			client_max: MAX_PROTOCOL_VERSION, server_min: handshake.min_protocol_version
@@ -583,16 +590,15 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 		});
 	}
 
-	let pver = cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version);
-	assert!((MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver));
-	assert!((handshake.min_protocol_version..=handshake.max_protocol_version).contains(&pver));
-
-	Ok(pver)
+	Ok(cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version))
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use super::{
+		check_handshake, protos, ConnectError, CreateEndpointError,
+		MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, NO_TRANSPORT_BACKEND_MESSAGE,
+	};
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {
@@ -600,5 +606,90 @@ mod tests {
 		assert_eq!(err.to_string(), NO_TRANSPORT_BACKEND_MESSAGE);
 		assert!(err.to_string().contains("bark-server-rpc/tonic-native"));
 		assert!(err.to_string().contains("bark-server-rpc/tonic-web"));
+	}
+
+	fn handshake(min: u64, max: u64) -> protos::HandshakeResponse {
+		protos::HandshakeResponse {
+			min_protocol_version: min,
+			max_protocol_version: max,
+			psa: None,
+		}
+	}
+
+	#[test]
+	fn handshake_inverted_range_errors_without_panicking() {
+		// A malicious or buggy server can advertise an inverted range whose
+		// endpoints lie inside the client range; it must be rejected, not panic.
+		let res = check_handshake(handshake(MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION));
+		match res {
+			Err(ConnectError::ProtocolVersionMismatchServerTooOld { client_min, server_max }) => {
+				assert_eq!(client_min, MIN_PROTOCOL_VERSION);
+				assert_eq!(server_max, MIN_PROTOCOL_VERSION);
+			},
+			other => panic!("expected ProtocolVersionMismatchServerTooOld, got {:?}", other),
+		}
+
+		// Any other inverted range must be rejected the same way.
+		assert!(matches!(
+			check_handshake(handshake(MIN_PROTOCOL_VERSION + 1, MIN_PROTOCOL_VERSION)),
+			Err(ConnectError::ProtocolVersionMismatchServerTooOld { .. }),
+		));
+		assert!(matches!(
+			check_handshake(handshake(u64::MAX, 0)),
+			Err(ConnectError::ProtocolVersionMismatchServerTooOld { .. }),
+		));
+	}
+
+	#[test]
+	fn handshake_disjoint_too_old_errors() {
+		// Server range entirely below the client range.
+		let res = check_handshake(handshake(0, MIN_PROTOCOL_VERSION - 1));
+		match res {
+			Err(ConnectError::ProtocolVersionMismatchServerTooOld { client_min, server_max }) => {
+				assert_eq!(client_min, MIN_PROTOCOL_VERSION);
+				assert_eq!(server_max, MIN_PROTOCOL_VERSION - 1);
+			},
+			other => panic!("expected ProtocolVersionMismatchServerTooOld, got {:?}", other),
+		}
+	}
+
+	#[test]
+	fn handshake_disjoint_too_new_errors() {
+		// Server range entirely above the client range.
+		let res = check_handshake(handshake(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION + 2));
+		match res {
+			Err(ConnectError::ProtocolVersionMismatchClientTooOld { client_max, server_min }) => {
+				assert_eq!(client_max, MAX_PROTOCOL_VERSION);
+				assert_eq!(server_min, MAX_PROTOCOL_VERSION + 1);
+			},
+			other => panic!("expected ProtocolVersionMismatchClientTooOld, got {:?}", other),
+		}
+	}
+
+	#[test]
+	fn handshake_valid_ranges_pass() {
+		// Full containment: client picks its own maximum.
+		assert_eq!(
+			check_handshake(handshake(MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION)).ok(),
+			Some(MAX_PROTOCOL_VERSION),
+		);
+
+		// Boundary overlap at the client's lower edge picks the client's minimum.
+		assert_eq!(
+			check_handshake(handshake(0, MIN_PROTOCOL_VERSION)).ok(),
+			Some(MIN_PROTOCOL_VERSION),
+		);
+
+		// Boundary overlap at the client's upper edge picks the client's maximum.
+		assert_eq!(
+			check_handshake(handshake(MAX_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION + 5)).ok(),
+			Some(MAX_PROTOCOL_VERSION),
+		);
+
+		// Server range strictly inside the client range picks the server's maximum.
+		assert_eq!(
+			check_handshake(handshake(MIN_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION)).ok(),
+			Some(MIN_PROTOCOL_VERSION),
+		);
 	}
 }
