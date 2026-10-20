@@ -434,9 +434,9 @@ pub(crate) async fn compute_lightning_receive_anti_dos(
 			.context("have no spendable vtxo with sufficient expiry margin to prove ownership of")?;
 		let input = wallet.inner.db.get_full_vtxo(vtxo.id()).await?
 			.context("owned proof vtxo is missing")?;
-		let key = wallet.vtxo_signing_key(&input).await?;
+		let key = wallet.vtxo_signer(&input).await?;
 		let proof_vtxo = input.to_bare();
-		let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
+		let signature = key.sign_ownership(wallet, OwnershipRequest {
 			input,
 			proof: OwnershipProof::LightningReceive { payment_hash },
 		}).await?;
@@ -726,7 +726,7 @@ async fn claim_lightning_receive_htlcs(
 	if let Some(destination) = recv.claim_destination.as_ref() {
 		wallet.prepare_program_receives(destination, &candidates).await?;
 	}
-	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
 		part.iter().map(|signature| signature.public_nonce()).collect()
 	}).collect()).context("failed to install lightning receive nonces")?;
@@ -758,7 +758,7 @@ async fn claim_lightning_receive_htlcs(
 
 	builder.verify_cosign_response(&cosign_resp)
 		.context("invalid lightning receive cosign response")?;
-	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_resp).await?;
+	let signatures = wallet.finish_arkoor_signatures(prepared, cosign_resp).await?;
 	let mut outputs = builder.finish_external(signatures)
 		.context("claim arkoor cosign failed with user response")?.build_signed_vtxos();
 

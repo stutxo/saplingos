@@ -460,7 +460,7 @@ pub(crate) async fn request_lightning_send_htlcs(
 		.context("Failed to construct arkoor package")?;
 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
 	wallet.prepare_program_recoveries(&candidates).await?;
-	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
 		part.iter().map(|signature| signature.public_nonce()).collect()
 	}).collect()).context("failed to install lightning payment nonces")?;
@@ -478,7 +478,7 @@ pub(crate) async fn request_lightning_send_htlcs(
 
 	builder.verify_cosign_response(&cosign_responses)
 		.context("invalid lightning payment cosign response")?;
-	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_responses).await?;
+	let signatures = wallet.finish_arkoor_signatures(prepared, cosign_responses).await?;
 	let vtxos = builder.finish_external(signatures)
 		.context("Failed to cosign vtxos")?.build_signed_vtxos();
 
@@ -760,7 +760,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
 		.context("Failed to construct arkoor package")?;
 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
 	wallet.prepare_program_recoveries(&candidates).await?;
-	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
 		part.iter().map(|signature| signature.public_nonce()).collect()
 	}).collect()).context("failed to install lightning revocation nonces")?;
@@ -777,7 +777,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
 
 	builder.verify_cosign_response(&cosign_resp)
 		.context("invalid lightning revocation cosign response")?;
-	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_resp).await?;
+	let signatures = wallet.finish_arkoor_signatures(prepared, cosign_resp).await?;
 	let vtxos = builder.finish_external(signatures)
 		.context("Failed to cosign vtxos")?.build_signed_vtxos();
 	let checkpoint = LightningSend {

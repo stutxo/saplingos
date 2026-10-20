@@ -29,7 +29,7 @@ impl Wallet {
 		let mut native = Vec::new();
 		let mut program = Vec::new();
 		for vtxo in vtxos {
-			if self.vtxo_signing_key(vtxo).await?.program().is_some() {
+			if self.vtxo_signer(vtxo).await?.is_external() {
 				program.push(vtxo.point());
 			} else {
 				adopt_native_lightning_exit(self.inner.db.as_ref(), vtxo, action_id).await?;

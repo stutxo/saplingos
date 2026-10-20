@@ -1,9 +1,11 @@
 
 pub mod selection;
+pub mod signer;
 mod signing;
 mod state;
 
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
+pub use self::signer::{PreparedVtxoSignature, SignatureResult, VtxoKeySigner};
 pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 use anyhow::Context;

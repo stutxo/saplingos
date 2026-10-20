@@ -258,7 +258,7 @@ impl WalletAction for Offboard {
 				if prior_txid.is_some() {
 					for id in &offboard_vtxo_ids {
 						let input = wallet.get_vtxo_by_id(*id).await?;
-						if wallet.vtxo_signing_key(&input).await?.program().is_some() {
+						if wallet.vtxo_signer(&input).await?.is_external() {
 							return Err(anyhow!(
 								"legacy program offboard may have forfeited its inputs; refusing a conflicting session",
 							).into());
@@ -273,7 +273,7 @@ impl WalletAction for Offboard {
 				if !forfeits_unsent {
 					for id in &offboard_vtxo_ids {
 						let input = wallet.get_vtxo_by_id(*id).await?;
-						if wallet.vtxo_signing_key(&input).await?.program().is_some() {
+						if wallet.vtxo_signer(&input).await?.is_external() {
 							return Err(anyhow!(
 								"legacy program offboard lacks durable forfeit shares; inputs remain locked",
 							).into());
@@ -764,8 +764,8 @@ async fn prepare_offboard(
 	let attestation = {
 		let mut attestations = Vec::with_capacity(vtxos.len());
 		for v in &vtxos {
-			let key = wallet.vtxo_signing_key(v).await?;
-			let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
+			let key = wallet.vtxo_signer(v).await?;
+			let signature = key.sign_ownership(wallet, OwnershipRequest {
 				input: v.clone(),
 				proof: OwnershipProof::Offboard {
 					request: req.clone(), inputs: offboard_vtxo_ids.clone(),
@@ -871,11 +871,11 @@ async fn prepare_offboard_forfeits(
 	for ((vtxo, input), server_nonce) in full_inputs.iter().zip(contexts)
 		.zip(server_forfeit_cosign_nonces.iter())
 	{
-		let key = wallet.vtxo_signing_key(vtxo).await?;
-		let prepared = wallet.prepare_vtxo_signature(&key, input).await
+		let key = wallet.vtxo_signer(vtxo).await?;
+		let prepared = key.prepare(wallet, input).await
 			.context("program rejected the offboard forfeit transaction")?;
 		user_nonces.push(prepared.public_nonce());
-		user_shares.push(prepared.finish(&key, Some(server_nonce.clone()), None).await?
+		user_shares.push(prepared.finish(Some(server_nonce.clone()), None).await?
 			.user_partial);
 	}
 	let sigs = ctx.assemble_external_forfeits(

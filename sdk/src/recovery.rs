@@ -1037,6 +1037,7 @@ mod test {
 				chain,
 				onchain: None,
 				program_transport: tokio::sync::OnceCell::new(),
+				external_vtxo_signers: parking_lot::RwLock::new(std::collections::HashMap::new()),
 				daemon: parking_lot::Mutex::new(None),
 				last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 				round_secret_nonces: RoundSecretNonces::new(),

@@ -16,6 +16,7 @@ use ark::sapio::protocol::{
 };
 
 use crate::{Config, Wallet};
+use crate::vtxo::SignatureResult;
 use super::VtxoSigningKey;
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
@@ -141,16 +142,27 @@ extern "C" {
 		-> std::result::Result<String, wasm_bindgen::JsValue>;
 }
 
-pub(crate) struct SignatureResult {
-	pub user_partial: musig::PartialSignature,
-	pub signature: Option<schnorr::Signature>,
-}
-
 pub(crate) struct PreparedSignature {
 	wallet: Wallet,
-	signer: PublicKey,
+	key: VtxoSigningKey,
 	input: Option<SigningInput>,
 	state: PreparedState,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl crate::vtxo::PreparedVtxoSignature for PreparedSignature {
+	fn public_nonce(&self) -> musig::PublicNonce {
+		self.public_nonce()
+	}
+
+	async fn finish(
+		self: Box<Self>,
+		server_nonce: Option<musig::PublicNonce>,
+		server_partial: Option<musig::PartialSignature>,
+	) -> Result<crate::vtxo::SignatureResult> {
+		PreparedSignature::finish(*self, server_nonce, server_partial).await
+	}
 }
 
 enum PreparedState {
@@ -182,11 +194,10 @@ impl PreparedSignature {
 
 	pub async fn finish(
 		self,
-		key: &VtxoSigningKey,
 		server_nonce: Option<musig::PublicNonce>,
 		server_partial: Option<musig::PartialSignature>,
-	) -> Result<SignatureResult> {
-		ensure!(key.public_key() == self.signer, "signer changed after nonce preparation");
+	) -> Result<crate::vtxo::SignatureResult> {
+		let key = &self.key;
 		let ret = match self.state {
 			PreparedState::Program { nonce, peer, intent, session, endpoint } => {
 				let request = FinishRequest {
@@ -215,7 +226,8 @@ impl PreparedSignature {
 				let native = key.local_keypair().context("native nonce supplied to program signer")?;
 				let server_nonce = server_nonce.context("missing server nonce")?;
 				ensure!(participants.len() == 2, "unsupported native participant count");
-				let server = participants.iter().copied().find(|p| *p != self.signer)
+				let server = participants.iter().copied()
+					.find(|p| *p != key.public_key())
 					.context("missing distinct server participant")?;
 				let cache = match tweak {
 					Some(tweak) => musig::tweaked_key_agg(participants.iter().copied(), tweak).0,
@@ -228,7 +240,8 @@ impl PreparedSignature {
 						"invalid server partial signature");
 				}
 				let user_partial = session.partial_sign(nonce, &musig::keypair_to(native), &cache);
-				ensure!(session.partial_verify(&cache, &user_partial, &public, musig::pubkey_to(self.signer)),
+				ensure!(session.partial_verify(&cache, &user_partial, &public,
+					musig::pubkey_to(key.public_key())),
 					"invalid local partial signature");
 				let signature = server_partial.as_ref().map(|server| {
 					musig::sig_from(session.partial_sig_agg(&[&user_partial, server]).assume_valid())
@@ -272,7 +285,7 @@ impl Wallet {
 		)?;
 		nested::aggregate_member_nonces(&intent, &[nonce.public(), peer])?;
 		Ok(PreparedSignature {
-			wallet: self.clone(), signer: key.public_key(), input,
+			wallet: self.clone(), key: key.clone(), input,
 			state: PreparedState::Program { nonce, peer, intent, session: response.session,
 				endpoint: descriptor.endpoint.clone() },
 		})
@@ -296,7 +309,9 @@ impl Wallet {
 			let (nonce, public) = musig::nonce_pair_with_msg(native, &message);
 			let state = PreparedState::Local { nonce, public, message,
 				participants: input.participants.clone(), tweak: input.tweak };
-			Ok(PreparedSignature { wallet: self.clone(), signer: key.public_key(), input: Some(input), state })
+			Ok(PreparedSignature {
+				wallet: self.clone(), key: key.clone(), input: Some(input), state,
+			})
 		}
 	}
 
@@ -306,7 +321,7 @@ impl Wallet {
 		ensure!(key.program().is_some(), "program claim requires a program key");
 		let request = SpendRequest::from_input(&input, None, witness)?;
 		self.prepare_program_signature(key, SigningAction::Spend { request }, Some(input)).await?
-			.finish(key, None, None).await?.signature.context("missing joint recovery signature")
+			.finish(None, None).await?.signature.context("missing joint recovery signature")
 	}
 
 	pub(crate) async fn sign_vtxo_ownership(
@@ -315,7 +330,7 @@ impl Wallet {
 		if let Some(program) = key.program() {
 			request.message(&program.program)?;
 			self.prepare_program_signature(key, SigningAction::Ownership { request }, None).await?
-				.finish(key, None, None).await?.signature.context("missing joint ownership signature")
+				.finish(None, None).await?.signature.context("missing joint ownership signature")
 		} else {
 			ensure!(request.input.user_pubkey() == key.public_key(), "ownership key mismatch");
 			let message = request.message_for_owner(key.public_key())?;

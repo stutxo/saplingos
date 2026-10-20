@@ -11,16 +11,34 @@ use ark::vtxo::policy::signing::VtxoSigner;
 use crate::{SECP, Wallet};
 
 impl Wallet {
-	/// Get the keypair for the given clause, if the wallet owns it.
-	///
-	/// Database errors are propagated: collapsing them into `None` would
-	/// make a transient persister failure indistinguishable from "no key",
-	/// letting an ownership probe permanently drop a payment the wallet in
-	/// fact owns. Callers that need the [`VtxoSigner::witness`] contract of
-	/// a plain `Option` handle the error at their boundary.
-	pub (crate) async fn clause_keypair(&self, clause: &VtxoClause) -> anyhow::Result<Option<Keypair>> {
-		let clause_pubkey = clause.pubkey();
-		Ok(self.pubkey_keypair(&clause_pubkey).await?.map(|(_, keypair)| keypair))
+	/// Build the clause witness with an already-resolved keypair. Shared by
+	/// the native signer and the generic [`crate::vtxo::VtxoKeySigner`] path.
+	pub(crate) async fn clause_witness_with_key(
+		&self,
+		keypair: &Keypair,
+		clause: &VtxoClause,
+		control_block: &taproot::ControlBlock,
+		sighash: TapSighash,
+	) -> anyhow::Result<Option<Witness>> {
+		let signature = SECP.sign_schnorr_with_aux_rand(&sighash.into(), keypair, &rand::random());
+		Ok(match clause {
+			VtxoClause::DelayedSign(c) => Some(c.witness(&signature, control_block)),
+			VtxoClause::DelayedTimelockSign(c) => Some(c.witness(&signature, &control_block)),
+			VtxoClause::TimelockSign(c) => Some(c.witness(&signature, &control_block)),
+			VtxoClause::HashDelaySign(c) => {
+				let preimage = self.lightning_receive_preimage(c.hash.into()).await?;
+				preimage.map(|p| c.witness(
+					&(signature, p.to_byte_array()), &control_block,
+				))
+			},
+			VtxoClause::HashDelaySign_v0(c) => {
+				let preimage = self.lightning_receive_preimage(c.hash.into()).await?;
+				preimage.map(|p| c.witness(
+					&(signature, p.to_byte_array()), &control_block,
+				))
+			},
+			VtxoClause::HashSign(_) | VtxoClause::HashSign_v0(_) => None,
+		})
 	}
 
 	/// Variant of [`VtxoSigner::find_signable_clause`] that propagates
@@ -53,8 +71,19 @@ impl Wallet {
 	/// propagating the underlying lookups' errors. See
 	/// [`Wallet::find_signable_clause_strict`].
 	async fn can_sign_clause_strict(&self, clause: &VtxoClause) -> anyhow::Result<bool> {
-		if self.clause_keypair(clause).await?.is_none() {
+		let Some(signer) = self.signer_for_pubkey(&clause.pubkey()).await? else {
 			return Ok(false);
+		};
+		if signer.is_external() {
+			// An external signer owns the key and decides at signing time.
+			// Key-possession clauses are the ones it can satisfy; program
+			// exit paths use their saved recovery authorization instead.
+			return Ok(matches!(
+				clause,
+				VtxoClause::DelayedSign(_)
+					| VtxoClause::DelayedTimelockSign(_)
+					| VtxoClause::TimelockSign(_)
+			));
 		}
 		Ok(match clause {
 			// Key-possession clauses sign with the wallet key alone.
@@ -93,43 +122,25 @@ impl VtxoSigner for Wallet {
 		control_block: &taproot::ControlBlock,
 		sighash: TapSighash,
 	) -> Option<Witness> {
-		let signature = match self.clause_keypair(clause).await {
-			Ok(Some(keypair)) => {
-				SECP.sign_schnorr_with_aux_rand(&sighash.into(), &keypair, &rand::random())
-			},
+		let signer = match self.signer_for_pubkey(&clause.pubkey()).await {
+			Ok(Some(signer)) => signer,
 			Ok(None) => return None,
 			// The [VtxoSigner] trait cannot propagate errors, so a transient
 			// database failure is reported as unsignable here. Callers whose
 			// verdict is final must use the strict variants instead (see
 			// [Wallet::find_signable_clause_strict]).
 			Err(e) => {
-				error!("Failed to look up clause keypair, treating clause as unsignable: {:#}", e);
+				error!("Failed to look up clause signer, treating clause as unsignable: {:#}", e);
 				return None;
 			},
 		};
 
-		match clause {
-			VtxoClause::DelayedSign(c) => Some(c.witness(&signature, control_block)),
-			VtxoClause::DelayedTimelockSign(c) => Some(c.witness(&signature, &control_block)),
-			VtxoClause::TimelockSign(c) => Some(c.witness(&signature, &control_block)),
-			VtxoClause::HashDelaySign(c) => {
-				let preimage = self.lightning_receive_preimage(c.hash.into())
-					.await.ok().flatten();
-
-				preimage.map(|p| c.witness(
-					&(signature, p.to_byte_array()), &control_block,
-				))
+		match signer.sign_clause(self, clause, control_block, sighash).await {
+			Ok(witness) => witness,
+			Err(e) => {
+				error!("Failed to build clause witness: {:#}", e);
+				None
 			},
-			VtxoClause::HashDelaySign_v0(c) => {
-				let preimage = self.lightning_receive_preimage(c.hash.into())
-					.await.ok().flatten();
-
-				preimage.map(|p| c.witness(
-					&(signature, p.to_byte_array()), &control_block,
-				))
-			},
-			VtxoClause::HashSign(_) => None, // Not used by bark
-			VtxoClause::HashSign_v0(_) => None, // Not used by bark
 		}
 	}
 }

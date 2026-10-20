@@ -43,7 +43,9 @@ use crate::movement::{MovementId, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::persist::models::{RoundStateId, StoredRoundState, Unlocked};
 use crate::subsystem::{RoundMovement, Subsystem};
-use crate::vtxo::{validate_vtxo_tree_params, VtxoLockHolder, VtxoStateKind, VtxoState};
+use crate::vtxo::{
+	validate_vtxo_tree_params, VtxoLockHolder, VtxoStateKind, VtxoState,
+};
 
 /// How long [`Wallet::lock_wait_round_state`] waits for a contended
 /// round lock before giving up. Long enough to outlast a normal round.
@@ -751,7 +753,7 @@ impl RoundState {
 		if self.forfeit_bundles.is_none() {
 			let mut program_owned = false;
 			for input in &self.participation.inputs {
-				program_owned |= wallet.vtxo_signing_key(input).await?.program().is_some();
+				program_owned |= wallet.vtxo_signer(input).await?.is_external();
 			}
 			// Preserve native legacy replay. Program-owned positions must never
 			// recreate a possibly released share from an ambiguous checkpoint.
@@ -1212,8 +1214,8 @@ async fn start_attempt(
 
 	let mut input_vtxos = Vec::with_capacity(participation.inputs.len());
 	for vtxo in participation.inputs.iter() {
-		let key = wallet.vtxo_signing_key(vtxo).await?;
-		let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
+		let key = wallet.vtxo_signer(vtxo).await?;
+		let signature = key.sign_ownership(wallet, OwnershipRequest {
 			input: vtxo.clone(),
 			proof: OwnershipProof::Round {
 				challenge: event.challenge.inner(), outputs: signed_reqs.clone(),
@@ -1262,10 +1264,10 @@ async fn hark_cosign_leaf(
 	funding_tx: &Transaction,
 	vtxo: &mut Vtxo<Full>,
 ) -> anyhow::Result<()> {
-	let key = wallet.vtxo_signing_key(&*vtxo).await?;
+	let key = wallet.vtxo_signer(&*vtxo).await?;
 	let ctx = ExternalLeafVtxoCosignContext::new(vtxo, funding_tx)
 		.with_context(|| format!("can't cosign leaf of VTXO {}", vtxo.id()))?;
-	let prepared = wallet.prepare_vtxo_signature(&key, ctx.signing_input().clone()).await
+	let prepared = key.prepare(wallet, ctx.signing_input().clone()).await
 		.context("program rejected the round leaf transaction")?;
 	let cosign_req = ctx.request(prepared.public_nonce());
 	let cosign_resp: LeafVtxoCosignResponse = srv.client.request_leaf_vtxo_cosign(
@@ -1275,7 +1277,7 @@ async fn hark_cosign_leaf(
 		.into_inner().try_into()
 		.context("bad leaf vtxo cosign response")?;
 	let signature = prepared.finish(
-		&key, Some(cosign_resp.public_nonce), Some(cosign_resp.partial_signature),
+		Some(cosign_resp.public_nonce), Some(cosign_resp.partial_signature),
 	).await?.signature.context("round leaf signature is incomplete")?;
 	*vtxo = ctx.finalize(signature)
 		.context("invalid externally signed round leaf")?;
@@ -1358,11 +1360,11 @@ async fn prepare_hark_forfeits(
 		let ctx = HarkForfeitSigningContext::new(input, unlock_hash)?;
 		wallet.prepare_hark_recovery(input, &ctx).await
 			.context("hArk fallback recovery preparation failed")?;
-		let key = wallet.vtxo_signing_key(input).await?;
-		let prepared = wallet.prepare_vtxo_signature(&key, ctx.signing_input().clone()).await
+		let key = wallet.vtxo_signer(input).await?;
+		let prepared = key.prepare(wallet, ctx.signing_input().clone()).await
 			.context("program rejected the hArk forfeit transaction")?;
 		let user_nonce = prepared.public_nonce();
-		let share = prepared.finish(&key, Some(nonces.clone()), None).await?.user_partial;
+		let share = prepared.finish(Some(nonces.clone()), None).await?.user_partial;
 		forfeit_bundles.push(ctx.assemble(user_nonce, share, &nonces)?.serialize());
 	}
 
@@ -2246,8 +2248,8 @@ impl Wallet {
 		// Generate attestations for input vtxos
 		let mut input_vtxos = Vec::with_capacity(participation.inputs.len());
 		for vtxo in participation.inputs.iter() {
-			let key = self.vtxo_signing_key(vtxo).await?;
-			let signature = self.sign_vtxo_ownership(&key, OwnershipRequest {
+			let key = self.vtxo_signer(vtxo).await?;
+			let signature = key.sign_ownership(self, OwnershipRequest {
 				input: vtxo.clone(),
 				proof: OwnershipProof::DelegatedRound { outputs: participation.outputs.clone() },
 			}).await?;

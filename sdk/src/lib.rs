@@ -104,7 +104,9 @@ use crate::proxy::proxy_for_url;
 use crate::round::{RoundParticipation, RoundSecretNonces, RoundStatus};
 use crate::subsystem::RoundMovement;
 use crate::utils::rejected_vtxos_from_error;
-use crate::vtxo::{FilterVtxos, RefreshStrategy, VtxoFilter, VtxoStateKind, VtxoValidationError};
+use crate::vtxo::{
+	FilterVtxos, RefreshStrategy, VtxoFilter, VtxoKeySigner, VtxoStateKind, VtxoValidationError,
+};
 use crate::vtxo::selection::{InputSelection, SelectedFeeInfos};
 
 #[cfg(all(feature = "wasm-web", feature = "socks5-proxy"))]
@@ -504,6 +506,12 @@ struct WalletInner {
 
 	/// Lazily initialized bounded transport for enclave and coordinated receive RPCs.
 	program_transport: tokio::sync::OnceCell<sapio::client::ProgramTransport>,
+
+	/// Application-registered signers for policy keys that are not derived
+	/// from the wallet seed (for example a local co-signer).
+	external_vtxo_signers: parking_lot::RwLock<
+		HashMap<PublicKey, Arc<dyn crate::vtxo::VtxoKeySigner>>,
+	>,
 
 	/// Coordinates access to the wallet's protected resources. The caller
 	/// picks a backend whose enforcement scope matches how the wallet is
@@ -1137,6 +1145,7 @@ impl Wallet {
 			config, db, lock_manager, seed, exit, movements, notifications, server, chain,
 			onchain,
 			program_transport: tokio::sync::OnceCell::new(),
+			external_vtxo_signers: parking_lot::RwLock::new(HashMap::new()),
 			daemon: parking_lot::Mutex::new(None),
 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 			round_secret_nonces: RoundSecretNonces::new(),
@@ -1364,7 +1373,7 @@ impl Wallet {
 	pub(crate) async fn fetch_vtxo_spend_state(
 		&self,
 		vtxo: impl VtxoRef,
-		key: &sapio::VtxoSigningKey,
+		key: &dyn VtxoKeySigner,
 	) -> anyhow::Result<VtxoSpendState> {
 		let vtxo_id = vtxo.vtxo_id();
 		let attestation = if let Some(local) = key.local_keypair() {
@@ -1375,7 +1384,7 @@ impl Wallet {
 				None => self.get_full_vtxo(vtxo_id).await?,
 			};
 			let bare = input.to_bare();
-			let signature = self.sign_vtxo_ownership(key, ark::sapio::protocol::OwnershipRequest {
+			let signature = key.sign_ownership(self, ark::sapio::protocol::OwnershipRequest {
 				input, proof: ark::sapio::protocol::OwnershipProof::Status,
 			}).await?;
 			VtxoStatusAttestation::from_signature(&bare, signature)?

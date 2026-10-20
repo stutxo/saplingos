@@ -1,0 +1,896 @@
+diff --git a/sdk/src/actions/lightning/pay.rs b/sdk/src/actions/lightning/pay.rs
+index 5ed2b6fbd..f467785ec 100644
+--- a/sdk/src/actions/lightning/pay.rs
++++ b/sdk/src/actions/lightning/pay.rs
+@@ -460,7 +460,7 @@ pub(crate) async fn request_lightning_send_htlcs(
+ 		.context("Failed to construct arkoor package")?;
+ 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+ 	wallet.prepare_program_recoveries(&candidates).await?;
+-	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
++	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+ 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+ 		part.iter().map(|signature| signature.public_nonce()).collect()
+ 	}).collect()).context("failed to install lightning payment nonces")?;
+@@ -478,7 +478,7 @@ pub(crate) async fn request_lightning_send_htlcs(
+ 
+ 	builder.verify_cosign_response(&cosign_responses)
+ 		.context("invalid lightning payment cosign response")?;
+-	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_responses).await?;
++	let signatures = wallet.finish_arkoor_signatures(prepared, cosign_responses).await?;
+ 	let vtxos = builder.finish_external(signatures)
+ 		.context("Failed to cosign vtxos")?.build_signed_vtxos();
+ 
+@@ -760,7 +760,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
+ 		.context("Failed to construct arkoor package")?;
+ 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+ 	wallet.prepare_program_recoveries(&candidates).await?;
+-	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
++	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+ 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+ 		part.iter().map(|signature| signature.public_nonce()).collect()
+ 	}).collect()).context("failed to install lightning revocation nonces")?;
+@@ -777,7 +777,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
+ 
+ 	builder.verify_cosign_response(&cosign_resp)
+ 		.context("invalid lightning revocation cosign response")?;
+-	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_resp).await?;
++	let signatures = wallet.finish_arkoor_signatures(prepared, cosign_resp).await?;
+ 	let vtxos = builder.finish_external(signatures)
+ 		.context("Failed to cosign vtxos")?.build_signed_vtxos();
+ 	let checkpoint = LightningSend {
+diff --git a/sdk/src/actions/lightning/receive.rs b/sdk/src/actions/lightning/receive.rs
+index a6a9f9069..b9579f9c3 100644
+--- a/sdk/src/actions/lightning/receive.rs
++++ b/sdk/src/actions/lightning/receive.rs
+@@ -434,9 +434,9 @@ pub(crate) async fn compute_lightning_receive_anti_dos(
+ 			.context("have no spendable vtxo with sufficient expiry margin to prove ownership of")?;
+ 		let input = wallet.inner.db.get_full_vtxo(vtxo.id()).await?
+ 			.context("owned proof vtxo is missing")?;
+-		let key = wallet.vtxo_signing_key(&input).await?;
++		let key = wallet.vtxo_signer(&input).await?;
+ 		let proof_vtxo = input.to_bare();
+-		let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
++		let signature = key.sign_ownership(wallet, OwnershipRequest {
+ 			input,
+ 			proof: OwnershipProof::LightningReceive { payment_hash },
+ 		}).await?;
+@@ -726,7 +726,7 @@ async fn claim_lightning_receive_htlcs(
+ 	if let Some(destination) = recv.claim_destination.as_ref() {
+ 		wallet.prepare_program_receives(destination, &candidates).await?;
+ 	}
+-	let (keys, prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
++	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+ 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+ 		part.iter().map(|signature| signature.public_nonce()).collect()
+ 	}).collect()).context("failed to install lightning receive nonces")?;
+@@ -758,7 +758,7 @@ async fn claim_lightning_receive_htlcs(
+ 
+ 	builder.verify_cosign_response(&cosign_resp)
+ 		.context("invalid lightning receive cosign response")?;
+-	let signatures = wallet.finish_arkoor_signatures(&keys, prepared, cosign_resp).await?;
++	let signatures = wallet.finish_arkoor_signatures(prepared, cosign_resp).await?;
+ 	let mut outputs = builder.finish_external(signatures)
+ 		.context("claim arkoor cosign failed with user response")?.build_signed_vtxos();
+ 
+diff --git a/sdk/src/actions/offboard.rs b/sdk/src/actions/offboard.rs
+index 7295df28e..ac44cda9f 100644
+--- a/sdk/src/actions/offboard.rs
++++ b/sdk/src/actions/offboard.rs
+@@ -258,7 +258,7 @@ impl WalletAction for Offboard {
+ 				if prior_txid.is_some() {
+ 					for id in &offboard_vtxo_ids {
+ 						let input = wallet.get_vtxo_by_id(*id).await?;
+-						if wallet.vtxo_signing_key(&input).await?.program().is_some() {
++						if wallet.vtxo_signer(&input).await?.is_external() {
+ 							return Err(anyhow!(
+ 								"legacy program offboard may have forfeited its inputs; refusing a conflicting session",
+ 							).into());
+@@ -273,7 +273,7 @@ impl WalletAction for Offboard {
+ 				if !forfeits_unsent {
+ 					for id in &offboard_vtxo_ids {
+ 						let input = wallet.get_vtxo_by_id(*id).await?;
+-						if wallet.vtxo_signing_key(&input).await?.program().is_some() {
++						if wallet.vtxo_signer(&input).await?.is_external() {
+ 							return Err(anyhow!(
+ 								"legacy program offboard lacks durable forfeit shares; inputs remain locked",
+ 							).into());
+@@ -764,8 +764,8 @@ async fn prepare_offboard(
+ 	let attestation = {
+ 		let mut attestations = Vec::with_capacity(vtxos.len());
+ 		for v in &vtxos {
+-			let key = wallet.vtxo_signing_key(v).await?;
+-			let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
++			let key = wallet.vtxo_signer(v).await?;
++			let signature = key.sign_ownership(wallet, OwnershipRequest {
+ 				input: v.clone(),
+ 				proof: OwnershipProof::Offboard {
+ 					request: req.clone(), inputs: offboard_vtxo_ids.clone(),
+@@ -871,11 +871,11 @@ async fn prepare_offboard_forfeits(
+ 	for ((vtxo, input), server_nonce) in full_inputs.iter().zip(contexts)
+ 		.zip(server_forfeit_cosign_nonces.iter())
+ 	{
+-		let key = wallet.vtxo_signing_key(vtxo).await?;
+-		let prepared = wallet.prepare_vtxo_signature(&key, input).await
++		let key = wallet.vtxo_signer(vtxo).await?;
++		let prepared = key.prepare(wallet, input).await
+ 			.context("program rejected the offboard forfeit transaction")?;
+ 		user_nonces.push(prepared.public_nonce());
+-		user_shares.push(prepared.finish(&key, Some(server_nonce.clone()), None).await?
++		user_shares.push(prepared.finish(Some(server_nonce.clone()), None).await?
+ 			.user_partial);
+ 	}
+ 	let sigs = ctx.assemble_external_forfeits(
+diff --git a/sdk/src/arkoor.rs b/sdk/src/arkoor.rs
+index 4e48d4d16..d513234f7 100644
+--- a/sdk/src/arkoor.rs
++++ b/sdk/src/arkoor.rs
+@@ -15,7 +15,6 @@ use server_rpc::{protos, ServerConnection};
+ use crate::{VtxoDelivery, Wallet, WalletVtxo};
+ use crate::actions::DriveMode;
+ use crate::actions::arkoor_send::{ArkoorSend, start_arkoor_send};
+-use crate::sapio::{PreparedSignature, VtxoSigningKey};
+ use crate::sapio::receive::is_coordinated_address;
+ 
+ /// The result of creating an arkoor transaction
+@@ -319,10 +318,10 @@ impl Wallet {
+ 			self.prepare_program_receives(address, &destination_candidates).await
+ 				.map_err(ArkoorCreateError::ProgramGuard)?;
+ 		}
+-		let (keys, prepared, attestations) = self.prepare_arkoor_signatures(&builder).await
++		let (prepared, attestations) = self.prepare_arkoor_signatures(&builder).await
+ 			.map_err(ArkoorCreateError::ProgramGuard)?;
+ 		let nonces = prepared.iter()
+-			.map(|group| group.iter().map(PreparedSignature::public_nonce).collect())
++			.map(|group| group.iter().map(|p| p.public_nonce()).collect())
+ 			.collect();
+ 		let builder = builder.with_external_nonces(nonces)
+ 			.context("invalid arkoor signing nonces")?;
+@@ -340,7 +339,7 @@ impl Wallet {
+ 
+ 		builder.verify_cosign_response(&cosign_responses)
+ 			.context("invalid arkoor cosign response")?;
+-		let signatures = self.finish_arkoor_signatures(&keys, prepared, cosign_responses).await
++		let signatures = self.finish_arkoor_signatures(prepared, cosign_responses).await
+ 			.map_err(ArkoorCreateError::ProgramGuard)?;
+ 		let vtxos = builder.finish_external(signatures)
+ 			.context("Failed to finalize arkoor vtxos")?.build_signed_vtxos();
+@@ -363,13 +362,13 @@ impl Wallet {
+ 		&self,
+ 		builder: &ArkoorPackageBuilder<state::Initial>,
+ 	) -> anyhow::Result<(
+-		Vec<VtxoSigningKey>, Vec<Vec<PreparedSignature>>, Vec<ArkoorCosignAttestation>,
++		Vec<Vec<Box<dyn crate::vtxo::PreparedVtxoSignature>>>,
++		Vec<ArkoorCosignAttestation>,
+ 	)> {
+-		let mut keys = Vec::with_capacity(builder.builders.len());
+ 		let mut prepared = Vec::with_capacity(builder.builders.len());
+ 		let mut attestations = Vec::with_capacity(builder.builders.len());
+ 		for input_builder in &builder.builders {
+-			let key = self.vtxo_signing_key(input_builder.input()).await?;
++			let key = self.vtxo_signer(input_builder.input()).await?;
+ 			let outputs = input_builder.all_outputs().collect::<Vec<_>>();
+ 			let ownership = OwnershipRequest {
+ 				input: input_builder.input().clone(),
+@@ -377,19 +376,18 @@ impl Wallet {
+ 					outputs: outputs.iter().map(|output| (*output).clone()).collect(),
+ 				},
+ 			};
+-			let signature = self.sign_vtxo_ownership(&key, ownership).await?;
++			let signature = key.sign_ownership(self, ownership).await?;
+ 			attestations.push(ArkoorCosignAttestation::from_signature(
+ 				input_builder.input(), &outputs, signature,
+ 			)?);
+ 			let contexts = input_builder.signing_inputs()?;
+ 			let mut group = Vec::with_capacity(contexts.len());
+ 			for context in contexts {
+-				group.push(self.prepare_vtxo_signature(&key, context).await?);
++				group.push(key.prepare(self, context).await?);
+ 			}
+-			keys.push(key);
+ 			prepared.push(group);
+ 		}
+-		Ok((keys, prepared, attestations))
++		Ok((prepared, attestations))
+ 	}
+ 
+ 	/// Finish every child path before completing any original-input spend.
+@@ -397,15 +395,14 @@ impl Wallet {
+ 	/// so completing only the input signature is not a recoverable package.
+ 	pub(crate) async fn finish_arkoor_signatures(
+ 		&self,
+-		keys: &[VtxoSigningKey],
+-		prepared: Vec<Vec<PreparedSignature>>,
++		prepared: Vec<Vec<Box<dyn crate::vtxo::PreparedVtxoSignature>>>,
+ 		response: ArkoorPackageCosignResponse,
+ 	) -> anyhow::Result<Vec<Vec<schnorr::Signature>>> {
+-		ensure!(prepared.len() == keys.len() && response.responses.len() == keys.len(),
++		ensure!(prepared.len() == response.responses.len(),
+ 			"arkoor signing package count mismatch");
+-		let mut roots = Vec::with_capacity(keys.len());
+-		let mut signatures = Vec::with_capacity(keys.len());
+-		for ((key, group), response) in keys.iter().zip(prepared).zip(response.responses) {
++		let mut roots = Vec::with_capacity(prepared.len());
++		let mut signatures = Vec::with_capacity(prepared.len());
++		for (group, response) in prepared.into_iter().zip(response.responses) {
+ 			ensure!(!group.is_empty()
+ 				&& group.len() == response.server_pub_nonces.len()
+ 				&& group.len() == response.server_partial_sigs.len(),
+@@ -416,15 +413,15 @@ impl Wallet {
+ 			roots.push(group.next().context("missing arkoor input context")?);
+ 			let mut children = Vec::with_capacity(group.len() + 1);
+ 			for ((prepared, nonce), partial) in group {
+-				children.push(prepared.finish(key, Some(nonce), Some(partial)).await?
++				children.push(prepared.finish(Some(nonce), Some(partial)).await?
+ 					.signature.context("incomplete arkoor child signature")?);
+ 			}
+ 			signatures.push(children);
+ 		}
+-		for ((key, ((prepared, nonce), partial)), children) in keys.iter().zip(roots)
++		for (((prepared, nonce), partial), children) in roots.into_iter()
+ 			.zip(signatures.iter_mut())
+ 		{
+-			let signature = prepared.finish(key, Some(nonce), Some(partial)).await?
++			let signature = prepared.finish(Some(nonce), Some(partial)).await?
+ 				.signature.context("incomplete arkoor input signature")?;
+ 			children.insert(0, signature);
+ 		}
+diff --git a/sdk/src/board.rs b/sdk/src/board.rs
+index af1fb40e7..bac412a2f 100644
+--- a/sdk/src/board.rs
++++ b/sdk/src/board.rs
+@@ -19,7 +19,7 @@ use crate::persist::models::{PendingBoard, recovery_action_key};
+ use crate::onchain::OnchainWalletTrait;
+ use crate::subsystem::{BoardMovement, Subsystem};
+ use crate::sapio::VtxoSigningKey;
+-use crate::vtxo::VtxoStateKind;
++use crate::vtxo::{VtxoKeySigner, VtxoStateKind};
+ 
+ impl Wallet {
+ 	/// Board a [ark::Vtxo] with the given amount.
+@@ -325,7 +325,7 @@ impl Wallet {
+ 			saved
+ 		} else {
+ 			self.prepare_program_recoveries(std::slice::from_ref(&candidate)).await?;
+-			let prepared = self.prepare_vtxo_signature(&user_key, builder.signing_input()?).await?;
++			let prepared = user_key.prepare(self, builder.signing_input()?).await?;
+ 			let builder = builder.with_external_nonce(prepared.public_nonce())?;
+ 
+ 			let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
+@@ -344,7 +344,7 @@ impl Wallet {
+ 			// The program and server shares are verified before the user's final
+ 			// contribution. Recovery preparation already saved the signed claim.
+ 			let signature = prepared.finish(
+-				&user_key, Some(cosign_resp.pub_nonce), Some(cosign_resp.partial_signature),
++				Some(cosign_resp.pub_nonce), Some(cosign_resp.partial_signature),
+ 			).await?.signature.context("incomplete board signature")?;
+ 			builder.finish_external(signature)?
+ 		};
+diff --git a/sdk/src/lib.rs b/sdk/src/lib.rs
+index 1b439ad53..396e63cf1 100644
+--- a/sdk/src/lib.rs
++++ b/sdk/src/lib.rs
+@@ -104,7 +104,9 @@ use crate::proxy::proxy_for_url;
+ use crate::round::{RoundParticipation, RoundSecretNonces, RoundStatus};
+ use crate::subsystem::RoundMovement;
+ use crate::utils::rejected_vtxos_from_error;
+-use crate::vtxo::{FilterVtxos, RefreshStrategy, VtxoFilter, VtxoStateKind, VtxoValidationError};
++use crate::vtxo::{
++	FilterVtxos, RefreshStrategy, VtxoFilter, VtxoKeySigner, VtxoStateKind, VtxoValidationError,
++};
+ use crate::vtxo::selection::{InputSelection, SelectedFeeInfos};
+ 
+ #[cfg(all(feature = "wasm-web", feature = "socks5-proxy"))]
+@@ -505,6 +507,12 @@ struct WalletInner {
+ 	/// Lazily initialized bounded transport for enclave and coordinated receive RPCs.
+ 	program_transport: tokio::sync::OnceCell<sapio::client::ProgramTransport>,
+ 
++	/// Application-registered signers for policy keys that are not derived
++	/// from the wallet seed (for example a local co-signer).
++	external_vtxo_signers: parking_lot::RwLock<
++		HashMap<PublicKey, Arc<dyn crate::vtxo::VtxoKeySigner>>,
++	>,
++
+ 	/// Coordinates access to the wallet's protected resources. The caller
+ 	/// picks a backend whose enforcement scope matches how the wallet is
+ 	/// deployed; see [`crate::lock_manager`].
+@@ -1137,6 +1145,7 @@ impl Wallet {
+ 			config, db, lock_manager, seed, exit, movements, notifications, server, chain,
+ 			onchain,
+ 			program_transport: tokio::sync::OnceCell::new(),
++			external_vtxo_signers: parking_lot::RwLock::new(HashMap::new()),
+ 			daemon: parking_lot::Mutex::new(None),
+ 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+ 			round_secret_nonces: RoundSecretNonces::new(),
+@@ -1364,7 +1373,7 @@ impl Wallet {
+ 	pub(crate) async fn fetch_vtxo_spend_state(
+ 		&self,
+ 		vtxo: impl VtxoRef,
+-		key: &sapio::VtxoSigningKey,
++		key: &dyn VtxoKeySigner,
+ 	) -> anyhow::Result<VtxoSpendState> {
+ 		let vtxo_id = vtxo.vtxo_id();
+ 		let attestation = if let Some(local) = key.local_keypair() {
+@@ -1375,7 +1384,7 @@ impl Wallet {
+ 				None => self.get_full_vtxo(vtxo_id).await?,
+ 			};
+ 			let bare = input.to_bare();
+-			let signature = self.sign_vtxo_ownership(key, ark::sapio::protocol::OwnershipRequest {
++			let signature = key.sign_ownership(self, ark::sapio::protocol::OwnershipRequest {
+ 				input, proof: ark::sapio::protocol::OwnershipProof::Status,
+ 			}).await?;
+ 			VtxoStatusAttestation::from_signature(&bare, signature)?
+diff --git a/sdk/src/lightning/receive.rs b/sdk/src/lightning/receive.rs
+index 453701d7a..ce47b74bb 100644
+--- a/sdk/src/lightning/receive.rs
++++ b/sdk/src/lightning/receive.rs
+@@ -29,7 +29,7 @@ impl Wallet {
+ 		let mut native = Vec::new();
+ 		let mut program = Vec::new();
+ 		for vtxo in vtxos {
+-			if self.vtxo_signing_key(vtxo).await?.program().is_some() {
++			if self.vtxo_signer(vtxo).await?.is_external() {
+ 				program.push(vtxo.point());
+ 			} else {
+ 				adopt_native_lightning_exit(self.inner.db.as_ref(), vtxo, action_id).await?;
+diff --git a/sdk/src/recovery.rs b/sdk/src/recovery.rs
+index d55946e0d..9ca51cf42 100644
+--- a/sdk/src/recovery.rs
++++ b/sdk/src/recovery.rs
+@@ -1037,6 +1037,7 @@ mod test {
+ 				chain,
+ 				onchain: None,
+ 				program_transport: tokio::sync::OnceCell::new(),
++				external_vtxo_signers: parking_lot::RwLock::new(std::collections::HashMap::new()),
+ 				daemon: parking_lot::Mutex::new(None),
+ 				last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+ 				round_secret_nonces: RoundSecretNonces::new(),
+diff --git a/sdk/src/round/mod.rs b/sdk/src/round/mod.rs
+index e8c46ae4e..8311bb536 100644
+--- a/sdk/src/round/mod.rs
++++ b/sdk/src/round/mod.rs
+@@ -43,7 +43,9 @@ use crate::movement::{MovementId, MovementStatus};
+ use crate::movement::update::MovementUpdate;
+ use crate::persist::models::{RoundStateId, StoredRoundState, Unlocked};
+ use crate::subsystem::{RoundMovement, Subsystem};
+-use crate::vtxo::{validate_vtxo_tree_params, VtxoLockHolder, VtxoStateKind, VtxoState};
++use crate::vtxo::{
++	validate_vtxo_tree_params, VtxoLockHolder, VtxoStateKind, VtxoState,
++};
+ 
+ /// How long [`Wallet::lock_wait_round_state`] waits for a contended
+ /// round lock before giving up. Long enough to outlast a normal round.
+@@ -751,7 +753,7 @@ impl RoundState {
+ 		if self.forfeit_bundles.is_none() {
+ 			let mut program_owned = false;
+ 			for input in &self.participation.inputs {
+-				program_owned |= wallet.vtxo_signing_key(input).await?.program().is_some();
++				program_owned |= wallet.vtxo_signer(input).await?.is_external();
+ 			}
+ 			// Preserve native legacy replay. Program-owned positions must never
+ 			// recreate a possibly released share from an ambiguous checkpoint.
+@@ -1212,8 +1214,8 @@ async fn start_attempt(
+ 
+ 	let mut input_vtxos = Vec::with_capacity(participation.inputs.len());
+ 	for vtxo in participation.inputs.iter() {
+-		let key = wallet.vtxo_signing_key(vtxo).await?;
+-		let signature = wallet.sign_vtxo_ownership(&key, OwnershipRequest {
++		let key = wallet.vtxo_signer(vtxo).await?;
++		let signature = key.sign_ownership(wallet, OwnershipRequest {
+ 			input: vtxo.clone(),
+ 			proof: OwnershipProof::Round {
+ 				challenge: event.challenge.inner(), outputs: signed_reqs.clone(),
+@@ -1262,10 +1264,10 @@ async fn hark_cosign_leaf(
+ 	funding_tx: &Transaction,
+ 	vtxo: &mut Vtxo<Full>,
+ ) -> anyhow::Result<()> {
+-	let key = wallet.vtxo_signing_key(&*vtxo).await?;
++	let key = wallet.vtxo_signer(&*vtxo).await?;
+ 	let ctx = ExternalLeafVtxoCosignContext::new(vtxo, funding_tx)
+ 		.with_context(|| format!("can't cosign leaf of VTXO {}", vtxo.id()))?;
+-	let prepared = wallet.prepare_vtxo_signature(&key, ctx.signing_input().clone()).await
++	let prepared = key.prepare(wallet, ctx.signing_input().clone()).await
+ 		.context("program rejected the round leaf transaction")?;
+ 	let cosign_req = ctx.request(prepared.public_nonce());
+ 	let cosign_resp: LeafVtxoCosignResponse = srv.client.request_leaf_vtxo_cosign(
+@@ -1275,7 +1277,7 @@ async fn hark_cosign_leaf(
+ 		.into_inner().try_into()
+ 		.context("bad leaf vtxo cosign response")?;
+ 	let signature = prepared.finish(
+-		&key, Some(cosign_resp.public_nonce), Some(cosign_resp.partial_signature),
++		Some(cosign_resp.public_nonce), Some(cosign_resp.partial_signature),
+ 	).await?.signature.context("round leaf signature is incomplete")?;
+ 	*vtxo = ctx.finalize(signature)
+ 		.context("invalid externally signed round leaf")?;
+@@ -1358,11 +1360,11 @@ async fn prepare_hark_forfeits(
+ 		let ctx = HarkForfeitSigningContext::new(input, unlock_hash)?;
+ 		wallet.prepare_hark_recovery(input, &ctx).await
+ 			.context("hArk fallback recovery preparation failed")?;
+-		let key = wallet.vtxo_signing_key(input).await?;
+-		let prepared = wallet.prepare_vtxo_signature(&key, ctx.signing_input().clone()).await
++		let key = wallet.vtxo_signer(input).await?;
++		let prepared = key.prepare(wallet, ctx.signing_input().clone()).await
+ 			.context("program rejected the hArk forfeit transaction")?;
+ 		let user_nonce = prepared.public_nonce();
+-		let share = prepared.finish(&key, Some(nonces.clone()), None).await?.user_partial;
++		let share = prepared.finish(Some(nonces.clone()), None).await?.user_partial;
+ 		forfeit_bundles.push(ctx.assemble(user_nonce, share, &nonces)?.serialize());
+ 	}
+ 
+@@ -2246,8 +2248,8 @@ impl Wallet {
+ 		// Generate attestations for input vtxos
+ 		let mut input_vtxos = Vec::with_capacity(participation.inputs.len());
+ 		for vtxo in participation.inputs.iter() {
+-			let key = self.vtxo_signing_key(vtxo).await?;
+-			let signature = self.sign_vtxo_ownership(&key, OwnershipRequest {
++			let key = self.vtxo_signer(vtxo).await?;
++			let signature = key.sign_ownership(self, OwnershipRequest {
+ 				input: vtxo.clone(),
+ 				proof: OwnershipProof::DelegatedRound { outputs: participation.outputs.clone() },
+ 			}).await?;
+diff --git a/sdk/src/sapio/client.rs b/sdk/src/sapio/client.rs
+index cba7172b3..658a48c3f 100644
+--- a/sdk/src/sapio/client.rs
++++ b/sdk/src/sapio/client.rs
+@@ -16,6 +16,7 @@ use ark::sapio::protocol::{
+ };
+ 
+ use crate::{Config, Wallet};
++use crate::vtxo::SignatureResult;
+ use super::VtxoSigningKey;
+ 
+ const HTTP_TIMEOUT_SECS: u64 = 30;
+@@ -141,18 +142,29 @@ extern "C" {
+ 		-> std::result::Result<String, wasm_bindgen::JsValue>;
+ }
+ 
+-pub(crate) struct SignatureResult {
+-	pub user_partial: musig::PartialSignature,
+-	pub signature: Option<schnorr::Signature>,
+-}
+-
+ pub(crate) struct PreparedSignature {
+ 	wallet: Wallet,
+-	signer: PublicKey,
++	key: VtxoSigningKey,
+ 	input: Option<SigningInput>,
+ 	state: PreparedState,
+ }
+ 
++#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
++#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
++impl crate::vtxo::PreparedVtxoSignature for PreparedSignature {
++	fn public_nonce(&self) -> musig::PublicNonce {
++		self.public_nonce()
++	}
++
++	async fn finish(
++		self: Box<Self>,
++		server_nonce: Option<musig::PublicNonce>,
++		server_partial: Option<musig::PartialSignature>,
++	) -> Result<crate::vtxo::SignatureResult> {
++		PreparedSignature::finish(*self, server_nonce, server_partial).await
++	}
++}
++
+ enum PreparedState {
+ 	Local {
+ 		nonce: musig::SecretNonce,
+@@ -182,11 +194,10 @@ impl PreparedSignature {
+ 
+ 	pub async fn finish(
+ 		self,
+-		key: &VtxoSigningKey,
+ 		server_nonce: Option<musig::PublicNonce>,
+ 		server_partial: Option<musig::PartialSignature>,
+-	) -> Result<SignatureResult> {
+-		ensure!(key.public_key() == self.signer, "signer changed after nonce preparation");
++	) -> Result<crate::vtxo::SignatureResult> {
++		let key = &self.key;
+ 		let ret = match self.state {
+ 			PreparedState::Program { nonce, peer, intent, session, endpoint } => {
+ 				let request = FinishRequest {
+@@ -215,7 +226,8 @@ impl PreparedSignature {
+ 				let native = key.local_keypair().context("native nonce supplied to program signer")?;
+ 				let server_nonce = server_nonce.context("missing server nonce")?;
+ 				ensure!(participants.len() == 2, "unsupported native participant count");
+-				let server = participants.iter().copied().find(|p| *p != self.signer)
++				let server = participants.iter().copied()
++					.find(|p| *p != key.public_key())
+ 					.context("missing distinct server participant")?;
+ 				let cache = match tweak {
+ 					Some(tweak) => musig::tweaked_key_agg(participants.iter().copied(), tweak).0,
+@@ -228,7 +240,8 @@ impl PreparedSignature {
+ 						"invalid server partial signature");
+ 				}
+ 				let user_partial = session.partial_sign(nonce, &musig::keypair_to(native), &cache);
+-				ensure!(session.partial_verify(&cache, &user_partial, &public, musig::pubkey_to(self.signer)),
++				ensure!(session.partial_verify(&cache, &user_partial, &public,
++					musig::pubkey_to(key.public_key())),
+ 					"invalid local partial signature");
+ 				let signature = server_partial.as_ref().map(|server| {
+ 					musig::sig_from(session.partial_sig_agg(&[&user_partial, server]).assume_valid())
+@@ -272,7 +285,7 @@ impl Wallet {
+ 		)?;
+ 		nested::aggregate_member_nonces(&intent, &[nonce.public(), peer])?;
+ 		Ok(PreparedSignature {
+-			wallet: self.clone(), signer: key.public_key(), input,
++			wallet: self.clone(), key: key.clone(), input,
+ 			state: PreparedState::Program { nonce, peer, intent, session: response.session,
+ 				endpoint: descriptor.endpoint.clone() },
+ 		})
+@@ -296,7 +309,9 @@ impl Wallet {
+ 			let (nonce, public) = musig::nonce_pair_with_msg(native, &message);
+ 			let state = PreparedState::Local { nonce, public, message,
+ 				participants: input.participants.clone(), tweak: input.tweak };
+-			Ok(PreparedSignature { wallet: self.clone(), signer: key.public_key(), input: Some(input), state })
++			Ok(PreparedSignature {
++				wallet: self.clone(), key: key.clone(), input: Some(input), state,
++			})
+ 		}
+ 	}
+ 
+@@ -306,7 +321,7 @@ impl Wallet {
+ 		ensure!(key.program().is_some(), "program claim requires a program key");
+ 		let request = SpendRequest::from_input(&input, None, witness)?;
+ 		self.prepare_program_signature(key, SigningAction::Spend { request }, Some(input)).await?
+-			.finish(key, None, None).await?.signature.context("missing joint recovery signature")
++			.finish(None, None).await?.signature.context("missing joint recovery signature")
+ 	}
+ 
+ 	pub(crate) async fn sign_vtxo_ownership(
+@@ -315,7 +330,7 @@ impl Wallet {
+ 		if let Some(program) = key.program() {
+ 			request.message(&program.program)?;
+ 			self.prepare_program_signature(key, SigningAction::Ownership { request }, None).await?
+-				.finish(key, None, None).await?.signature.context("missing joint ownership signature")
++				.finish(None, None).await?.signature.context("missing joint ownership signature")
+ 		} else {
+ 			ensure!(request.input.user_pubkey() == key.public_key(), "ownership key mismatch");
+ 			let message = request.message_for_owner(key.public_key())?;
+diff --git a/sdk/src/sapio/mod.rs b/sdk/src/sapio/mod.rs
+index 699e225d0..4ec1aaaca 100644
+--- a/sdk/src/sapio/mod.rs
++++ b/sdk/src/sapio/mod.rs
+@@ -10,6 +10,7 @@ pub mod recovery;
+ 
+ use std::borrow::Cow;
+ use std::net::SocketAddr;
++use std::sync::Arc;
+ 
+ use anyhow::{Context, Result};
+ use bitcoin::bip32::Xpub;
+@@ -21,8 +22,6 @@ use ark::vtxo::VtxoRef;
+ use crate::persist::models::{ProgramRecoveryTemplate, SerdeProgramKey};
+ use crate::Wallet;
+ 
+-pub(crate) use client::PreparedSignature;
+-
+ /// Complete policy and recovery construction for newly issued program keys.
+ /// Obtain `root` from independently verified attestation of the expected image.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -57,6 +56,7 @@ impl SapioConfig {
+ 
+ /// A native key or the user's private participant in an immutable joint key.
+ /// No conversion from a program handle to a native C keypair exists.
++#[derive(Clone)]
+ pub(crate) struct VtxoSigningKey {
+ 	pub(super) user: Keypair,
+ 	public: PublicKey,
+@@ -69,6 +69,46 @@ impl From<Keypair> for VtxoSigningKey {
+ 	}
+ }
+ 
++#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
++#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
++impl crate::vtxo::VtxoKeySigner for VtxoSigningKey {
++	fn public_key(&self) -> PublicKey { self.public }
++
++	fn local_keypair(&self) -> Option<&Keypair> { self.local_keypair() }
++
++	async fn prepare(
++		&self,
++		wallet: &Wallet,
++		input: ark::musig::context::SigningInput,
++	) -> Result<Box<dyn crate::vtxo::PreparedVtxoSignature>> {
++		Ok(Box::new(wallet.prepare_vtxo_signature(self, input).await?))
++	}
++
++	async fn sign_ownership(
++		&self,
++		wallet: &Wallet,
++		request: ark::sapio::protocol::OwnershipRequest,
++	) -> Result<bitcoin::secp256k1::schnorr::Signature> {
++		wallet.sign_vtxo_ownership(self, request).await
++	}
++
++	async fn sign_clause(
++		&self,
++		wallet: &Wallet,
++		clause: &ark::vtxo::VtxoClause,
++		control_block: &bitcoin::taproot::ControlBlock,
++		sighash: bitcoin::TapSighash,
++	) -> Result<Option<bitcoin::Witness>> {
++		let Some(keypair) = self.local_keypair() else {
++			// Program-backed live clause signing is handled by the saved
++			// recovery path; the generic interface returns "not signable"
++			// rather than silently signing with the wrong participant.
++			return Ok(None);
++		};
++		wallet.clause_witness_with_key(keypair, clause, control_block, sighash).await
++	}
++}
++
+ impl VtxoSigningKey {
+ 	pub fn public_key(&self) -> PublicKey { self.public }
+ 
+@@ -100,12 +140,39 @@ impl Wallet {
+ 		}
+ 	}
+ 
+-	pub(crate) async fn vtxo_signing_key(&self, vtxo: impl VtxoRef) -> Result<VtxoSigningKey> {
++	/// Register an application-provided signer for a policy public key.
++	///
++	/// The signer is consulted before seed/program lookup, so a companion
++	/// crate can own keys whose secret material lives in a local co-signer.
++	pub fn register_vtxo_signer(&self, signer: Arc<dyn crate::vtxo::VtxoKeySigner>) {
++		self.inner.external_vtxo_signers.write()
++			.insert(signer.public_key(), signer);
++	}
++
++	pub(crate) async fn signer_for_pubkey(
++		&self,
++		public: &PublicKey,
++	) -> Result<Option<Arc<dyn crate::vtxo::VtxoKeySigner>>> {
++		if let Some(signer) = self.inner.external_vtxo_signers.read().get(public).cloned() {
++			return Ok(Some(signer));
++		}
++		Ok(self.signing_key(public).await?
++			.map(|key| Arc::new(key) as Arc<dyn crate::vtxo::VtxoKeySigner>))
++	}
++
++	/// Generic signer for a VTXO's policy key. Core signing paths use this;
++	/// Sapio-specific recovery preparation still resolves the concrete
++	/// descriptor through [Wallet::signing_key].
++	pub(crate) async fn vtxo_signer(
++		&self,
++		vtxo: impl VtxoRef,
++	) -> Result<Arc<dyn crate::vtxo::VtxoKeySigner>> {
+ 		let bare = match vtxo.as_bare_vtxo() {
+ 			Some(bare) => bare,
+ 			None => Cow::Owned(self.get_vtxo_by_id(vtxo.vtxo_id()).await?.vtxo),
+ 		};
+-		self.signing_key(&bare.user_pubkey()).await?.context("VTXO ownership key not found")
++		self.signer_for_pubkey(&bare.user_pubkey()).await?
++			.context("VTXO ownership key not found")
+ 	}
+ 
+ 	pub(crate) async fn peek_signing_key(&self, index: u32) -> Result<VtxoSigningKey> {
+diff --git a/sdk/src/vtxo/mod.rs b/sdk/src/vtxo/mod.rs
+index 6ea2e2013..f3ab0a913 100644
+--- a/sdk/src/vtxo/mod.rs
++++ b/sdk/src/vtxo/mod.rs
+@@ -1,9 +1,11 @@
+ 
+ pub mod selection;
++pub mod signer;
+ mod signing;
+ mod state;
+ 
+ pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
++pub use self::signer::{PreparedVtxoSignature, SignatureResult, VtxoKeySigner};
+ pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+ 
+ use anyhow::Context;
+diff --git a/sdk/src/vtxo/signer.rs b/sdk/src/vtxo/signer.rs
+new file mode 100644
+index 000000000..58278bd72
+--- /dev/null
++++ b/sdk/src/vtxo/signer.rs
+@@ -0,0 +1,85 @@
++//! Generic signing interface for VTXO policy keys.
++//!
++//! Most wallets sign with a seed-derived keypair. Program-backed wallets use
++//! the same interface for keys whose private material is split with a local
++//! co-signer: bark sees one public key and asks the signer to prepare nonces
++//! and finish the MuSig session.
++
++use bitcoin::key::Keypair;
++use bitcoin::secp256k1::{schnorr, PublicKey};
++use bitcoin::Witness;
++
++use ark::musig::{PartialSignature, PublicNonce};
++use ark::musig::context::SigningInput;
++use ark::sapio::protocol::OwnershipRequest;
++use ark::vtxo::VtxoClause;
++
++use crate::Wallet;
++
++/// A signing key for one VTXO policy public key.
++///
++/// `local_keypair()` is `Some` only when the wallet can sign without help.
++/// Callers use it for operations that are intentionally native-only (raw
++/// keypair export, address mailbox binding, specialized protocol paths).
++#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
++#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
++pub trait VtxoKeySigner: Send + Sync {
++	/// The public key this signer controls.
++	fn public_key(&self) -> PublicKey;
++
++	/// The local keypair, when this is a seed-derived native key.
++	fn local_keypair(&self) -> Option<&Keypair>;
++
++	/// Whether signing requires a local co-signer.
++	fn is_external(&self) -> bool {
++		self.local_keypair().is_none()
++	}
++
++	/// Prepare one MuSig signing context. The returned object holds any
++	/// secret nonce state until `finish`.
++	async fn prepare(
++		&self,
++		wallet: &Wallet,
++		input: SigningInput,
++	) -> anyhow::Result<Box<dyn PreparedVtxoSignature>>;
++
++	/// Sign an ownership challenge for this key.
++	async fn sign_ownership(
++		&self,
++		wallet: &Wallet,
++		request: OwnershipRequest,
++	) -> anyhow::Result<schnorr::Signature>;
++
++	/// Sign a tapscript clause when the wallet owns the clause key.
++	async fn sign_clause(
++		&self,
++		wallet: &Wallet,
++		clause: &VtxoClause,
++		control_block: &bitcoin::taproot::ControlBlock,
++		sighash: bitcoin::TapSighash,
++	) -> anyhow::Result<Option<Witness>>;
++}
++
++/// A prepared MuSig session for one VTXO signing context.
++#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
++#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
++pub trait PreparedVtxoSignature: Send {
++	/// The public nonce to send to the server.
++	fn public_nonce(&self) -> PublicNonce;
++
++	/// Finish the session with the server's nonce/partial signature.
++	async fn finish(
++		self: Box<Self>,
++		server_nonce: Option<PublicNonce>,
++		server_partial: Option<PartialSignature>,
++	) -> anyhow::Result<SignatureResult>;
++}
++
++/// Result of finishing a MuSig signing context.
++#[derive(Debug, Clone)]
++pub struct SignatureResult {
++	/// The wallet's own partial signature, before aggregation.
++	pub user_partial: PartialSignature,
++	/// The aggregated signature when the context includes the server.
++	pub signature: Option<schnorr::Signature>,
++}
+diff --git a/sdk/src/vtxo/signing.rs b/sdk/src/vtxo/signing.rs
+index 984a3b256..79262d1cb 100644
+--- a/sdk/src/vtxo/signing.rs
++++ b/sdk/src/vtxo/signing.rs
+@@ -11,16 +11,34 @@ use ark::vtxo::policy::signing::VtxoSigner;
+ use crate::{SECP, Wallet};
+ 
+ impl Wallet {
+-	/// Get the keypair for the given clause, if the wallet owns it.
+-	///
+-	/// Database errors are propagated: collapsing them into `None` would
+-	/// make a transient persister failure indistinguishable from "no key",
+-	/// letting an ownership probe permanently drop a payment the wallet in
+-	/// fact owns. Callers that need the [`VtxoSigner::witness`] contract of
+-	/// a plain `Option` handle the error at their boundary.
+-	pub (crate) async fn clause_keypair(&self, clause: &VtxoClause) -> anyhow::Result<Option<Keypair>> {
+-		let clause_pubkey = clause.pubkey();
+-		Ok(self.pubkey_keypair(&clause_pubkey).await?.map(|(_, keypair)| keypair))
++	/// Build the clause witness with an already-resolved keypair. Shared by
++	/// the native signer and the generic [`crate::vtxo::VtxoKeySigner`] path.
++	pub(crate) async fn clause_witness_with_key(
++		&self,
++		keypair: &Keypair,
++		clause: &VtxoClause,
++		control_block: &taproot::ControlBlock,
++		sighash: TapSighash,
++	) -> anyhow::Result<Option<Witness>> {
++		let signature = SECP.sign_schnorr_with_aux_rand(&sighash.into(), keypair, &rand::random());
++		Ok(match clause {
++			VtxoClause::DelayedSign(c) => Some(c.witness(&signature, control_block)),
++			VtxoClause::DelayedTimelockSign(c) => Some(c.witness(&signature, &control_block)),
++			VtxoClause::TimelockSign(c) => Some(c.witness(&signature, &control_block)),
++			VtxoClause::HashDelaySign(c) => {
++				let preimage = self.lightning_receive_preimage(c.hash.into()).await?;
++				preimage.map(|p| c.witness(
++					&(signature, p.to_byte_array()), &control_block,
++				))
++			},
++			VtxoClause::HashDelaySign_v0(c) => {
++				let preimage = self.lightning_receive_preimage(c.hash.into()).await?;
++				preimage.map(|p| c.witness(
++					&(signature, p.to_byte_array()), &control_block,
++				))
++			},
++			VtxoClause::HashSign(_) | VtxoClause::HashSign_v0(_) => None,
++		})
+ 	}
+ 
+ 	/// Variant of [`VtxoSigner::find_signable_clause`] that propagates
+@@ -53,8 +71,19 @@ impl Wallet {
+ 	/// propagating the underlying lookups' errors. See
+ 	/// [`Wallet::find_signable_clause_strict`].
+ 	async fn can_sign_clause_strict(&self, clause: &VtxoClause) -> anyhow::Result<bool> {
+-		if self.clause_keypair(clause).await?.is_none() {
++		let Some(signer) = self.signer_for_pubkey(&clause.pubkey()).await? else {
+ 			return Ok(false);
++		};
++		if signer.is_external() {
++			// An external signer owns the key and decides at signing time.
++			// Key-possession clauses are the ones it can satisfy; program
++			// exit paths use their saved recovery authorization instead.
++			return Ok(matches!(
++				clause,
++				VtxoClause::DelayedSign(_)
++					| VtxoClause::DelayedTimelockSign(_)
++					| VtxoClause::TimelockSign(_)
++			));
+ 		}
+ 		Ok(match clause {
+ 			// Key-possession clauses sign with the wallet key alone.
+@@ -93,43 +122,25 @@ impl VtxoSigner for Wallet {
+ 		control_block: &taproot::ControlBlock,
+ 		sighash: TapSighash,
+ 	) -> Option<Witness> {
+-		let signature = match self.clause_keypair(clause).await {
+-			Ok(Some(keypair)) => {
+-				SECP.sign_schnorr_with_aux_rand(&sighash.into(), &keypair, &rand::random())
+-			},
++		let signer = match self.signer_for_pubkey(&clause.pubkey()).await {
++			Ok(Some(signer)) => signer,
+ 			Ok(None) => return None,
+ 			// The [VtxoSigner] trait cannot propagate errors, so a transient
+ 			// database failure is reported as unsignable here. Callers whose
+ 			// verdict is final must use the strict variants instead (see
+ 			// [Wallet::find_signable_clause_strict]).
+ 			Err(e) => {
+-				error!("Failed to look up clause keypair, treating clause as unsignable: {:#}", e);
++				error!("Failed to look up clause signer, treating clause as unsignable: {:#}", e);
+ 				return None;
+ 			},
+ 		};
+ 
+-		match clause {
+-			VtxoClause::DelayedSign(c) => Some(c.witness(&signature, control_block)),
+-			VtxoClause::DelayedTimelockSign(c) => Some(c.witness(&signature, &control_block)),
+-			VtxoClause::TimelockSign(c) => Some(c.witness(&signature, &control_block)),
+-			VtxoClause::HashDelaySign(c) => {
+-				let preimage = self.lightning_receive_preimage(c.hash.into())
+-					.await.ok().flatten();
+-
+-				preimage.map(|p| c.witness(
+-					&(signature, p.to_byte_array()), &control_block,
+-				))
+-			},
+-			VtxoClause::HashDelaySign_v0(c) => {
+-				let preimage = self.lightning_receive_preimage(c.hash.into())
+-					.await.ok().flatten();
+-
+-				preimage.map(|p| c.witness(
+-					&(signature, p.to_byte_array()), &control_block,
+-				))
++		match signer.sign_clause(self, clause, control_block, sighash).await {
++			Ok(witness) => witness,
++			Err(e) => {
++				error!("Failed to build clause witness: {:#}", e);
++				None
+ 			},
+-			VtxoClause::HashSign(_) => None, // Not used by bark
+-			VtxoClause::HashSign_v0(_) => None, // Not used by bark
+ 		}
+ 	}
+ }

@@ -15,7 +15,6 @@ use server_rpc::{protos, ServerConnection};
 use crate::{VtxoDelivery, Wallet, WalletVtxo};
 use crate::actions::DriveMode;
 use crate::actions::arkoor_send::{ArkoorSend, start_arkoor_send};
-use crate::sapio::{PreparedSignature, VtxoSigningKey};
 use crate::sapio::receive::is_coordinated_address;
 
 /// The result of creating an arkoor transaction
@@ -319,10 +318,10 @@ impl Wallet {
 			self.prepare_program_receives(address, &destination_candidates).await
 				.map_err(ArkoorCreateError::ProgramGuard)?;
 		}
-		let (keys, prepared, attestations) = self.prepare_arkoor_signatures(&builder).await
+		let (prepared, attestations) = self.prepare_arkoor_signatures(&builder).await
 			.map_err(ArkoorCreateError::ProgramGuard)?;
 		let nonces = prepared.iter()
-			.map(|group| group.iter().map(PreparedSignature::public_nonce).collect())
+			.map(|group| group.iter().map(|p| p.public_nonce()).collect())
 			.collect();
 		let builder = builder.with_external_nonces(nonces)
 			.context("invalid arkoor signing nonces")?;
@@ -340,7 +339,7 @@ impl Wallet {
 
 		builder.verify_cosign_response(&cosign_responses)
 			.context("invalid arkoor cosign response")?;
-		let signatures = self.finish_arkoor_signatures(&keys, prepared, cosign_responses).await
+		let signatures = self.finish_arkoor_signatures(prepared, cosign_responses).await
 			.map_err(ArkoorCreateError::ProgramGuard)?;
 		let vtxos = builder.finish_external(signatures)
 			.context("Failed to finalize arkoor vtxos")?.build_signed_vtxos();
@@ -363,13 +362,13 @@ impl Wallet {
 		&self,
 		builder: &ArkoorPackageBuilder<state::Initial>,
 	) -> anyhow::Result<(
-		Vec<VtxoSigningKey>, Vec<Vec<PreparedSignature>>, Vec<ArkoorCosignAttestation>,
+		Vec<Vec<Box<dyn crate::vtxo::PreparedVtxoSignature>>>,
+		Vec<ArkoorCosignAttestation>,
 	)> {
-		let mut keys = Vec::with_capacity(builder.builders.len());
 		let mut prepared = Vec::with_capacity(builder.builders.len());
 		let mut attestations = Vec::with_capacity(builder.builders.len());
 		for input_builder in &builder.builders {
-			let key = self.vtxo_signing_key(input_builder.input()).await?;
+			let key = self.vtxo_signer(input_builder.input()).await?;
 			let outputs = input_builder.all_outputs().collect::<Vec<_>>();
 			let ownership = OwnershipRequest {
 				input: input_builder.input().clone(),
@@ -377,19 +376,18 @@ impl Wallet {
 					outputs: outputs.iter().map(|output| (*output).clone()).collect(),
 				},
 			};
-			let signature = self.sign_vtxo_ownership(&key, ownership).await?;
+			let signature = key.sign_ownership(self, ownership).await?;
 			attestations.push(ArkoorCosignAttestation::from_signature(
 				input_builder.input(), &outputs, signature,
 			)?);
 			let contexts = input_builder.signing_inputs()?;
 			let mut group = Vec::with_capacity(contexts.len());
 			for context in contexts {
-				group.push(self.prepare_vtxo_signature(&key, context).await?);
+				group.push(key.prepare(self, context).await?);
 			}
-			keys.push(key);
 			prepared.push(group);
 		}
-		Ok((keys, prepared, attestations))
+		Ok((prepared, attestations))
 	}
 
 	/// Finish every child path before completing any original-input spend.
@@ -397,15 +395,14 @@ impl Wallet {
 	/// so completing only the input signature is not a recoverable package.
 	pub(crate) async fn finish_arkoor_signatures(
 		&self,
-		keys: &[VtxoSigningKey],
-		prepared: Vec<Vec<PreparedSignature>>,
+		prepared: Vec<Vec<Box<dyn crate::vtxo::PreparedVtxoSignature>>>,
 		response: ArkoorPackageCosignResponse,
 	) -> anyhow::Result<Vec<Vec<schnorr::Signature>>> {
-		ensure!(prepared.len() == keys.len() && response.responses.len() == keys.len(),
+		ensure!(prepared.len() == response.responses.len(),
 			"arkoor signing package count mismatch");
-		let mut roots = Vec::with_capacity(keys.len());
-		let mut signatures = Vec::with_capacity(keys.len());
-		for ((key, group), response) in keys.iter().zip(prepared).zip(response.responses) {
+		let mut roots = Vec::with_capacity(prepared.len());
+		let mut signatures = Vec::with_capacity(prepared.len());
+		for (group, response) in prepared.into_iter().zip(response.responses) {
 			ensure!(!group.is_empty()
 				&& group.len() == response.server_pub_nonces.len()
 				&& group.len() == response.server_partial_sigs.len(),
@@ -416,15 +413,15 @@ impl Wallet {
 			roots.push(group.next().context("missing arkoor input context")?);
 			let mut children = Vec::with_capacity(group.len() + 1);
 			for ((prepared, nonce), partial) in group {
-				children.push(prepared.finish(key, Some(nonce), Some(partial)).await?
+				children.push(prepared.finish(Some(nonce), Some(partial)).await?
 					.signature.context("incomplete arkoor child signature")?);
 			}
 			signatures.push(children);
 		}
-		for ((key, ((prepared, nonce), partial)), children) in keys.iter().zip(roots)
+		for (((prepared, nonce), partial), children) in roots.into_iter()
 			.zip(signatures.iter_mut())
 		{
-			let signature = prepared.finish(key, Some(nonce), Some(partial)).await?
+			let signature = prepared.finish(Some(nonce), Some(partial)).await?
 				.signature.context("incomplete arkoor input signature")?;
 			children.insert(0, signature);
 		}

@@ -10,6 +10,7 @@ pub mod recovery;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bitcoin::bip32::Xpub;
@@ -20,8 +21,6 @@ use ark::vtxo::VtxoRef;
 
 use crate::persist::models::{ProgramRecoveryTemplate, SerdeProgramKey};
 use crate::Wallet;
-
-pub(crate) use client::PreparedSignature;
 
 /// Complete policy and recovery construction for newly issued program keys.
 /// Obtain `root` from independently verified attestation of the expected image.
@@ -57,6 +56,7 @@ impl SapioConfig {
 
 /// A native key or the user's private participant in an immutable joint key.
 /// No conversion from a program handle to a native C keypair exists.
+#[derive(Clone)]
 pub(crate) struct VtxoSigningKey {
 	pub(super) user: Keypair,
 	public: PublicKey,
@@ -66,6 +66,46 @@ pub(crate) struct VtxoSigningKey {
 impl From<Keypair> for VtxoSigningKey {
 	fn from(user: Keypair) -> Self {
 		Self { public: user.public_key(), user, program: None }
+	}
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl crate::vtxo::VtxoKeySigner for VtxoSigningKey {
+	fn public_key(&self) -> PublicKey { self.public }
+
+	fn local_keypair(&self) -> Option<&Keypair> { self.local_keypair() }
+
+	async fn prepare(
+		&self,
+		wallet: &Wallet,
+		input: ark::musig::context::SigningInput,
+	) -> Result<Box<dyn crate::vtxo::PreparedVtxoSignature>> {
+		Ok(Box::new(wallet.prepare_vtxo_signature(self, input).await?))
+	}
+
+	async fn sign_ownership(
+		&self,
+		wallet: &Wallet,
+		request: ark::sapio::protocol::OwnershipRequest,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature> {
+		wallet.sign_vtxo_ownership(self, request).await
+	}
+
+	async fn sign_clause(
+		&self,
+		wallet: &Wallet,
+		clause: &ark::vtxo::VtxoClause,
+		control_block: &bitcoin::taproot::ControlBlock,
+		sighash: bitcoin::TapSighash,
+	) -> Result<Option<bitcoin::Witness>> {
+		let Some(keypair) = self.local_keypair() else {
+			// Program-backed live clause signing is handled by the saved
+			// recovery path; the generic interface returns "not signable"
+			// rather than silently signing with the wrong participant.
+			return Ok(None);
+		};
+		wallet.clause_witness_with_key(keypair, clause, control_block, sighash).await
 	}
 }
 
@@ -100,12 +140,39 @@ impl Wallet {
 		}
 	}
 
-	pub(crate) async fn vtxo_signing_key(&self, vtxo: impl VtxoRef) -> Result<VtxoSigningKey> {
+	/// Register an application-provided signer for a policy public key.
+	///
+	/// The signer is consulted before seed/program lookup, so a companion
+	/// crate can own keys whose secret material lives in a local co-signer.
+	pub fn register_vtxo_signer(&self, signer: Arc<dyn crate::vtxo::VtxoKeySigner>) {
+		self.inner.external_vtxo_signers.write()
+			.insert(signer.public_key(), signer);
+	}
+
+	pub(crate) async fn signer_for_pubkey(
+		&self,
+		public: &PublicKey,
+	) -> Result<Option<Arc<dyn crate::vtxo::VtxoKeySigner>>> {
+		if let Some(signer) = self.inner.external_vtxo_signers.read().get(public).cloned() {
+			return Ok(Some(signer));
+		}
+		Ok(self.signing_key(public).await?
+			.map(|key| Arc::new(key) as Arc<dyn crate::vtxo::VtxoKeySigner>))
+	}
+
+	/// Generic signer for a VTXO's policy key. Core signing paths use this;
+	/// Sapio-specific recovery preparation still resolves the concrete
+	/// descriptor through [Wallet::signing_key].
+	pub(crate) async fn vtxo_signer(
+		&self,
+		vtxo: impl VtxoRef,
+	) -> Result<Arc<dyn crate::vtxo::VtxoKeySigner>> {
 		let bare = match vtxo.as_bare_vtxo() {
 			Some(bare) => bare,
 			None => Cow::Owned(self.get_vtxo_by_id(vtxo.vtxo_id()).await?.vtxo),
 		};
-		self.signing_key(&bare.user_pubkey()).await?.context("VTXO ownership key not found")
+		self.signer_for_pubkey(&bare.user_pubkey()).await?
+			.context("VTXO ownership key not found")
 	}
 
 	pub(crate) async fn peek_signing_key(&self, index: u32) -> Result<VtxoSigningKey> {

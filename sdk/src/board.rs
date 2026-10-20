@@ -19,7 +19,7 @@ use crate::persist::models::{PendingBoard, recovery_action_key};
 use crate::onchain::OnchainWalletTrait;
 use crate::subsystem::{BoardMovement, Subsystem};
 use crate::sapio::VtxoSigningKey;
-use crate::vtxo::VtxoStateKind;
+use crate::vtxo::{VtxoKeySigner, VtxoStateKind};
 
 impl Wallet {
 	/// Board a [ark::Vtxo] with the given amount.
@@ -325,7 +325,7 @@ impl Wallet {
 			saved
 		} else {
 			self.prepare_program_recoveries(std::slice::from_ref(&candidate)).await?;
-			let prepared = self.prepare_vtxo_signature(&user_key, builder.signing_input()?).await?;
+			let prepared = user_key.prepare(self, builder.signing_input()?).await?;
 			let builder = builder.with_external_nonce(prepared.public_nonce())?;
 
 			let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
@@ -344,7 +344,7 @@ impl Wallet {
 			// The program and server shares are verified before the user's final
 			// contribution. Recovery preparation already saved the signed claim.
 			let signature = prepared.finish(
-				&user_key, Some(cosign_resp.pub_nonce), Some(cosign_resp.partial_signature),
+				Some(cosign_resp.pub_nonce), Some(cosign_resp.partial_signature),
 			).await?.signature.context("incomplete board signature")?;
 			builder.finish_external(signature)?
 		};
