@@ -881,12 +881,23 @@ impl Wallet {
 
 	/// Persist disclosure links before sending any forfeit share. The signed
 	/// replacement witness itself is authenticated against its native ancestry.
+	///
+	/// Every replacement output, native leaf or program-bound, must be locked
+	/// under the same unlock hash the input forfeits commit to. The server
+	/// earns the forfeit claim only by revealing that hash's preimage, and
+	/// the same preimage is the only way to unlock the replacement. This is
+	/// the last check before any forfeit share escapes, so it is enforced
+	/// even for native outputs that carry no program recovery record.
 	pub(crate) async fn preserve_hark_unlocks(
 		&self, outputs: &[Vtxo<Full>], inputs: &[Vtxo<Full>], hash: sha256::Hash,
 	) -> anyhow::Result<()> {
 		let disclosures = recovery_disclosures(inputs, hash)?;
 		let mut records = Vec::new();
 		for vtxo in outputs {
+			ensure!(vtxo.unlock_hash() == Some(hash),
+				"replacement VTXO {} is not locked under the forfeit unlock hash",
+				vtxo.id(),
+			);
 			let Some(mut record) = self.inner.db.get_program_recovery(vtxo.point()).await? else { continue; };
 			retain_unlock_witness(vtxo, &mut record);
 			let unlock = record.unlocks.iter_mut().find(|unlock| unlock.ancestor == vtxo.point().txid)
