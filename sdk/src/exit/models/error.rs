@@ -1,4 +1,4 @@
-use bitcoin::{Amount, Txid};
+use bitcoin::{Amount, FeeRate, Txid};
 use bitcoin::address::FromScriptError;
 use thiserror::Error;
 
@@ -96,6 +96,9 @@ pub enum ExitError {
 		status: ExitTxStatus,
 		error: String
 	},
+
+	#[error("Fee Rate Exceeds Ceiling: fee rate {rate} is above the sanity ceiling of {ceiling} applied to exit fee math")]
+	FeeRateExceedsCeiling { rate: FeeRate, ceiling: FeeRate },
 
 	#[error("Invalid Fee Margin: {margin} must be finite and non-negative and keep the fee in range")]
 	InvalidFeeMargin { margin: String },

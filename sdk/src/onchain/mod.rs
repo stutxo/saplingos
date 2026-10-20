@@ -24,6 +24,36 @@ pub use bdk_wallet;
 
 pub use bitcoin_ext::cpfp::{CpfpError, MakeCpfpFees};
 
+/// The largest share of rescued value a chain-backend-reported package fee may claim:
+/// a reported `current_package_fee` above one tenth of [cap_backend_package_fee]'s
+/// `value_at_stake` (bounded below by [MIN_CPFP_FEE_CAP]) is treated as fabricated.
+///
+/// `MakeCpfpFees::Rbf::current_package_fee` is the absolute fee floor a replacement CPFP
+/// child must pay. When it comes from `ChainSource::mempool_ancestor_info` it is
+/// unverified data from a configured but potentially adversarial chain backend: esplora
+/// sums raw JSON `fee` fields of claimed unconfirmed ancestors and bitcoind relays
+/// `getmempoolentry`, so either can invent a package fee of arbitrary size (the audited
+/// reproduction passed 99 BTC straight through to the signer's `fee_absolute`, bounded
+/// only by the wallet's entire confirmed balance).
+const MAX_CPFP_FEE_DIVISOR: u64 = 10;
+
+/// Floor for [cap_backend_package_fee]'s cap so that exits and program recoveries of
+/// near-dust value remain bumpable at ordinary fee rates.
+const MIN_CPFP_FEE_CAP: Amount = Amount::from_sat(10_000);
+
+/// Bounds a chain-backend-reported total package fee before it may become an RBF fee
+/// floor for a package rescuing `value_at_stake`.
+///
+/// Returns `Some(reported)` when the claim is plausible, and `None` — the caller must
+/// skip the bump, warning, and never sign — when it exceeds one tenth of the rescued
+/// value (see [MAX_CPFP_FEE_DIVISOR]), which honest mempool data cannot produce.
+pub(crate) fn cap_backend_package_fee(value_at_stake: Amount, reported: Amount) -> Option<Amount> {
+	let cap = Amount::from_sat(
+		(value_at_stake.to_sat() / MAX_CPFP_FEE_DIVISOR).max(MIN_CPFP_FEE_CAP.to_sat()),
+	);
+	if reported > cap { None } else { Some(reported) }
+}
+
 /// BDK-backed onchain wallet implementation.
 ///
 /// Available only when the `onchain-bdk` feature is enabled.
@@ -183,4 +213,38 @@ pub trait OnchainWalletTrait: std::any::Any + Send + Sync {
 
 	/// Persist the signed CPFP transaction so it can be rebroadcast or retrieved as needed.
 	async fn store_signed_p2a_cpfp(&mut self, tx: &Transaction) -> anyhow::Result<(), CpfpError>;
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn cap_backend_package_fee_rejects_implausible_claims() {
+		// Regression for a lying chain backend claiming a 99 BTC package fee; such a
+		// floor must never reach a signed CPFP child.
+		let one_btc = Amount::from_sat(100_000_000);
+		assert_eq!(cap_backend_package_fee(one_btc, Amount::from_sat(99_000_000_000)), None);
+		// Even just above the cap (one tenth of the rescued value) is refused.
+		assert_eq!(cap_backend_package_fee(one_btc, Amount::from_sat(10_000_001)), None);
+	}
+
+	#[test]
+	fn cap_backend_package_fee_passes_plausible_claims() {
+		let one_btc = Amount::from_sat(100_000_000);
+		// Sane package fees pass through bit-for-bit.
+		let sane = Amount::from_sat(5_000);
+		assert_eq!(cap_backend_package_fee(one_btc, sane), Some(sane));
+		// Boundary: exactly one tenth of the rescued value stays permissible.
+		assert_eq!(cap_backend_package_fee(one_btc, one_btc / 10), Some(one_btc / 10));
+	}
+
+	#[test]
+	fn cap_backend_package_fee_floors_near_dust_rescues() {
+		// The 10k-sat floor keeps near-dust exits/recoveries bumpable at ordinary rates.
+		let dust = Amount::from_sat(5_000);
+		let floor = Amount::from_sat(10_000);
+		assert_eq!(cap_backend_package_fee(dust, floor), Some(floor));
+		assert_eq!(cap_backend_package_fee(dust, floor + Amount::from_sat(1)), None);
+	}
 }

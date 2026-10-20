@@ -24,7 +24,6 @@ use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::vtxo::Full;
-use ark::vtxo::policy::signing::VtxoSigner;
 use server_rpc::{protos, MAX_NB_MAILBOX_RECOVERY_IDS};
 use server_rpc::protos::mailbox_server::MailboxMessage;
 
@@ -36,6 +35,7 @@ use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
 use crate::sapio::recovery::{verify_program_recovery, verify_program_recovery_template};
+use crate::vtxo::VtxoValidationError;
 
 
 /// The maximum number of times we will call the fetch mailbox endpoint in one go
@@ -48,6 +48,30 @@ use crate::sapio::recovery::{verify_program_recovery, verify_program_recovery_te
 /// (Note that currently the server sends 100 messages per fetch, so this would
 /// only happen for users with more than 1000 pending items.)
 pub(crate) const MAX_MAILBOX_REQUEST_BURST: usize = 10;
+
+/// Number of low bits in a server mailbox checkpoint that hold a
+/// per-millisecond counter; the upper bits are milliseconds since the Unix
+/// epoch.
+///
+/// The checkpoint shape is defined by the server: captaind's migrations
+/// V21/V37 build `next_checkpoint()` as `(unix_ms << 20) | per_ms_counter`,
+/// i.e. one global, time-shifted sequence — the "strictly ascending time
+/// based number" of mailbox_server.proto. Two stamps taken a millisecond
+/// apart already differ by 2^20, and a fresh wallet's first claim lands at
+/// roughly time-now-shifted (~1.9e18) while its cursor is still 0, so no
+/// fixed count-based advance bound can ever work against an honest server;
+/// plausibility can only be judged against wall time.
+pub(crate) const MAILBOX_CHECKPOINT_COUNTER_BITS: u32 = 20;
+
+/// How far into the future a server-claimed checkpoint may be timestamped
+/// before we refuse to persist it.
+///
+/// 24h absorbs clock drift and timezone misconfiguration on either side
+/// while still rejecting far-future poison values (e.g. `u64::MAX - 7`),
+/// which would black out every later message: all fetches request messages
+/// strictly after the stored checkpoint.
+pub(crate) const MAX_MAILBOX_CHECKPOINT_FUTURE_SKEW: std::time::Duration =
+	std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -111,6 +135,80 @@ fn check_arkoor_receive_policy(
 		bail!("VTXO commits to a foreign server pubkey {}", vtxo.server_pubkey());
 	}
 	Ok(())
+}
+
+/// Classify the outcome of [`Wallet::validate_vtxo`] for the arkoor-receive
+/// path: `Ok(None)` for a valid VTXO, `Ok(Some(_))` for a provably invalid
+/// one that must be absorbed and skipped, and `Err(_)` for a transient or
+/// environmental failure, which must abort the whole message so its
+/// checkpoint is not advanced and the server redelivers it.
+///
+/// Without this split, every validation failure was absorbed as if the
+/// VTXO were provably invalid, while the checkpoint still advanced: a
+/// chain-backend hiccup or an anchor the backend had not indexed yet
+/// permanently dropped a genuine incoming payment.
+///
+/// The match must stay exhaustive: any new [VtxoValidationError] variant
+/// forces a deliberate absorb-vs-abort decision here.
+fn classify_arkoor_validation(
+	result: Result<(), VtxoValidationError>,
+) -> anyhow::Result<Option<ark::vtxo::VtxoValidationError>> {
+	match result {
+		Ok(()) => Ok(None),
+		// Transient/environmental: not a property of the VTXO bytes.
+		Err(VtxoValidationError::Chain(e)) => Err(e.context(
+			"chain backend error vetting received arkoor VTXO; will retry on redelivery",
+		)),
+		Err(VtxoValidationError::AnchorNotFound) => Err(anyhow!(
+			"chain anchor of received arkoor VTXO not visible to the backend yet; \
+				will retry on redelivery",
+		)),
+		// Deterministic rejection: retrying can never credit these bytes.
+		Err(VtxoValidationError::Invalid(e)) => Ok(Some(e)),
+	}
+}
+
+/// Whether a vetted server-claimed checkpoint should be persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointVerdict {
+	/// The claim advances the cursor and is within the plausibility bound.
+	Advance,
+	/// The stored cursor already covers this message, e.g. a racing
+	/// consumer of the same wallet (sync and subscription run in parallel)
+	/// advanced the cursor past it after this one started processing. Its
+	/// position is durably covered, so there is nothing to persist.
+	AlreadyCovered,
+}
+
+/// Vet a server-claimed mailbox checkpoint against the freshly read cursor
+/// before it becomes the durable fetch position.
+///
+/// The claimed value is server-controlled input. Rejecting claims whose
+/// embedded timestamp (see [MAILBOX_CHECKPOINT_COUNTER_BITS]) lies
+/// implausibly far in the future (see [MAX_MAILBOX_CHECKPOINT_FUTURE_SKEW])
+/// keeps one `MailboxMessage{checkpoint: huge, arkoor vtxos: []}` — fully
+/// valid, unrefusable content — from poisoning the cursor and blacking out
+/// every later message. Claims at or below the cursor are not errors: the
+/// position is already covered (see [CheckpointVerdict::AlreadyCovered]),
+/// and the persisters independently refuse non-increasing stores.
+fn vet_server_checkpoint(
+	current: u64,
+	claimed: u64,
+) -> anyhow::Result<CheckpointVerdict> {
+	if claimed <= current {
+		return Ok(CheckpointVerdict::AlreadyCovered);
+	}
+	let claimed_ms = claimed >> MAILBOX_CHECKPOINT_COUNTER_BITS;
+	let limit_ms = chrono::Local::now().timestamp_millis() as u64
+		+ MAX_MAILBOX_CHECKPOINT_FUTURE_SKEW.as_millis() as u64;
+	anyhow::ensure!(
+		claimed_ms <= limit_ms,
+		"server-claimed mailbox checkpoint {claimed} is timestamped {} ms in the \
+			future, beyond the allowed skew; refusing to persist a cursor the wallet \
+			would never fetch past",
+		claimed_ms.saturating_sub(limit_ms),
+	);
+	Ok(CheckpointVerdict::Advance)
 }
 
 impl Wallet {
@@ -245,20 +343,34 @@ impl Wallet {
 								// healthy, so stop counting reconnects as failures.
 								reconnect_count = 0;
 								let Some(wallet) = upgrade() else { return Ok(()) };
-								if wallet.process_mailbox_message(message).await.is_break() {
-									// A message failed without advancing its
-									// checkpoint. Stop consuming this stream and
-									// resubscribe from the unadvanced checkpoint
-									// so it's redelivered before a later message
-									// can bury it. We deliberately do NOT reset
-									// the backoff here: if the same message keeps
-									// failing, the growing delay keeps this from
-									// becoming a tight redeliver loop.
-									trace!("Halting mailbox stream after unadvanced message; resubscribing");
-									break 'stream;
+								match wallet.process_mailbox_message(message).await {
+									Ok(ControlFlow::Break(())) => {
+										// A message failed without advancing its
+										// checkpoint. Stop consuming this stream and
+										// resubscribe from the unadvanced checkpoint
+										// so it's redelivered before a later message
+										// can bury it. We deliberately do NOT reset
+										// the backoff here: if the same message keeps
+										// failing, the growing delay keeps this from
+										// becoming a tight redeliver loop.
+										trace!("Halting mailbox stream after unadvanced message; resubscribing");
+										break 'stream;
+									},
+									Err(e) => {
+										// The message's checkpoint could not be
+										// safely persisted (store failure or an
+										// implausible server-claimed value). The
+										// cursor was NOT advanced, so treat it
+										// like the unadvanced case above and
+										// resubscribe, keeping the backoff.
+										error!("Halting mailbox stream after unadvanced message: {:#}", e);
+										break 'stream;
+									},
+									Ok(ControlFlow::Continue(())) => {
+										// Progress made: reconnect promptly next time.
+										backoff.reset();
+									},
 								}
-								// Progress made: reconnect promptly next time.
-								backoff.reset();
 							},
 							// A tonic h2 stream reset is almost always a
 							// proxy- or server-side idle timeout rather than
@@ -328,11 +440,12 @@ impl Wallet {
 			debug!("Ark server has {} mailbox messages for us", mailbox_resp.messages.len());
 
 			for mailbox_msg in mailbox_resp.messages {
-				if self.process_mailbox_message(mailbox_msg).await.is_break() {
+				match self.process_mailbox_message(mailbox_msg).await? {
+					ControlFlow::Continue(()) => {},
 					// A message failed without advancing its checkpoint. Stop
 					// so we don't advance past it; the next sync retries from
 					// the same checkpoint.
-					return Ok(());
+					ControlFlow::Break(()) => return Ok(()),
 				}
 			}
 
@@ -372,7 +485,16 @@ impl Wallet {
 			};
 
 			let program = self.inner.db.get_program_key(&vtxo.user_pubkey()).await?;
-			if let Err(e) = self.validate_vtxo(&vtxo).await {
+			// Only deterministic rejections are absorbed; a transient
+			// failure (chain backend error, anchor not yet indexed) aborts
+			// here, leaving this message's checkpoint unadvanced so the
+			// server redelivers it — like the require_server()/tip()
+			// prologue above. Absorbing a transient failure would
+			// permanently drop a genuine payment while advancing the
+			// checkpoint past it.
+			let invalid = classify_arkoor_validation(self.validate_vtxo(&vtxo).await)
+				.with_context(|| format!("cannot vet received arkoor VTXO {}", vtxo.id()))?;
+			if let Some(e) = invalid {
 				if program.is_some() {
 					self.quarantine_program_receive(&vtxo, bytes, "invalid or unverifiable program deposit").await?;
 					continue;
@@ -405,7 +527,7 @@ impl Wallet {
 					self.quarantine_program_receive(&vtxo, bytes, "program deposit recovery is not ready").await?;
 					continue;
 				}
-			} else if self.find_signable_clause(&vtxo).await.is_none() {
+			} else if self.find_signable_clause_strict(&vtxo).await?.is_none() {
 				error!("Refusing received arkoor VTXO {}: not owned by this wallet", vtxo.id());
 				invalid_vtxos.push(bytes);
 				continue;
@@ -438,10 +560,18 @@ impl Wallet {
 	/// checkpoints are monotonic, the caller must stop before a later message
 	/// stores a higher checkpoint and buries the unprocessed one; the next
 	/// sync/resubscribe re-fetches from the unadvanced checkpoint and retries.
+	///
+	/// # Errors
+	///
+	/// The server-claimed checkpoint is vetted and persisted only after the
+	/// message was processed; a vetting rejection or a store failure is
+	/// returned as an error with the cursor left unchanged, so processing
+	/// halts and the message can be redelivered instead of silently
+	/// advancing past a cursor that was never durably written.
 	pub(crate) async fn process_mailbox_message(
 		&self,
 		mailbox_msg: MailboxMessage,
-	) -> ControlFlow<()> {
+	) -> anyhow::Result<ControlFlow<()>> {
 		use protos::mailbox_server::mailbox_message::Message;
 
 		// Each arm returns whether the checkpoint should advance. Arkoor
@@ -483,7 +613,7 @@ impl Wallet {
 				true
 			}
 			Some(Message::LightningSendFinished(msg)) => {
-				if let Err(e) = self.handle_lightning_send_finished(msg, mailbox_msg.checkpoint).await {
+				if let Err(e) = self.handle_lightning_send_finished(msg).await {
 					error!("Error handling lightning send finished notification: {:#}", e);
 				}
 				true
@@ -496,16 +626,36 @@ impl Wallet {
 		};
 
 		if advance {
-			if let Err(e) = self.store_mailbox_checkpoint(mailbox_msg.checkpoint).await {
-				error!("Error storing mailbox checkpoint: {:#}", e);
-			}
-			ControlFlow::Continue(())
+			self.advance_mailbox_checkpoint(mailbox_msg.checkpoint).await?;
+			Ok(ControlFlow::Continue(()))
 		} else {
 			// The message didn't process and its checkpoint wasn't
 			// advanced. Stop here so a later message can't store a higher
 			// checkpoint and bury it.
-			ControlFlow::Break(())
+			Ok(ControlFlow::Break(()))
 		}
+	}
+
+	/// Vet the server-claimed checkpoint of a processed message and persist
+	/// it as the new durable cursor.
+	///
+	/// The claim is server-controlled input: it is checked against the
+	/// freshly read cursor (see [vet_server_checkpoint]) before anything is
+	/// written, and read/store failures propagate so the caller halts with
+	/// the cursor unchanged instead of logging and continuing past a cursor
+	/// that was never durably written.
+	async fn advance_mailbox_checkpoint(&self, claimed: u64) -> anyhow::Result<()> {
+		let current = self.get_mailbox_checkpoint().await
+			.context("failed to read mailbox checkpoint")?;
+		match vet_server_checkpoint(current, claimed)? {
+			CheckpointVerdict::Advance => {
+				self.store_mailbox_checkpoint(claimed).await?;
+			},
+			CheckpointVerdict::AlreadyCovered => {
+				trace!("Mailbox checkpoint {} already covered by stored cursor {}", claimed, current);
+			},
+		}
+		Ok(())
 	}
 
 	async fn process_received_arkoor_package(
@@ -679,10 +829,13 @@ impl Wallet {
 	///
 	/// This notification indicates that the server has completed processing
 	/// a lightning payment we initiated, either successfully or with failure.
+	///
+	/// The mailbox checkpoint is vetted and advanced by the caller; handler
+	/// errors are logged but never propagated, because re-processing the
+	/// same notification on the next poll is worse than dropping it.
 	async fn handle_lightning_send_finished(
 		&self,
 		notif: protos::mailbox_server::LightningSendFinishedMessage,
-		checkpoint: u64,
 	) -> anyhow::Result<()> {
 		let payment_hash = PaymentHash::try_from(notif.payment_hash)
 			.context("invalid payment hash in lightning send finished notification")?;
@@ -696,8 +849,8 @@ impl Wallet {
 			debug!("Lightning send finished notification (failed): payment_hash={}", payment_hash);
 		}
 
-		// Errors are logged but not propagated: we always advance the
-		// mailbox checkpoint to avoid re-processing the same
+		// Errors are logged but not propagated: the caller always advances
+		// the mailbox checkpoint to avoid re-processing the same
 		// notification on the next poll.
 		match self.is_invoice_paid(payment_hash).await {
 			Ok(true) => {
@@ -737,7 +890,6 @@ impl Wallet {
 			},
 		}
 
-		self.store_mailbox_checkpoint(checkpoint).await?;
 		Ok(())
 	}
 
@@ -816,6 +968,86 @@ mod test {
 			.unwrap().public_key();
 		check_arkoor_receive_policy(good, foreign_server)
 			.expect_err("a vtxo for a foreign server must be refused");
+	}
+
+	/// Arkoor-receive validation failures split into absorbed deterministic
+	/// rejections and abort-the-message transient ones. Only the abort side
+	/// is safe to leave the mailbox checkpoint unadvanced; absorbing a
+	/// transient failure would advance the checkpoint past a genuine
+	/// payment that was never credited.
+	#[test]
+	fn arkoor_validation_classification() {
+		use crate::vtxo::VtxoValidationError as E;
+
+		// Valid stays valid.
+		assert!(classify_arkoor_validation(Ok(()))
+			.expect("valid").is_none(), "a valid VTXO yields nothing to absorb");
+
+		// A provably invalid VTXO is absorbed (Ok(Some)): retrying can't
+		// fix bad bytes.
+		let absorbed = classify_arkoor_validation(Err(E::Invalid(
+			ark::vtxo::VtxoValidationError::Invalid("bad genesis signature"),
+		))).expect("a deterministic rejection must be absorbable");
+		assert!(absorbed.is_some());
+
+		// A chain-backend error is transient: bubble it out so processing
+		// aborts and the checkpoint is left unchanged.
+		classify_arkoor_validation(Err(E::Chain(anyhow::anyhow!("backend 503"))))
+			.expect_err("a chain backend error must abort, not be absorbed");
+
+		// An anchor the backend has not indexed yet is transient for the
+		// same reason.
+		classify_arkoor_validation(Err(E::AnchorNotFound))
+			.expect_err("a missing anchor must abort, not be absorbed");
+	}
+
+	/// The server-stamped checkpoint is untrusted input: persist only
+	/// advances whose embedded timestamp is plausible (captaind stamps
+	/// checkpoints as `(unix_ms << 20) | per_ms_counter`), and never rewind.
+	#[test]
+	fn server_checkpoint_vetting() {
+		let shift = |ms: u64, counter: u64| (ms << MAILBOX_CHECKPOINT_COUNTER_BITS) | counter;
+		let now_ms = chrono::Local::now().timestamp_millis() as u64;
+
+		// A fresh wallet's cursor is 0 while the first honest claim is
+		// time-now-shifted (~1.9e18): that jump over the cursor must pass.
+		assert_eq!(
+			vet_server_checkpoint(0, shift(now_ms, 0)).unwrap(),
+			CheckpointVerdict::Advance,
+		);
+
+		// Two stamps a millisecond apart differ by 2^20 and both must
+		// advance over the previous one.
+		let first = shift(now_ms, 3);
+		let second = shift(now_ms + 1, 0);
+		assert!(second > first);
+		assert_eq!(
+			vet_server_checkpoint(first, second).unwrap(),
+			CheckpointVerdict::Advance,
+		);
+
+		// A stamp slightly ahead of local time (clock skew both sides) is
+		// accepted.
+		assert_eq!(
+			vet_server_checkpoint(0, shift(now_ms + 60_000, 7)).unwrap(),
+			CheckpointVerdict::Advance,
+		);
+
+		// Far-future claims are refused as a server protocol violation,
+		// including the u64-range poison values from the attack scenario.
+		assert!(vet_server_checkpoint(first, u64::MAX - 7).is_err());
+		assert!(vet_server_checkpoint(0, shift(now_ms, 0).wrapping_mul(2)).is_err());
+		assert!(
+			vet_server_checkpoint(0, shift(now_ms + 2 * 24 * 60 * 60 * 1000, 0)).is_err(),
+			"a claim two days ahead exceeds the allowed skew",
+		);
+
+		// Equal or lower claims are already covered by the stored cursor
+		// (a racing consumer stored them first): nothing to persist, no
+		// error, and no rewind — also at the numeric edge.
+		assert_eq!(vet_server_checkpoint(second, second).unwrap(), CheckpointVerdict::AlreadyCovered);
+		assert_eq!(vet_server_checkpoint(second, first).unwrap(), CheckpointVerdict::AlreadyCovered);
+		assert_eq!(vet_server_checkpoint(u64::MAX, u64::MAX).unwrap(), CheckpointVerdict::AlreadyCovered);
 	}
 
 	/// A forged package of repeated maximum-value VTXOs must be rejected with
