@@ -1,0 +1,889 @@
+
+use std::borrow::Borrow;
+use std::convert::TryFrom;
+use std::time::Duration;
+
+use bitcoin::hashes::sha256;
+use bitcoin::secp256k1::{schnorr, PublicKey};
+use bitcoin::{self, Amount, FeeRate, OutPoint, ScriptBuf, Transaction, Txid};
+
+use ark::{musig, ProtocolEncoding, SignedVtxoRequest, Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
+use ark::vtxo::policy::check_block_delta;
+use ark::arkoor::{ArkoorCosignRequest, ArkoorCosignResponse, ArkoorDestination};
+use ark::arkoor::package::{ArkoorPackageCosignRequest, ArkoorPackageCosignResponse};
+use ark::attestations::{
+	ArkoorCosignAttestation, DelegatedRoundParticipationAttestation, LightningReceiveAttestation, OffboardRequestAttestation, RoundAttemptAttestation, VtxoStatusAttestation
+};
+use ark::board::BoardCosignResponse;
+use ark::fees::PpmFeeRate;
+use ark::forfeit::HashLockedForfeitBundle;
+use ark::lightning::{PaymentHash, Preimage};
+use ark::mailbox::BlindedMailboxIdentifier;
+use ark::offboard::OffboardRequest;
+use ark::rounds::{Challenge, RoundId};
+use ark::tree::signed::{LeafVtxoCosignRequest, LeafVtxoCosignResponse, VtxoTreeSpec};
+use ark::vtxo::{Bare, Full, VtxoRef};
+
+use crate::protos;
+
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("rpc conversion error: {msg}")]
+pub struct ConvertError {
+	pub msg: &'static str,
+}
+
+impl From<&'static str> for ConvertError {
+	fn from(msg: &'static str) -> ConvertError {
+		ConvertError { msg }
+	}
+}
+
+impl From<ConvertError> for tonic::Status {
+	fn from(e: ConvertError) -> Self {
+		tonic::Status::invalid_argument(e.msg)
+	}
+}
+
+/// Trait to convert some types from byte slices.
+pub trait TryFromBytes: Sized {
+	fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError>;
+}
+
+macro_rules! impl_try_from_byte_array {
+	($ty:path, $exp:expr) => {
+		impl TryFromBytes for $ty {
+			fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError> {
+				#[allow(unused)]
+				use bitcoin::hashes::Hash;
+
+				let array = TryFrom::try_from(b.as_ref())
+					.map_err(|_| concat!("invalid ", $exp))?;
+				Ok(<$ty>::from_byte_array(array))
+			}
+		}
+	};
+}
+impl_try_from_byte_array!(PaymentHash, "lightning payment hash");
+impl_try_from_byte_array!(Preimage, "lightning payment preimage");
+impl_try_from_byte_array!(sha256::Hash, "SHA-256 hash");
+impl_try_from_byte_array!(Txid, "transaction id");
+
+macro_rules! impl_try_from_byte_array_result {
+	($ty:path, $exp:expr) => {
+		impl TryFromBytes for $ty {
+			fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError> {
+				Ok(TryFrom::try_from(b.as_ref()).ok()
+					.and_then(|b| <$ty>::from_byte_array(b).ok())
+					.ok_or(concat!("invalid ", $exp))?)
+			}
+		}
+	};
+}
+impl_try_from_byte_array_result!(musig::PublicNonce, "public musig nonce");
+impl_try_from_byte_array_result!(musig::PartialSignature, "partial musig signature");
+impl_try_from_byte_array_result!(musig::AggregatedNonce, "aggregated musig nonce");
+
+macro_rules! impl_try_from_byte_slice {
+	($ty:path, $exp:expr) => {
+		impl TryFromBytes for $ty {
+			fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError> {
+				#[allow(unused)] // used for the impls of hash types
+				use bitcoin::hashes::Hash;
+
+				Ok(<$ty>::from_slice(b.as_ref()).map_err(|_| concat!("invalid ", $exp))?)
+			}
+		}
+	};
+}
+impl_try_from_byte_slice!(PublicKey, "public key");
+impl_try_from_byte_slice!(schnorr::Signature, "Schnorr signature");
+impl_try_from_byte_slice!(VtxoId, "VTXO ID");
+impl_try_from_byte_slice!(RoundId, "VTXO ID");
+
+macro_rules! impl_try_from_bytes_protocol {
+	($ty:path, $exp:expr) => {
+		impl TryFromBytes for $ty {
+			fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError> {
+				Ok(ProtocolEncoding::deserialize(b.as_ref())
+					.map_err(|_| concat!("invalid ", $exp))?)
+			}
+		}
+	};
+}
+impl_try_from_bytes_protocol!(OutPoint, "outpoint");
+impl_try_from_bytes_protocol!(Vtxo<Bare>, "bare VTXO");
+impl_try_from_bytes_protocol!(Vtxo<Full>, "full VTXO (with genesis)");
+impl_try_from_bytes_protocol!(VtxoPolicy, "VTXO policy");
+impl_try_from_bytes_protocol!(BlindedMailboxIdentifier, "a blinded VTXO mailbox identifier");
+impl_try_from_bytes_protocol!(HashLockedForfeitBundle, "hArk forfeit bundle");
+impl_try_from_bytes_protocol!(RoundAttemptAttestation, "round attempt attestation");
+impl_try_from_bytes_protocol!(DelegatedRoundParticipationAttestation,
+	"delegated round participation attestation"
+);
+impl_try_from_bytes_protocol!(LightningReceiveAttestation, "lightning receive attestation");
+impl_try_from_bytes_protocol!(VtxoStatusAttestation, "VTXO status attestation");
+impl_try_from_bytes_protocol!(OffboardRequestAttestation, "offboard request attestation");
+
+macro_rules! impl_try_from_bytes_bitcoin {
+	($ty:path, $exp:expr) => {
+		impl TryFromBytes for $ty {
+			fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError> {
+				Ok(bitcoin::consensus::encode::deserialize(b.as_ref())
+					.map_err(|_| concat!("invalid ", $exp))?)
+			}
+		}
+	};
+}
+impl_try_from_bytes_bitcoin!(Transaction, "bitcoin transaction");
+
+
+impl From<ark::ArkInfo> for protos::ArkInfo {
+	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
+	fn from(v: ark::ArkInfo) -> Self {
+		protos::ArkInfo {
+			network: v.network.to_string(),
+			server_pubkey: v.server_pubkey.serialize().to_vec(),
+			mailbox_pubkey: v.mailbox_pubkey.serialize().to_vec(),
+			round_interval_secs: v.round_interval.as_secs() as u32,
+			nb_round_nonces: v.nb_round_nonces as u32,
+			vtxo_exit_delta: v.vtxo_exit_delta.into(),
+			vtxo_lifetime: v.vtxo_lifetime.into(),
+			// we serve the deprecated field from the new one so that it
+			// can never go stale for old clients
+			vtxo_expiry_delta: v.vtxo_lifetime.into(),
+			htlc_send_expiry_delta: v.htlc_send_expiry_delta.into(),
+			htlc_expiry_delta: v.htlc_expiry_delta.into(),
+			max_vtxo_amount: v.max_vtxo_amount.map(|v| v.to_sat()),
+			required_board_confirmations: v.required_board_confirmations as u32,
+			max_user_invoice_cltv_delta: v.max_user_invoice_cltv_delta.into(),
+			min_board_amount: v.min_board_amount.to_sat(),
+			offboard_feerate_sat_vkb: v.offboard_feerate.to_sat_per_kwu() * 4,
+			max_offboard_inputs: v.max_offboard_inputs as u32,
+			ln_receive_anti_dos_required: v.ln_receive_anti_dos_required,
+			fees: Some(v.fees.into()),
+			max_vtxo_exit_depth: v.max_vtxo_exit_depth as u32,
+			tos_link: v.tos_link,
+		}
+	}
+}
+
+impl TryFrom<protos::ArkInfo> for ark::ArkInfo {
+	type Error = ConvertError;
+	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
+	fn try_from(v: protos::ArkInfo) -> Result<Self, Self::Error> {
+		// Servers from before the rename only set vtxo_expiry_delta.
+		let vtxo_lifetime = check_block_delta(match v.vtxo_lifetime {
+			0 => v.vtxo_expiry_delta,
+			l => l,
+		}).map_err(|_| "invalid vtxo_lifetime")?;
+
+		Ok(ark::ArkInfo {
+			network: v.network.parse().map_err(|_| "invalid network")?,
+			server_pubkey: PublicKey::from_slice(&v.server_pubkey)
+				.map_err(|_| "invalid server pubkey")?,
+			mailbox_pubkey: PublicKey::from_slice(&v.mailbox_pubkey)
+				.map_err(|_| "invalid mailbox pubkey")?,
+			round_interval: Duration::from_secs(v.round_interval_secs as u64),
+			nb_round_nonces: v.nb_round_nonces as usize,
+			vtxo_exit_delta: check_block_delta(v.vtxo_exit_delta)
+				.map_err(|_| "invalid vtxo_exit_delta")?,
+			vtxo_lifetime,
+			vtxo_expiry_delta: vtxo_lifetime,
+			htlc_send_expiry_delta: check_block_delta(v.htlc_send_expiry_delta)
+				.map_err(|_| "invalid htlc_send_expiry_delta")?,
+			htlc_expiry_delta: check_block_delta(v.htlc_expiry_delta)
+				.map_err(|_| "invalid htlc_expiry_delta")?,
+			max_vtxo_amount: v.max_vtxo_amount.map(|v| Amount::from_sat(v)),
+			required_board_confirmations: check_block_delta(v.required_board_confirmations)
+				.map_err(|_| "invalid required_board_confirmations")?.to_u16() as usize,
+			max_user_invoice_cltv_delta: check_block_delta(v.max_user_invoice_cltv_delta)
+				.map_err(|_| "invalid max_user_invoice_cltv_delta")?,
+			min_board_amount: Amount::from_sat(v.min_board_amount),
+			offboard_feerate: FeeRate::from_sat_per_kwu(v.offboard_feerate_sat_vkb / 4),
+			max_offboard_inputs: v.max_offboard_inputs as usize,
+			ln_receive_anti_dos_required: v.ln_receive_anti_dos_required,
+			fees: v.fees.ok_or("missing fees")?.try_into()?,
+			max_vtxo_exit_depth: v.max_vtxo_exit_depth.try_into()
+				.map_err(|_| "invalid max_vtxo_exit_depth")?,
+			tos_link: v.tos_link,
+		})
+	}
+}
+
+impl From<ark::fees::PpmExpiryFeeEntry> for protos::PpmExpiryFeeEntry {
+	fn from(v: ark::fees::PpmExpiryFeeEntry) -> Self {
+		protos::PpmExpiryFeeEntry {
+			expiry_blocks_threshold: v.expiry_blocks_threshold,
+			ppm: v.ppm.0,
+		}
+	}
+}
+
+impl From<protos::PpmExpiryFeeEntry> for ark::fees::PpmExpiryFeeEntry {
+	fn from(v: protos::PpmExpiryFeeEntry) -> Self {
+		ark::fees::PpmExpiryFeeEntry {
+			expiry_blocks_threshold: v.expiry_blocks_threshold,
+			ppm: PpmFeeRate(v.ppm),
+		}
+	}
+}
+
+impl From<ark::fees::BoardFees> for protos::BoardFees {
+	fn from(v: ark::fees::BoardFees) -> Self {
+		protos::BoardFees {
+			min_fee_sat: v.min_fee.to_sat(),
+			base_fee_sat: v.base_fee.to_sat(),
+			ppm: v.ppm.0,
+		}
+	}
+}
+
+impl From<protos::BoardFees> for ark::fees::BoardFees {
+	fn from(v: protos::BoardFees) -> Self {
+		ark::fees::BoardFees {
+			min_fee: Amount::from_sat(v.min_fee_sat),
+			base_fee: Amount::from_sat(v.base_fee_sat),
+			ppm: PpmFeeRate(v.ppm),
+		}
+	}
+}
+
+impl From<ark::fees::OffboardFees> for protos::OffboardFees {
+	fn from(v: ark::fees::OffboardFees) -> Self {
+		protos::OffboardFees {
+			base_fee_sat: v.base_fee.to_sat(),
+			fixed_additional_vb: v.fixed_additional_vb,
+			ppm_expiry_table: v.ppm_expiry_table.into_iter().map(Into::into).collect(),
+		}
+	}
+}
+
+impl From<protos::OffboardFees> for ark::fees::OffboardFees {
+	fn from(v: protos::OffboardFees) -> Self {
+		ark::fees::OffboardFees {
+			base_fee: Amount::from_sat(v.base_fee_sat),
+			fixed_additional_vb: v.fixed_additional_vb,
+			ppm_expiry_table: v.ppm_expiry_table.into_iter().map(Into::into).collect(),
+		}
+	}
+}
+
+impl From<ark::fees::RefreshFees> for protos::RefreshFees {
+	fn from(v: ark::fees::RefreshFees) -> Self {
+		protos::RefreshFees {
+			base_fee_sat: v.base_fee.to_sat(),
+			ppm_expiry_table: v.ppm_expiry_table.into_iter().map(Into::into).collect(),
+		}
+	}
+}
+
+impl From<protos::RefreshFees> for ark::fees::RefreshFees {
+	fn from(v: protos::RefreshFees) -> Self {
+		ark::fees::RefreshFees {
+			base_fee: Amount::from_sat(v.base_fee_sat),
+			ppm_expiry_table: v.ppm_expiry_table.into_iter().map(Into::into).collect(),
+		}
+	}
+}
+
+impl From<ark::fees::LightningReceiveFees> for protos::LightningReceiveFees {
+	fn from(v: ark::fees::LightningReceiveFees) -> Self {
+		protos::LightningReceiveFees {
+			base_fee_sat: v.base_fee.to_sat(),
+			ppm: v.ppm.0,
+		}
+	}
+}
+
+impl From<protos::LightningReceiveFees> for ark::fees::LightningReceiveFees {
+	fn from(v: protos::LightningReceiveFees) -> Self {
+		ark::fees::LightningReceiveFees {
+			base_fee: Amount::from_sat(v.base_fee_sat),
+			ppm: PpmFeeRate(v.ppm),
+		}
+	}
+}
+
+impl From<ark::fees::LightningSendFees> for protos::LightningSendFees {
+	fn from(v: ark::fees::LightningSendFees) -> Self {
+		protos::LightningSendFees {
+			min_fee_sat: v.min_fee.to_sat(),
+			base_fee_sat: v.base_fee.to_sat(),
+			ppm_expiry_table: v.ppm_expiry_table.into_iter().map(Into::into).collect(),
+		}
+	}
+}
+
+impl From<protos::LightningSendFees> for ark::fees::LightningSendFees {
+	fn from(v: protos::LightningSendFees) -> Self {
+		ark::fees::LightningSendFees {
+			min_fee: Amount::from_sat(v.min_fee_sat),
+			base_fee: Amount::from_sat(v.base_fee_sat),
+			ppm_expiry_table: v.ppm_expiry_table.into_iter().map(Into::into).collect(),
+		}
+	}
+}
+
+impl From<ark::fees::FeeSchedule> for protos::FeeSchedule {
+	fn from(v: ark::fees::FeeSchedule) -> Self {
+		protos::FeeSchedule {
+			board: Some(v.board.into()),
+			offboard: Some(v.offboard.into()),
+			refresh: Some(v.refresh.into()),
+			lightning_receive: Some(v.lightning_receive.into()),
+			lightning_send: Some(v.lightning_send.into()),
+		}
+	}
+}
+
+impl TryFrom<protos::FeeSchedule> for ark::fees::FeeSchedule {
+	type Error = ConvertError;
+	fn try_from(v: protos::FeeSchedule) -> Result<Self, Self::Error> {
+		Ok(ark::fees::FeeSchedule {
+			board: v.board.ok_or("missing board fees")?.into(),
+			offboard: v.offboard.ok_or("missing offboard fees")?.into(),
+			refresh: v.refresh.ok_or("missing refresh fees")?.into(),
+			lightning_receive: v.lightning_receive.ok_or("missing lightning receive fees")?.into(),
+			lightning_send: v.lightning_send.ok_or("missing lightning send fees")?.into(),
+		})
+	}
+}
+
+impl<'a> From<&'a ark::rounds::RoundEvent> for protos::RoundEvent {
+	fn from(e: &'a ark::rounds::RoundEvent) -> Self {
+		protos::RoundEvent {
+			event: Some(match e {
+				ark::rounds::RoundEvent::Attempt(ark::rounds::RoundAttempt {
+					round_seq, attempt_seq, challenge,
+				}) => {
+					protos::round_event::Event::Attempt(protos::RoundAttempt {
+						round_seq: (*round_seq).into(),
+						attempt_seq: *attempt_seq as u64,
+						round_attempt_challenge: challenge.inner().to_vec(),
+					})
+				},
+				ark::rounds::RoundEvent::VtxoProposal(ark::rounds::VtxoProposal {
+					round_seq, attempt_seq, vtxos_spec, unsigned_round_tx, cosign_agg_nonces,
+				}) => {
+					protos::round_event::Event::VtxoProposal(protos::VtxoProposal {
+						round_seq: (*round_seq).into(),
+						attempt_seq: *attempt_seq as u64,
+						vtxos_spec: vtxos_spec.serialize(),
+						unsigned_round_tx: bitcoin::consensus::serialize(&unsigned_round_tx),
+						vtxos_agg_nonces: cosign_agg_nonces.into_iter()
+							.map(|n| n.serialize().to_vec())
+							.collect(),
+					})
+				},
+				ark::rounds::RoundEvent::Finished(ark::rounds::RoundFinished {
+					round_seq, attempt_seq, cosign_sigs, signed_round_tx,
+				}) => {
+					protos::round_event::Event::Finished(protos::RoundFinished {
+						round_seq: (*round_seq).into(),
+						attempt_seq: *attempt_seq as u64,
+						vtxo_cosign_signatures: cosign_sigs.into_iter()
+							.map(|s| s.serialize().to_vec()).collect(),
+						signed_round_tx: bitcoin::consensus::serialize(&signed_round_tx),
+					})
+				},
+				ark::rounds::RoundEvent::Failed(ark::rounds::RoundFailed {
+					round_seq,
+				}) => {
+					protos::round_event::Event::Failed(protos::RoundFailed {
+						round_seq: (*round_seq).into(),
+					})
+				},
+			})
+		}
+	}
+}
+
+impl TryFrom<protos::RoundEvent> for ark::rounds::RoundEvent {
+	type Error = ConvertError;
+
+	fn try_from(m: protos::RoundEvent) -> Result<ark::rounds::RoundEvent, Self::Error> {
+		Ok(match m.event.ok_or("unknown round event")? {
+			protos::round_event::Event::Attempt(m) => {
+				ark::rounds::RoundEvent::Attempt(ark::rounds::RoundAttempt {
+					round_seq: m.round_seq.into(),
+					attempt_seq: m.attempt_seq as usize,
+					challenge: Challenge::new(
+						m.round_attempt_challenge.try_into().map_err(|_| "invalid challenge")?
+					),
+				})
+			},
+			protos::round_event::Event::VtxoProposal(m) => {
+				ark::rounds::RoundEvent::VtxoProposal(ark::rounds::VtxoProposal {
+					round_seq: m.round_seq.into(),
+					attempt_seq: m.attempt_seq as usize,
+					unsigned_round_tx: bitcoin::consensus::deserialize(&m.unsigned_round_tx)
+						.map_err(|_| "invalid unsigned_round_tx")?,
+					vtxos_spec: VtxoTreeSpec::deserialize(&m.vtxos_spec)
+						.map_err(|_| "invalid vtxos_spec")?,
+					cosign_agg_nonces: m.vtxos_agg_nonces.into_iter().map(|n| {
+						musig::AggregatedNonce::from_bytes(&n)
+					}).collect::<Result<_, _>>()?,
+				})
+			},
+			protos::round_event::Event::Finished(m) => {
+				ark::rounds::RoundEvent::Finished(ark::rounds::RoundFinished {
+					round_seq: m.round_seq.into(),
+					attempt_seq: m.attempt_seq as usize,
+					cosign_sigs: m.vtxo_cosign_signatures.into_iter().map(|s| {
+						schnorr::Signature::from_slice(&s)
+							.map_err(|_| "invalid vtxo_cosign_signatures")
+					}).collect::<Result<_, _>>()?,
+					signed_round_tx: bitcoin::consensus::deserialize(&m.signed_round_tx)
+						.map_err(|_| "invalid signed_round_tx")?,
+				})
+			},
+			protos::round_event::Event::Failed(m) => {
+				ark::rounds::RoundEvent::Failed(ark::rounds::RoundFailed {
+					round_seq: m.round_seq.into(),
+				})
+			},
+		})
+	}
+}
+
+impl From<crate::WalletStatus> for protos::WalletStatus {
+	fn from(s: crate::WalletStatus) -> Self {
+		protos::WalletStatus {
+			address: s.address.assume_checked().to_string(),
+			total_balance: s.total_balance.to_sat(),
+			trusted_balance: s.trusted_balance.to_sat(),
+			untrusted_balance: s.untrusted_balance.to_sat(),
+			confirmed_utxos: s.confirmed_utxos.iter().map(|u| u.to_string()).collect(),
+			unconfirmed_utxos: s.unconfirmed_utxos.iter().map(|u| u.to_string()).collect(),
+		}
+	}
+}
+
+impl TryFrom<protos::WalletStatus> for crate::WalletStatus {
+	type Error = ConvertError;
+	fn try_from(s: protos::WalletStatus) -> Result<Self, Self::Error> {
+		Ok(crate::WalletStatus {
+			address: s.address.parse().map_err(|_| "invalid address")?,
+			total_balance: Amount::from_sat(s.total_balance),
+			trusted_balance: Amount::from_sat(s.trusted_balance),
+			untrusted_balance: Amount::from_sat(s.untrusted_balance),
+			confirmed_utxos: s.confirmed_utxos.iter().map(|u| {
+				u.parse().map_err(|_| "invalid outpoint")
+			}).collect::<Result<_, _>>()?,
+			unconfirmed_utxos: s.unconfirmed_utxos.iter().map(|u| {
+				u.parse().map_err(|_| "invalid outpoint")
+			}).collect::<Result<_, _>>()?,
+		})
+	}
+}
+
+
+impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
+	fn from(v: &'a VtxoRequest) -> Self {
+		protos::VtxoRequest {
+			amount: v.amount.to_sat(),
+			policy: v.policy.serialize(),
+		}
+	}
+}
+
+impl TryFrom<protos::VtxoRequest> for VtxoRequest {
+	type Error = ConvertError;
+	fn try_from(v: protos::VtxoRequest) -> Result<Self, Self::Error> {
+		Ok(Self {
+			amount: Amount::from_sat(v.amount),
+			policy: VtxoPolicy::deserialize(&v.policy).map_err(|_| "invalid policy")?,
+		})
+	}
+}
+
+impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
+	type Error = ConvertError;
+	fn try_from(v: protos::ArkoorDestination) -> Result<Self, Self::Error> {
+		Ok(Self {
+			total_amount: Amount::from_sat(v.total_amount),
+			policy: VtxoPolicy::deserialize(&v.policy).map_err(|_| "invalid policy")?,
+		})
+	}
+}
+
+impl From<ArkoorDestination> for protos::ArkoorDestination {
+	fn from(v: ArkoorDestination) -> Self {
+		Self {
+			total_amount: v.total_amount.to_sat(),
+			policy: v.policy.serialize(),
+		}
+	}
+}
+
+impl From<SignedVtxoRequest> for protos::SignedVtxoRequest {
+	fn from(v: SignedVtxoRequest) -> Self {
+		protos::SignedVtxoRequest {
+			vtxo: Some(protos::VtxoRequest {
+				amount: v.vtxo.amount.to_sat(),
+				policy: v.vtxo.policy.serialize(),
+			}),
+			cosign_pubkey: v.cosign_pubkey.serialize().to_vec(),
+			public_nonces: v.nonces.iter().map(|n| n.serialize().to_vec()).collect(),
+		}
+	}
+}
+
+impl TryFrom<protos::SignedVtxoRequest> for SignedVtxoRequest {
+	type Error = ConvertError;
+	fn try_from(v: protos::SignedVtxoRequest) -> Result<Self, Self::Error> {
+		let vtxo = v.vtxo.ok_or("vtxo field missing")?;
+		Ok(SignedVtxoRequest {
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(vtxo.amount),
+				policy: VtxoPolicy::from_bytes(&vtxo.policy)?,
+			},
+			cosign_pubkey: PublicKey::from_bytes(&v.cosign_pubkey)?,
+			nonces: v.public_nonces.into_iter()
+				.map(|n| musig::PublicNonce::from_bytes(n))
+				.collect::<Result<_, _>>()?,
+		})
+	}
+}
+
+impl From<BoardCosignResponse> for protos::BoardCosignResponse {
+	fn from(v: BoardCosignResponse) -> Self {
+		Self {
+			pub_nonce: v.pub_nonce.serialize().to_vec(),
+			partial_sig: v.partial_signature.serialize().to_vec(),
+		}
+	}
+}
+
+impl TryFrom<protos::BoardCosignResponse> for BoardCosignResponse {
+	type Error = ConvertError;
+	fn try_from(v: protos::BoardCosignResponse) -> Result<Self, Self::Error> {
+		Ok(Self {
+			pub_nonce: musig::PublicNonce::from_bytes(&v.pub_nonce)?,
+			partial_signature: musig::PartialSignature::from_bytes(&v.partial_sig)?,
+		})
+	}
+}
+
+impl From<ark::integration::TokenType> for protos::intman::TokenType {
+	fn from(value: ark::integration::TokenType) -> Self {
+		match value {
+			ark::integration::TokenType::SingleUseBoard => protos::intman::TokenType::SingleUseBoard,
+		}
+	}
+}
+
+impl From<protos::intman::TokenType> for ark::integration::TokenType {
+	fn from(value: protos::intman::TokenType) -> Self {
+		match value {
+			protos::intman::TokenType::SingleUseBoard => ark::integration::TokenType::SingleUseBoard,
+		}
+	}
+}
+
+impl From<protos::intman::TokenStatus> for ark::integration::TokenStatus {
+	fn from(value: protos::intman::TokenStatus) -> Self {
+		match value {
+			protos::intman::TokenStatus::Unused => ark::integration::TokenStatus::Unused,
+			protos::intman::TokenStatus::Used => ark::integration::TokenStatus::Used,
+			protos::intman::TokenStatus::Abused => ark::integration::TokenStatus::Abused,
+			protos::intman::TokenStatus::Disabled => ark::integration::TokenStatus::Disabled,
+			// Setting to `Unused` since this status is an alias for `Unused` + expired.
+			protos::intman::TokenStatus::Expired => ark::integration::TokenStatus::Unused,
+		}
+	}
+}
+
+impl From<ark::integration::TokenStatus> for protos::intman::TokenStatus {
+	fn from(value: ark::integration::TokenStatus) -> Self {
+		match value {
+			ark::integration::TokenStatus::Unused => protos::intman::TokenStatus::Unused,
+			ark::integration::TokenStatus::Used => protos::intman::TokenStatus::Used,
+			ark::integration::TokenStatus::Abused => protos::intman::TokenStatus::Abused,
+			ark::integration::TokenStatus::Disabled => protos::intman::TokenStatus::Disabled,
+		}
+	}
+}
+
+// Serialization of a CosignRequest
+impl<V: VtxoRef> From<ArkoorCosignRequest<V>> for protos::ArkoorCosignRequest {
+	fn from(v: ArkoorCosignRequest<V>) -> Self {
+		Self {
+			input_vtxo_id: v.input.vtxo_id().serialize(),
+			user_pub_nonces: v.user_pub_nonces.into_iter()
+				.map(|n| n.serialize().to_vec())
+				.collect::<Vec<_>>(),
+			outputs: v.outputs.into_iter().map(|output| output.into()).collect::<Vec<_>>(),
+			isolated_outputs: v.isolated_outputs.into_iter()
+				.map(|output| output.into())
+				.collect::<Vec<_>>(),
+			use_checkpoint: v.use_checkpoint,
+			attestation: v.attestation.serialize().to_vec(),
+		}
+	}
+}
+
+// Deserialization of CosignRequest
+impl TryFrom<protos::ArkoorCosignRequest> for ArkoorCosignRequest<VtxoId> {
+	type Error = ConvertError;
+	fn try_from(v: protos::ArkoorCosignRequest) -> Result<Self, Self::Error> {
+		let req = Self::new_with_attestation(
+			v.user_pub_nonces.into_iter()
+				.map(|n| musig::PublicNonce::from_bytes(&n))
+				.collect::<Result<Vec<_>, _>>()?,
+			VtxoId::from_bytes(&v.input_vtxo_id)?,
+			v.outputs.into_iter()
+				.map(|output| ArkoorDestination::try_from(output))
+				.collect::<Result<Vec<_>, _>>()?,
+			v.isolated_outputs.into_iter()
+				.map(|output| ArkoorDestination::try_from(output))
+				.collect::<Result<Vec<_>, _>>()?,
+			v.use_checkpoint,
+			ArkoorCosignAttestation::deserialize(&v.attestation)
+				.map_err(|_| "Failed to parse attestation")?,
+		);
+		Ok(req)
+	}
+}
+
+impl<V: VtxoRef> From<ArkoorPackageCosignRequest<V>> for protos::ArkoorPackageCosignRequest {
+	fn from(v: ArkoorPackageCosignRequest<V>) -> Self {
+		Self {
+			parts: v.requests.into_iter().map(|p| p.into()).collect(),
+		}
+	}
+}
+
+impl<'a> TryFrom<protos::ArkoorPackageCosignRequest> for ArkoorPackageCosignRequest<VtxoId> {
+	type Error = ConvertError;
+
+	fn try_from(v: protos::ArkoorPackageCosignRequest) -> Result<Self, Self::Error> {
+		Ok(Self {
+			requests: v.parts.into_iter().map(|p| p.try_into()).collect::<Result<Vec<_>, _>>()?,
+		})
+	}
+}
+
+impl<'a> TryFrom<protos::LightningPayHtlcCosignRequest> for ArkoorPackageCosignRequest<VtxoId> {
+	type Error = ConvertError;
+
+	fn try_from(v: protos::LightningPayHtlcCosignRequest) -> Result<Self, Self::Error> {
+		Ok(Self {
+			requests: v.parts.into_iter().map(|p| p.try_into()).collect::<Result<Vec<_>, _>>()?,
+		})
+	}
+}
+
+impl From<ArkoorCosignResponse> for protos::ArkoorCosignResponse {
+	fn from(v: ArkoorCosignResponse) -> Self {
+		Self {
+			server_pub_nonces: v.server_pub_nonces.into_iter().map(|p| p.serialize().to_vec()).collect::<Vec<_>>(),
+			server_partial_sigs: v.server_partial_sigs.into_iter().map(|p| p.serialize().to_vec()).collect::<Vec<_>>(),
+		}
+	}
+}
+
+impl TryFrom<protos::ArkoorCosignResponse> for ArkoorCosignResponse {
+	type Error = ConvertError;
+	fn try_from(v: protos::ArkoorCosignResponse) -> Result<Self, Self::Error> {
+		Ok(Self {
+			server_pub_nonces: v.server_pub_nonces.into_iter().map(|n| musig::PublicNonce::from_bytes(&n)).collect::<Result<Vec<_>, _>>()?,
+			server_partial_sigs: v.server_partial_sigs.into_iter().map(|n| musig::PartialSignature::from_bytes(&n)).collect::<Result<Vec<_>, _>>()?,
+		})
+	}
+}
+
+impl From<ArkoorPackageCosignResponse> for protos::ArkoorPackageCosignResponse {
+	fn from(v: ArkoorPackageCosignResponse) -> Self {
+		Self {
+			parts: v.responses.into_iter().map(|p| p.into()).collect::<Vec<_>>(),
+		}
+	}
+}
+
+impl TryFrom<protos::ArkoorPackageCosignResponse> for ArkoorPackageCosignResponse {
+	type Error = ConvertError;
+	fn try_from(v: protos::ArkoorPackageCosignResponse) -> Result<Self, Self::Error> {
+		Ok(Self {
+			responses: v.parts.into_iter().map(|p| p.try_into()).collect::<Result<Vec<_>, _>>()?,
+		})
+	}
+}
+
+impl From<LeafVtxoCosignRequest> for protos::LeafVtxoCosignRequest {
+	fn from(v: LeafVtxoCosignRequest) -> Self {
+		protos::LeafVtxoCosignRequest {
+			vtxo_id: v.vtxo_id.to_bytes().to_vec(),
+			public_nonce: v.pub_nonce.serialize().to_vec(),
+		}
+	}
+}
+
+impl From<LeafVtxoCosignResponse> for protos::LeafVtxoCosignResponse {
+	fn from(v: LeafVtxoCosignResponse) -> Self {
+		protos::LeafVtxoCosignResponse {
+			public_nonce: v.public_nonce.serialize().to_vec(),
+			partial_signature: v.partial_signature.serialize().to_vec(),
+		}
+	}
+}
+
+impl TryFrom<protos::LeafVtxoCosignResponse> for LeafVtxoCosignResponse {
+	type Error = ConvertError;
+
+	fn try_from(v: protos::LeafVtxoCosignResponse) -> Result<Self, Self::Error> {
+		Ok(Self {
+			public_nonce: TryFromBytes::from_bytes(v.public_nonce)?,
+			partial_signature: TryFromBytes::from_bytes(v.partial_signature)?,
+		})
+	}
+}
+
+impl<V: Borrow<OffboardRequest>> From<V> for protos::OffboardRequest {
+	fn from(v: V) -> Self {
+		let v = v.borrow();
+	    protos::OffboardRequest {
+			offboard_spk: v.script_pubkey.to_bytes(),
+			net_amount_sat: v.net_amount.to_sat(),
+			deduct_fees_from_gross_amount: v.deduct_fees_from_gross_amount,
+			fee_rate_kwu: v.fee_rate.to_sat_per_kwu(),
+		}
+	}
+}
+
+impl TryFrom<protos::OffboardRequest> for OffboardRequest {
+	type Error = ConvertError;
+
+	fn try_from(v: protos::OffboardRequest) -> Result<Self, Self::Error> {
+		Ok(Self {
+			script_pubkey: ScriptBuf::from_bytes(v.offboard_spk),
+			net_amount: Amount::from_sat(v.net_amount_sat),
+			deduct_fees_from_gross_amount: v.deduct_fees_from_gross_amount,
+			fee_rate: FeeRate::from_sat_per_kwu(v.fee_rate_kwu),
+		})
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use std::str::FromStr;
+	use bitcoin::hex::FromHex;
+	use super::*;
+
+	#[test]
+	fn test_preimage_bytes() {
+		let h = "ef2cb05d04819ddb2b9d960c7e0e295ea48ffb429712dc8f30aa48dfcc20c97e";
+		let b = Vec::<u8>::from_hex(h).unwrap();
+
+		let preimage = Preimage::from_str(h).unwrap();
+		assert_eq!(preimage, Preimage::from_bytes(&b).unwrap());
+		assert_eq!(preimage, Preimage::from_slice(&b).unwrap());
+		assert_eq!(preimage, Preimage::from_slice(&preimage.to_vec()).unwrap());
+		assert_eq!(preimage, Preimage::from_bytes(&preimage.to_vec()).unwrap());
+	}
+
+	/// Baseline proto with valid network and pubkeys, so TryFrom proceeds far
+	/// enough to exercise the delta validators. Fields after the deltas may be
+	/// invalid; these tests only assert delta-rejection short-circuits.
+	fn baseline_ark_info_proto() -> protos::ArkInfo {
+		let pk = PublicKey::from_str(
+			"02dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c",
+		).unwrap();
+		protos::ArkInfo {
+			network: "regtest".into(),
+			server_pubkey: pk.serialize().to_vec(),
+			mailbox_pubkey: pk.serialize().to_vec(),
+			round_interval_secs: 60,
+			nb_round_nonces: 1,
+			vtxo_exit_delta: 12,
+			vtxo_lifetime: 100,
+			#[allow(deprecated)]
+			vtxo_expiry_delta: 100,
+			htlc_send_expiry_delta: 100,
+			htlc_expiry_delta: 6,
+			max_vtxo_amount: None,
+			required_board_confirmations: 1,
+			max_user_invoice_cltv_delta: 50,
+			min_board_amount: 0,
+			ln_receive_anti_dos_required: false,
+			#[allow(deprecated)]
+			offboard_feerate_sat_vkb: 1000,
+			fees: None,
+			max_vtxo_exit_depth: 5,
+			max_offboard_inputs: 10,
+			tos_link: None,
+		}
+	}
+
+	#[test]
+	fn ark_info_rejects_oversized_vtxo_exit_delta() {
+		let mut proto = baseline_ark_info_proto();
+		proto.vtxo_exit_delta = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
+		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+
+	#[test]
+	fn ark_info_rejects_oversized_htlc_expiry_delta() {
+		let mut proto = baseline_ark_info_proto();
+		proto.htlc_expiry_delta = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
+		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+
+	#[test]
+	fn ark_info_rejects_oversized_max_user_invoice_cltv_delta() {
+		let mut proto = baseline_ark_info_proto();
+		proto.max_user_invoice_cltv_delta = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
+		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+
+	#[test]
+	fn ark_info_rejects_oversized_required_board_confirmations() {
+		// A malicious server could otherwise push this near u32::MAX and overflow
+		// the client's `current_height + required` board arithmetic.
+		let mut proto = baseline_ark_info_proto();
+		proto.required_board_confirmations = ark::vtxo::policy::MAX_BLOCK_DELTA.to_u32() + 1;
+		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+
+	#[test]
+	#[allow(deprecated)] // vtxo_expiry_delta kept for old peers
+	fn ark_info_vtxo_lifetime_falls_back_to_deprecated_field() {
+		// Servers from before the rename only set vtxo_expiry_delta.
+		let mut proto = baseline_ark_info_proto();
+		proto.fees = Some(ark::fees::FeeSchedule::default().into());
+		proto.vtxo_lifetime = 0;
+		proto.vtxo_expiry_delta = 42;
+
+		let info = ark::ArkInfo::try_from(proto).unwrap();
+		assert_eq!(info.vtxo_lifetime.to_u32(), 42);
+		assert_eq!(info.vtxo_expiry_delta.to_u32(), 42);
+	}
+
+	#[test]
+	#[allow(deprecated)] // vtxo_expiry_delta kept for old peers
+	fn ark_info_vtxo_lifetime_takes_precedence() {
+		let mut proto = baseline_ark_info_proto();
+		proto.fees = Some(ark::fees::FeeSchedule::default().into());
+		proto.vtxo_lifetime = 42;
+		proto.vtxo_expiry_delta = 100;
+
+		let info = ark::ArkInfo::try_from(proto).unwrap();
+		assert_eq!(info.vtxo_lifetime.to_u32(), 42);
+		assert_eq!(info.vtxo_expiry_delta.to_u32(), 42);
+
+		// and both fields are populated again on the way out
+		let proto = protos::ArkInfo::from(info);
+		assert_eq!(proto.vtxo_lifetime, 42);
+		assert_eq!(proto.vtxo_expiry_delta, 42);
+	}
+
+	#[test]
+	fn ark_info_rejects_u32_max_delta() {
+		// Pre-MR a u32 value above u16::MAX would have failed try_into; verify
+		// the new validator still rejects values that exceed the policy bound.
+		let mut proto = baseline_ark_info_proto();
+		proto.htlc_expiry_delta = u32::MAX;
+		assert!(ark::ArkInfo::try_from(proto).is_err());
+	}
+}

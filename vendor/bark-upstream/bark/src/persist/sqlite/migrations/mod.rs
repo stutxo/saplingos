@@ -1,0 +1,362 @@
+mod m0001_initial_version;
+mod m0002_config;
+mod m0003_payment_history;
+mod m0004_unregistered_board;
+mod m0005_lightning_receive;
+mod m0006_exit_rework;
+mod m0007_vtxo_refresh_expiry_threshold;
+mod m0008_fee_rate_implementation;
+mod m0009_add_movement_kind;
+mod m0010_remove_keychain;
+mod m0011_exit_ancestor_info;
+mod m0012_round;
+mod m0013_round_sync;
+mod m0014_drop_past_round_sync;
+mod m0015_optional_round_seq;
+mod m0016_config;
+mod m0017_great_state_cleanup;
+mod m0018_htlc_recv_cltv_delta;
+mod m0019_round_state;
+mod m0020_new_movements_api;
+mod m0021_fix_lightning_movements;
+mod m0022_unreleased;
+mod m0023_mailbox;
+mod m0024_server_pubkey;
+mod m0025_fees;
+mod m0026_pending_offboard;
+mod m0027_split_destination;
+mod m0028_mailbox_pubkey;
+mod m0029_split_vtxo_genesis;
+mod m0030_wallet_action_checkpoint;
+mod m0031_vtxo_lock_holder;
+mod m0032_exit_state_refactor;
+mod m0033_paid_invoice;
+mod m0034_unlock_failed_movement_vtxos;
+mod m0035_exit_vtxo_pending;
+mod m0036_pending_exit_movements;
+mod m0037_settled_lightning_receive;
+mod m0038_board_action_checkpoints;
+mod m0039_movement_action_id;
+mod m0040_unlock_failed_movement_vtxos_again;
+mod m0041_offboard_action_checkpoint;
+mod m0042_vtxo_registered;
+
+use anyhow::Context;
+use log::debug;
+use rusqlite::{Connection, Transaction};
+
+use m0001_initial_version::Migration0001;
+use m0002_config::Migration0002;
+use m0003_payment_history::Migration0003;
+use m0004_unregistered_board::Migration0004;
+use m0005_lightning_receive::Migration0005;
+use m0006_exit_rework::Migration0006;
+use m0007_vtxo_refresh_expiry_threshold::Migration0007;
+use m0008_fee_rate_implementation::Migration0008;
+use m0009_add_movement_kind::Migration0009;
+use m0010_remove_keychain::Migration0010;
+use m0011_exit_ancestor_info::Migration0011;
+use m0012_round::Migration0012;
+use m0013_round_sync::Migration0013;
+use m0014_drop_past_round_sync::Migration0014;
+use m0015_optional_round_seq::Migration0015;
+use m0016_config::Migration0016;
+use m0017_great_state_cleanup::Migration0017;
+use m0018_htlc_recv_cltv_delta::Migration0018;
+use m0019_round_state::Migration0019;
+use m0020_new_movements_api::Migration0020;
+use m0021_fix_lightning_movements::Migration0021;
+use m0022_unreleased::Migration0022;
+use m0023_mailbox::Migration0023;
+use m0024_server_pubkey::Migration0024;
+use m0025_fees::Migration0025;
+use m0026_pending_offboard::Migration0026;
+use m0027_split_destination::Migration0027;
+use m0028_mailbox_pubkey::Migration0028;
+use m0029_split_vtxo_genesis::Migration0029;
+use m0030_wallet_action_checkpoint::Migration0030;
+use m0031_vtxo_lock_holder::Migration0031;
+use m0032_exit_state_refactor::Migration0032;
+use m0033_paid_invoice::Migration0033;
+use m0034_unlock_failed_movement_vtxos::Migration0034;
+use m0035_exit_vtxo_pending::Migration0035;
+use m0036_pending_exit_movements::Migration0036;
+use m0037_settled_lightning_receive::Migration0037;
+use m0038_board_action_checkpoints::Migration0038;
+use m0039_movement_action_id::Migration0039;
+use m0040_unlock_failed_movement_vtxos_again::Migration0040;
+use m0041_offboard_action_checkpoint::Migration0041;
+use m0042_vtxo_registered::Migration0042;
+
+pub struct MigrationContext {}
+
+impl MigrationContext {
+
+	/// Creates a new migration context
+	pub fn new() -> Self {
+		MigrationContext {}
+	}
+
+	/// Perform all initliazation scripts
+	pub fn do_all_migrations(&self, conn: &mut Connection) -> anyhow::Result<()> {
+		let tx = conn.transaction().context("Failed to start transcation")?;
+		self.init_migrations(&tx)?;
+		tx.commit().context("Failed to commit transaction")?;
+
+		// Run all migration scripts
+		self.try_migration(conn, &Migration0001{})?;
+		self.try_migration(conn, &Migration0002{})?;
+		self.try_migration(conn, &Migration0003{})?;
+		self.try_migration(conn, &Migration0004{})?;
+		self.try_migration(conn, &Migration0005{})?;
+		self.try_migration(conn, &Migration0006{})?;
+		self.try_migration(conn, &Migration0007{})?;
+		self.try_migration(conn, &Migration0008{})?;
+		self.try_migration(conn, &Migration0009{})?;
+		self.try_migration(conn, &Migration0010{})?;
+		self.try_migration(conn, &Migration0011{})?;
+		self.try_migration(conn, &Migration0012{})?;
+		self.try_migration(conn, &Migration0013{})?;
+		self.try_migration(conn, &Migration0014{})?;
+		self.try_migration(conn, &Migration0015{})?;
+		self.try_migration(conn, &Migration0016{})?;
+		self.try_migration(conn, &Migration0017{})?;
+		self.try_migration(conn, &Migration0018{})?;
+		self.try_migration(conn, &Migration0019{})?;
+		self.try_migration(conn, &Migration0020{})?;
+		self.try_migration(conn, &Migration0021{})?;
+		self.try_migration(conn, &Migration0022{})?;
+		self.try_migration(conn, &Migration0023{})?;
+		self.try_migration(conn, &Migration0024{})?;
+		self.try_migration(conn, &Migration0025{})?;
+		self.try_migration(conn, &Migration0026{})?;
+		self.try_migration(conn, &Migration0027{})?;
+		self.try_migration(conn, &Migration0028{})?;
+		self.try_migration(conn, &Migration0029{})?;
+		self.try_migration(conn, &Migration0030{})?;
+		self.try_migration(conn, &Migration0031{})?;
+		self.try_migration(conn, &Migration0032{})?;
+		self.try_migration(conn, &Migration0033{})?;
+		self.try_migration(conn, &Migration0034{})?;
+		self.try_migration(conn, &Migration0035{})?;
+		self.try_migration(conn, &Migration0036{})?;
+		self.try_migration(conn, &Migration0037{})?;
+		self.try_migration(conn, &Migration0038{})?;
+		self.try_migration(conn, &Migration0039{})?;
+		self.try_migration(conn, &Migration0040{})?;
+		self.try_migration(conn, &Migration0041{})?;
+		self.try_migration(conn, &Migration0042{})?;
+
+		Ok(())
+	}
+
+	/// Initiliazes the migrations table in the database if needed
+	///
+	/// This function returns the current schema sversion if succesful
+	fn init_migrations(&self, conn: &Connection) -> anyhow::Result<i64> {
+		self.create_migrations_table_if_not_exists(conn)?;
+		match self.get_current_version(conn) {
+			Ok(version) => Ok(version),
+			Err(_) => {
+				// The database hasn't been initialized yet
+				self.update_version(conn, 0)?;
+				Ok(0)
+			}
+		}
+	}
+
+	/// Attempts to perform a migration if needed
+	fn try_migration(
+		&self,
+		conn: &mut Connection,
+		migration: &impl Migration
+	) -> anyhow::Result<()> {
+		// Start the transaction
+		let tx = conn.transaction().context("Failed to init transaction")?;
+
+		let current_version = self.get_current_version(&tx)?;
+		let from_version = migration.from_version();
+
+		if current_version == from_version {
+			debug!("Performing migration {}", migration.summary());
+			migration.do_migration(&tx)?;
+			self.update_version(&tx, migration.to_version())?;
+		} else if current_version < from_version {
+			bail!("Failed to perform migration. Database is at {} for migration {}",
+				current_version,
+				migration.summary()
+			);
+		}
+
+		tx.commit().context("Failed to commit transaction")?;
+		Ok(())
+	}
+
+	/// Retrieves the current schema version
+	fn get_current_version(&self, conn: &Connection) -> anyhow::Result<i64> {
+		const ERR_MSG : &'static str = "Failed to get_current_version from database";
+
+		let query = "SELECT value FROM migrations ORDER BY value DESC LIMIT 1";
+		let mut statement = conn.prepare(query).context(ERR_MSG)?;
+		let mut rows = statement.query(()).context(ERR_MSG)?;
+
+		let row = rows.next().context(ERR_MSG)?
+			.context("the current schema version is not defined in the databases")?;
+		Ok(row.get(0).context(ERR_MSG)?)
+	}
+
+	/// Update schema version
+	fn update_version(&self, conn: &Connection, new_version: i64) -> anyhow::Result<i64> {
+		const ERR_MSG : &'static str = "Failed to update_version for database";
+
+		let query = "INSERT INTO migrations (value) VALUES (?1)";
+		let mut statement = conn.prepare(query).context(ERR_MSG)?;
+		statement.execute([new_version]).context(ERR_MSG)?;
+
+		Ok(new_version)
+	}
+
+
+	/// Creates the migrations table if it doesn't exist yet
+	fn create_migrations_table_if_not_exists(&self, conn: &Connection) -> anyhow::Result<()> {
+		let query =
+			"CREATE TABLE IF NOT EXISTS migrations (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+				value INTEGER NOT NULL
+			)";
+
+		conn.execute(query, ()).context("Failed to create migration table")?;
+
+		Ok(())
+	}
+
+}
+
+trait Migration {
+	fn name(&self) -> &str;
+
+	fn to_version(&self) -> i64;
+
+	fn from_version(&self) -> i64 {
+		self.to_version() - 1
+	}
+
+	/// Performs the migration script on the provided connection
+	fn do_migration(&self, conn: &Transaction) -> anyhow::Result<()>;
+
+	fn summary(&self) -> String {
+		format!("{}->{}:'{}'", self.from_version(), self.to_version(), self.name())
+	}
+}
+
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn table_exists(conn: &Connection, table_name: &str) -> anyhow::Result<bool> {
+		let query = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?";
+		let mut statement = conn.prepare(query).context("Invalid query")?;
+		let mut rows = statement.query((table_name,)).context("Failed to execute query")?;
+
+		if let Some(_row) = rows.next().unwrap() {
+			return Ok(true)
+		} else {
+			return Ok(false)
+		}
+	}
+
+	/// Checks if schema matches the initial version
+	fn assert_current_version(conn: &Connection, expected: i64) -> anyhow::Result<()> {
+		let ctx = MigrationContext::new();
+		let current_version = ctx.get_current_version(conn)?;
+		if current_version == expected {
+			Ok(())
+		} else {
+			bail!("Migration error; Expected version {} but database was at {}", expected, current_version);
+		}
+	}
+
+	#[test]
+	fn test_set_schema_version() {
+		let conn = rusqlite::Connection::open(":memory:").unwrap();
+		let migs = MigrationContext::new();
+
+		migs.init_migrations(&conn).unwrap();
+		assert_current_version(&conn, 0).unwrap();
+
+		migs.update_version(&conn, 1).unwrap();
+		assert_current_version(&conn, 1).unwrap();
+	}
+
+	#[test]
+	fn test_good_migration() {
+		let mut conn = rusqlite::Connection::open(":memory:").unwrap();
+		let migs = MigrationContext::new();
+
+		migs.init_migrations(&conn).unwrap();
+		assert_current_version(&conn, 0).unwrap();
+
+		// Perform the migrations and confirm it took effect
+		migs.do_all_migrations(&mut conn).unwrap();
+		assert_current_version(&conn, 42).unwrap();
+
+		assert!(table_exists(&conn, "bark_vtxo").unwrap());
+		assert!(table_exists(&conn, "bark_vtxo_state").unwrap());
+		assert!(table_exists(&conn, "bark_movements").unwrap());
+		assert!(table_exists(&conn, "bark_movements_sent_to").unwrap());
+		assert!(table_exists(&conn, "bark_movements_received_on").unwrap());
+		assert!(table_exists(&conn, "bark_movements_input_vtxos").unwrap());
+		assert!(table_exists(&conn, "bark_movements_output_vtxos").unwrap());
+		assert!(table_exists(&conn, "bark_movements_exited_vtxos").unwrap());
+		assert!(table_exists(&conn, "bark_pending_lightning_receive").unwrap());
+		assert!(table_exists(&conn, "bark_exit_states").unwrap());
+		assert!(table_exists(&conn, "bark_exit_child_transactions").unwrap());
+		assert!(table_exists(&conn, "bark_round_state").unwrap());
+		assert!(table_exists(&conn, "bark_lightning_send").unwrap());
+		assert!(table_exists(&conn, "bark_mailbox_checkpoint").unwrap());
+		assert!(!table_exists(&conn, "bark_pending_offboard").unwrap(),
+			"bark_pending_offboard should be dropped by migration 41");
+		assert!(table_exists(&conn, "bark_wallet_action_checkpoint").unwrap());
+		assert!(table_exists(&conn, "bark_paid_invoice").unwrap());
+		assert!(table_exists(&conn, "bark_settled_lightning_receive").unwrap());
+
+		// The migration can be run multiple times
+		migs.do_all_migrations(&mut conn).unwrap();
+	}
+
+	struct BadMigration {}
+
+	impl Migration for BadMigration {
+
+		fn name(&self) -> &str { "Bad migration"}
+		fn to_version(&self) -> i64 { 1 }
+		fn do_migration(&self, tx: &Transaction) -> anyhow::Result<()> {
+
+			let good_query =
+				"CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)";
+			let bad_query = "NOT VALID SQL";
+
+			tx.execute(good_query, ())?;
+			tx.execute(bad_query, ())?;
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn test_bad_migration() {
+		let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+		let migs = MigrationContext::new();
+
+		migs.init_migrations(&conn).unwrap();
+		migs.try_migration(&mut conn, &BadMigration{})
+			.expect_err("The bad migration failed");
+
+		// The version hasn't been edited
+		assert_current_version(&conn, 0).unwrap();
+
+		// The table hasn't been created
+		assert!(! table_exists(&conn, "test").unwrap());
+	}
+}

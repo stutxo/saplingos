@@ -1,0 +1,1031 @@
+
+use bitcoin::absolute::LockTime;
+use bitcoin::hashes::sha256;
+use bitcoin::key::constants::SCHNORR_SIGNATURE_SIZE;
+use bitcoin::secp256k1::schnorr;
+use bitcoin::taproot::{self, ControlBlock};
+use bitcoin::{Sequence, VarInt, Witness};
+use bitcoin::{secp256k1::PublicKey, ScriptBuf};
+
+use bitcoin_ext::{BlockDelta, BlockHeight};
+
+use crate::lightning::{PaymentHash, Preimage};
+use crate::vtxo::policy::Policy;
+use crate::Vtxo;
+use crate::scripts;
+
+/// A trait describing a VTXO policy clause.
+///
+/// It can be used when creating the VTXO, specifying the script pubkey,
+/// and check the satisfaction weight when spending it.
+pub trait TapScriptClause: Sized + Clone {
+	/// The type of witness data required to sign the clause.
+	type WitnessData;
+
+	/// Returns the tapscript for the clause.
+	fn tapscript(&self) -> ScriptBuf;
+
+	/// Construct the taproot control block for spending the VTXO using this clause
+	fn control_block<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> ControlBlock {
+		vtxo.output_taproot()
+			.control_block(&(self.tapscript(), taproot::LeafVersion::TapScript))
+			.expect("clause is not in taproot tree")
+	}
+
+	/// Computes the total witness size in bytes for spending via this clause.
+	///
+	/// Implementations sum bounded components and so cannot overflow `usize`
+	/// on any supported platform:
+	///   tapscript_size: <= MAX_STANDARD_TAPSCRIPT_SIZE (10_000 bytes)
+	///   cb_size: <= TAPROOT_CONTROL_MAX_SIZE (33 + 32*128 = 4_129 bytes)
+	///   VarInt sizes: <= 9 bytes each
+	///   constants: <= 1 + 1 + 64 (+ 1 + 32 for hash variants)
+	/// Sum is on the order of ~14 KB, well below u32::MAX, so the
+	/// usize addition cannot overflow even when usize is 32 bits.
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize;
+
+	/// Constructs the witness for the clause.
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness;
+}
+
+/// A clause that allows to sign and spend the UTXO after a relative
+/// timelock.
+#[derive(Debug, Clone)]
+pub struct DelayedSignClause {
+	pub pubkey: PublicKey,
+	pub block_delta: BlockDelta,
+}
+
+impl DelayedSignClause {
+	/// Returns the input sequence value for this clause.
+	pub fn sequence(&self) -> Sequence {
+		self.block_delta.into()
+	}
+}
+
+impl TapScriptClause for DelayedSignClause {
+	type WitnessData = schnorr::Signature;
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::delayed_sign(self.block_delta, self.pubkey.x_only_public_key().0)
+	}
+
+	fn witness(
+		&self,
+		signature: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		Witness::from_slice(&[
+			&signature[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for DelayedSignClause {
+	fn into(self) -> VtxoClause {
+		VtxoClause::DelayedSign(self)
+	}
+}
+
+/// A clause that allows to sign and spend the UTXO after an absolute
+/// timelock.
+#[derive(Debug, Clone)]
+pub struct TimelockSignClause {
+	pub pubkey: PublicKey,
+	pub timelock_height: BlockHeight,
+}
+
+impl TimelockSignClause {
+	/// Returns the absolute locktime for this clause.
+	pub fn locktime(&self) -> LockTime {
+		self.timelock_height.to_locktime().expect("timelock height is valid")
+	}
+}
+
+impl TapScriptClause for TimelockSignClause {
+	type WitnessData = schnorr::Signature;
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::timelock_sign(self.timelock_height, self.pubkey.x_only_public_key().0)
+	}
+
+	fn witness(
+		&self,
+		signature: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		Witness::from_slice(&[
+			&signature[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for TimelockSignClause {
+	fn into(self) -> VtxoClause {
+		VtxoClause::TimelockSign(self)
+	}
+}
+
+/// A clause that allows to sign and spend the UTXO after a relative
+/// timelock, with an additional absolute one.
+#[derive(Debug, Clone)]
+pub struct DelayedTimelockSignClause {
+	pub pubkey: PublicKey,
+	pub timelock_height: BlockHeight,
+	pub block_delta: BlockDelta,
+}
+
+impl DelayedTimelockSignClause {
+	/// Returns the input sequence for this clause.
+	pub fn sequence(&self) -> Sequence {
+		self.block_delta.into()
+	}
+
+	/// Returns the absolute locktime for this clause.
+	pub fn locktime(&self) -> LockTime {
+		self.timelock_height.to_locktime().expect("timelock height is valid")
+	}
+}
+
+impl TapScriptClause for DelayedTimelockSignClause {
+	type WitnessData = schnorr::Signature;
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::delay_timelock_sign(
+			self.block_delta,
+			self.timelock_height,
+			self.pubkey.x_only_public_key().0,
+		)
+	}
+
+	fn witness(
+		&self,
+		signature: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		Witness::from_slice(&[
+			&signature[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for DelayedTimelockSignClause {
+	fn into(self) -> VtxoClause {
+		VtxoClause::DelayedTimelockSign(self)
+	}
+}
+
+/// A clause that allows to sign and spend the UTXO after a relative
+/// timelock, if preimage matching the hash is provided.
+#[derive(Debug, Clone)]
+pub struct HashDelaySignClause {
+	pub pubkey: PublicKey,
+	pub hash: sha256::Hash,
+	pub block_delta: BlockDelta,
+}
+
+impl HashDelaySignClause {
+	/// Returns the input sequence for this clause.
+	pub fn sequence(&self) -> Sequence {
+		self.block_delta.into()
+	}
+
+	/// Try to extract the preimage from a witness that spends this clause.
+	///
+	/// Our own clauses build the witness `[signature, preimage, tapscript,
+	/// control_block]`. Bitcoin accepts more than that one shape for the same spend.
+	/// BIP341 permits an optional annex as the final witness item, and script
+	/// execution removes the annex before the tapscript runs. So `[signature,
+	/// preimage, tapscript, control_block, annex]` satisfies the same clause, and
+	/// consensus accepts it.
+	///
+	/// A 32-byte item that hashes to the payment hash is the preimage, whatever its
+	/// position. The witness is already mined, so the preimage is public either way.
+	pub fn extract_preimage_from_witness(
+		witness: &Witness,
+		payment_hash: PaymentHash,
+	) -> Option<Preimage> {
+		witness.iter()
+			.filter_map(|item| Preimage::try_from(item).ok())
+			.find(|preimage| preimage.compute_payment_hash() == payment_hash)
+	}
+}
+
+impl TapScriptClause for HashDelaySignClause {
+	type WitnessData = (schnorr::Signature, [u8; 32]);
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::hash_delay_sign(
+			self.hash,
+			self.block_delta,
+			self.pubkey.x_only_public_key().0,
+		)
+	}
+
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		let (signature, preimage) = data;
+		Witness::from_slice(&[
+			&signature[..],
+			&preimage[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ 1  // preimage size byte
+		+ 32 // preimage bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for HashDelaySignClause {
+	fn into(self) -> VtxoClause {
+		VtxoClause::HashDelaySign(self)
+	}
+}
+
+/// A clause that allows to sign and spend the UTXO after a relative
+/// timelock, if preimage matching the hash is provided.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct HashDelaySignClause_v0 {
+	pub pubkey: PublicKey,
+	pub hash: sha256::Hash,
+	pub block_delta: BlockDelta,
+}
+
+impl HashDelaySignClause_v0 {
+	/// Returns the input sequence for this clause.
+	pub fn sequence(&self) -> Sequence {
+		self.block_delta.into()
+	}
+
+	/// Try to extract the preimage from a witness that spends this clause.
+	///
+	/// Our own clauses build the witness `[signature, preimage, tapscript,
+	/// control_block]`. Bitcoin accepts more than that one shape for the same spend.
+	/// BIP341 permits an optional annex as the final witness item, and script
+	/// execution removes the annex before the tapscript runs. So `[signature,
+	/// preimage, tapscript, control_block, annex]` satisfies the same clause, and
+	/// consensus accepts it.
+	///
+	/// A 32-byte item that hashes to the payment hash is the preimage, whatever its
+	/// position. The witness is already mined, so the preimage is public either way.
+	pub fn extract_preimage_from_witness(
+		witness: &Witness,
+		payment_hash: PaymentHash,
+	) -> Option<Preimage> {
+		witness.iter()
+			.filter_map(|item| Preimage::try_from(item).ok())
+			.find(|preimage| preimage.compute_payment_hash() == payment_hash)
+	}
+}
+
+impl TapScriptClause for HashDelaySignClause_v0 {
+	type WitnessData = (schnorr::Signature, [u8; 32]);
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::hash_delay_sign_v0(
+			self.hash,
+			self.block_delta,
+			self.pubkey.x_only_public_key().0,
+		)
+	}
+
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		let (signature, preimage) = data;
+		Witness::from_slice(&[
+			&signature[..],
+			&preimage[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ 1  // preimage size byte
+		+ 32 // preimage bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for HashDelaySignClause_v0 {
+	fn into(self) -> VtxoClause {
+		VtxoClause::HashDelaySign_v0(self)
+	}
+}
+
+/// A clause that allows spending by revealing a preimage and providing a signature.
+///
+/// This is used for the unlock clause in hArk leaf outputs, where the aggregate
+/// pubkey of user+server must sign, and a preimage must be revealed.
+#[derive(Debug, Clone)]
+pub struct HashSignClause {
+	pub pubkey: PublicKey,
+	pub hash: sha256::Hash,
+}
+
+impl TapScriptClause for HashSignClause {
+	type WitnessData = (schnorr::Signature, [u8; 32]);
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::hash_and_sign(self.hash, self.pubkey.x_only_public_key().0)
+	}
+
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		let (signature, preimage) = data;
+		Witness::from_slice(&[
+			&signature[..],
+			&preimage[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = self.tapscript().as_bytes().len();
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ 1  // preimage size byte
+		+ 32 // preimage bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for HashSignClause {
+	fn into(self) -> VtxoClause {
+		VtxoClause::HashSign(self)
+	}
+}
+
+/// A clause that allows spending by revealing a preimage and providing a signature.
+///
+/// This is used for the unlock clause in hArk leaf outputs, where the aggregate
+/// pubkey of user+server must sign, and a preimage must be revealed.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct HashSignClause_v0 {
+	pub pubkey: PublicKey,
+	pub hash: sha256::Hash,
+}
+
+impl TapScriptClause for HashSignClause_v0 {
+	type WitnessData = (schnorr::Signature, [u8; 32]);
+
+	fn tapscript(&self) -> ScriptBuf {
+		scripts::hash_and_sign_v0(self.hash, self.pubkey.x_only_public_key().0)
+	}
+
+	fn witness(
+		&self,
+		data: &Self::WitnessData,
+		control_block: &ControlBlock,
+	) -> Witness {
+		let (signature, preimage) = data;
+		Witness::from_slice(&[
+			&signature[..],
+			&preimage[..],
+			self.tapscript().as_bytes(),
+			&control_block.serialize()[..],
+		])
+	}
+
+	// See `TapScriptClause::witness_size` for the overflow analysis.
+	#[allow(clippy::arithmetic_side_effects)]
+	fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		let cb_size = self.control_block(vtxo).size();
+		let tapscript_size = 57;
+
+		debug_assert_eq!(tapscript_size, self.tapscript().as_bytes().len());
+
+		1 // byte for the number of witness elements
+		+ 1  // schnorr signature size byte
+		+ SCHNORR_SIGNATURE_SIZE // schnorr sig bytes
+		+ 1  // preimage size byte
+		+ 32 // preimage bytes
+		+ VarInt::from(tapscript_size).size()  // tapscript size bytes
+		+ tapscript_size // tapscript bytes
+		+ VarInt::from(cb_size).size()  // control block size bytes
+		+ cb_size // control block bytes
+	}
+}
+
+impl Into<VtxoClause> for HashSignClause_v0 {
+	fn into(self) -> VtxoClause {
+		VtxoClause::HashSign_v0(self)
+	}
+}
+
+#[derive(Debug, Clone)]
+pub enum VtxoClause {
+	DelayedSign(DelayedSignClause),
+	TimelockSign(TimelockSignClause),
+	DelayedTimelockSign(DelayedTimelockSignClause),
+	HashDelaySign(HashDelaySignClause),
+	HashSign(HashSignClause),
+	#[allow(non_camel_case_types)]
+	HashDelaySign_v0(HashDelaySignClause_v0),
+	#[allow(non_camel_case_types)]
+	HashSign_v0(HashSignClause_v0),
+}
+
+impl VtxoClause {
+	/// Returns the public key associated with this clause.
+	pub fn pubkey(&self) -> PublicKey {
+		match self {
+			Self::DelayedSign(c) => c.pubkey,
+			Self::TimelockSign(c) => c.pubkey,
+			Self::DelayedTimelockSign(c) => c.pubkey,
+			Self::HashDelaySign(c) => c.pubkey,
+			Self::HashSign(c) => c.pubkey,
+			Self::HashDelaySign_v0(c) => c.pubkey,
+			Self::HashSign_v0(c) => c.pubkey,
+		}
+	}
+
+
+	/// Returns the tapscript for this clause.
+	pub fn tapscript(&self) -> ScriptBuf {
+		match self {
+			Self::DelayedSign(c) => c.tapscript(),
+			Self::TimelockSign(c) => c.tapscript(),
+			Self::DelayedTimelockSign(c) => c.tapscript(),
+			Self::HashDelaySign(c) => c.tapscript(),
+			Self::HashSign(c) => c.tapscript(),
+			Self::HashDelaySign_v0(c) => c.tapscript(),
+			Self::HashSign_v0(c) => c.tapscript(),
+		}
+	}
+
+	/// Returns the input sequence for this clause, if applicable.
+	pub fn sequence(&self) -> Option<Sequence> {
+		match self {
+			Self::DelayedSign(c) => Some(c.sequence()),
+			Self::TimelockSign(_) => None,
+			Self::DelayedTimelockSign(c) => Some(c.sequence()),
+			Self::HashDelaySign(c) => Some(c.sequence()),
+			Self::HashSign(_) => None,
+			Self::HashDelaySign_v0(c) => Some(c.sequence()),
+			Self::HashSign_v0(_) => None,
+		}
+	}
+
+	/// Computes the total witness size in bytes for spending the VTXO via this clause.
+	pub fn control_block<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> ControlBlock {
+		match self {
+			Self::DelayedSign(c) => c.control_block(vtxo),
+			Self::TimelockSign(c) => c.control_block(vtxo),
+			Self::DelayedTimelockSign(c) => c.control_block(vtxo),
+			Self::HashDelaySign(c) => c.control_block(vtxo),
+			Self::HashSign(c) => c.control_block(vtxo),
+			Self::HashDelaySign_v0(c) => c.control_block(vtxo),
+			Self::HashSign_v0(c) => c.control_block(vtxo),
+		}
+	}
+
+	/// Computes the total witness size in bytes for spending the VTXO via this clause.
+	pub fn witness_size<G, P: Policy>(&self, vtxo: &Vtxo<G, P>) -> usize {
+		match self {
+			Self::DelayedSign(c) => c.witness_size(vtxo),
+			Self::TimelockSign(c) => c.witness_size(vtxo),
+			Self::DelayedTimelockSign(c) => c.witness_size(vtxo),
+			Self::HashDelaySign(c) => c.witness_size(vtxo),
+			Self::HashSign(c) => c.witness_size(vtxo),
+			Self::HashDelaySign_v0(c) => c.witness_size(vtxo),
+			Self::HashSign_v0(c) => c.witness_size(vtxo),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::str::FromStr;
+
+	use bitcoin::taproot::TaprootSpendInfo;
+	use bitcoin::{Amount, OutPoint, Transaction, TxIn, TxOut, Txid, sighash};
+	use bitcoin::hashes::Hash;
+	use bitcoin::key::Keypair;
+	use bitcoin_ext::{TaprootSpendInfoExt, fee};
+
+	use crate::{SECP, musig};
+	use crate::test_util::verify_tx;
+
+	use super::*;
+
+	lazy_static! {
+		static ref USER_KEYPAIR: Keypair = Keypair::from_str("5255d132d6ec7d4fc2a41c8f0018bb14343489ddd0344025cc60c7aa2b3fda6a").unwrap();
+		static ref SERVER_KEYPAIR: Keypair = Keypair::from_str("1fb316e653eec61de11c6b794636d230379509389215df1ceb520b65313e5426").unwrap();
+	}
+
+	#[allow(unused)]
+	fn all_clause_tested(clause: VtxoClause) -> bool {
+		// NB: matcher to ensure all clauses are tested
+		match clause {
+			VtxoClause::DelayedSign(_) => true,
+			VtxoClause::TimelockSign(_) => true,
+			VtxoClause::DelayedTimelockSign(_) => true,
+			VtxoClause::HashDelaySign(_) => true,
+			VtxoClause::HashSign(_) => true,
+			VtxoClause::HashDelaySign_v0(_) => true,
+			VtxoClause::HashSign_v0(_) => true,
+		}
+	}
+
+	fn transaction() -> Transaction {
+		let address = bitcoin::Address::from_str("tb1q00h5delzqxl7xae8ufmsegghcl4jwfvdnd8530")
+			.unwrap().assume_checked();
+
+		Transaction {
+			version: bitcoin::transaction::Version(3),
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![],
+			output: vec![TxOut {
+				script_pubkey: address.script_pubkey(),
+				value: Amount::from_sat(900_000),
+			}, fee::fee_anchor()]
+		}
+	}
+
+	fn taproot_material(clause_spk: ScriptBuf) -> (TaprootSpendInfo, ControlBlock) {
+		let user_pubkey = USER_KEYPAIR.public_key();
+		let server_pubkey = SERVER_KEYPAIR.public_key();
+
+		let combined_pk = musig::combine_keys([user_pubkey, server_pubkey])
+			.x_only_public_key().0;
+		let taproot = taproot::TaprootBuilder::new()
+			.add_leaf(0, clause_spk.clone()).unwrap()
+			.finalize(&SECP, combined_pk).unwrap();
+
+		let cb = taproot
+			.control_block(&(clause_spk.clone(), taproot::LeafVersion::TapScript))
+			.expect("script is in taproot");
+
+		(taproot, cb)
+	}
+
+	fn signature(tx: &Transaction, input: &TxOut, clause_spk: ScriptBuf) -> schnorr::Signature {
+		let leaf_hash = taproot::TapLeafHash::from_script(
+			&clause_spk,
+			taproot::LeafVersion::TapScript,
+		);
+
+		let mut shc = sighash::SighashCache::new(tx);
+		let sighash = shc.taproot_script_spend_signature_hash(
+			0, &sighash::Prevouts::All(&[input.clone()]), leaf_hash, sighash::TapSighashType::Default,
+		).expect("all prevouts provided");
+
+		SECP.sign_schnorr(&sighash.into(), &*USER_KEYPAIR)
+	}
+
+	#[test]
+	fn test_delayed_sign_clause() {
+		let clause = DelayedSignClause {
+			pubkey: USER_KEYPAIR.public_key(),
+			block_delta: BlockDelta::new(100),
+		};
+
+		// We compute taproot material for the clause
+		let (taproot, cb) = taproot_material(clause.tapscript());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		// We build transaction spending input containing clause
+		let mut tx = transaction();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence: clause.sequence(),
+			witness: Witness::new(),
+		});
+
+		// We compute the signature for the transaction
+		let signature = signature(&tx, &tx_in, clause.tapscript());
+		tx.input[0].witness = clause.witness(&signature, &cb);
+
+		// We verify the transaction
+		verify_tx(&[tx_in], 0, &tx).expect("transaction is invalid");
+	}
+
+	#[test]
+	fn test_timelock_sign_clause() {
+		let clause = TimelockSignClause {
+			pubkey: USER_KEYPAIR.public_key(),
+			timelock_height: BlockHeight::new(100),
+		};
+
+		// We compute taproot material for the clause
+		let (taproot, cb) = taproot_material(clause.tapscript());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		// We build transaction spending input containing clause
+		let mut tx = transaction();
+		tx.lock_time = clause.locktime();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence: Sequence::ZERO,
+			witness: Witness::new(),
+		});
+
+		// We compute the signature for the transaction
+		let signature = signature(&tx, &tx_in, clause.tapscript());
+		tx.input[0].witness = clause.witness(&signature, &cb);
+
+		// We verify the transaction
+		verify_tx(&[tx_in], 0, &tx).expect("transaction is invalid");
+	}
+
+	#[test]
+	fn test_delayed_timelock_clause() {
+		let clause = DelayedTimelockSignClause {
+			pubkey: USER_KEYPAIR.public_key(),
+			timelock_height: BlockHeight::new(100),
+			block_delta: BlockDelta::new(24),
+		};
+
+		// We compute taproot material for the clause
+		let (taproot, cb) = taproot_material(clause.tapscript());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		// We build transaction spending input containing clause
+		let mut tx = transaction();
+		tx.lock_time = clause.locktime();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence: clause.sequence(),
+			witness: Witness::new(),
+		});
+
+		// We compute the signature for the transaction
+		let signature = signature(&tx, &tx_in, clause.tapscript());
+		tx.input[0].witness = clause.witness(&signature, &cb);
+
+		// We verify the transaction
+		verify_tx(&[tx_in], 0, &tx).expect("transaction is invalid");
+	}
+
+	#[test]
+	fn test_hash_delay_clause() {
+		let preimage = [0; 32];
+
+		let clause = HashDelaySignClause_v0 {
+			pubkey: USER_KEYPAIR.public_key(),
+			hash: sha256::Hash::hash(&preimage),
+			block_delta: BlockDelta::new(24),
+		};
+
+		// We compute taproot material for the clause
+		let (taproot, cb) = taproot_material(clause.tapscript());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		// We build transaction spending input containing clause
+		let mut tx = transaction();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence: clause.sequence(),
+			witness: Witness::new(),
+		});
+
+		// We compute the signature for the transaction
+		let signature = signature(&tx, &tx_in, clause.tapscript());
+		tx.input[0].witness = clause.witness(&(signature, preimage), &cb);
+
+		// We verify the transaction
+		verify_tx(&[tx_in], 0, &tx).expect("transaction is invalid");
+	}
+
+	#[test]
+	fn test_extract_preimage_from_witness() {
+		let preimage_bytes = [42u8; 32];
+		let payment_hash = sha256::Hash::hash(&preimage_bytes);
+
+		let clause = HashDelaySignClause_v0 {
+			pubkey: USER_KEYPAIR.public_key(),
+			hash: payment_hash,
+			block_delta: BlockDelta::new(24),
+		};
+
+		// Build a valid witness via the clause
+		let (taproot, cb) = taproot_material(clause.tapscript());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		let mut tx = transaction();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence: clause.sequence(),
+			witness: Witness::new(),
+		});
+
+		let sig = signature(&tx, &tx_in, clause.tapscript());
+		let witness = clause.witness(&(sig, preimage_bytes), &cb);
+
+		// Extract should succeed with correct payment hash
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
+			&witness,
+			payment_hash.into(),
+		);
+		assert!(extracted.is_some());
+		assert_eq!(extracted.unwrap().as_ref(), &preimage_bytes);
+
+		// Extract should fail with wrong payment hash
+		let wrong_hash = sha256::Hash::hash(&[0u8; 32]);
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
+			&witness,
+			wrong_hash.into(),
+		);
+		assert!(extracted.is_none());
+
+		// Extract should fail on a witness that reveals no matching preimage
+		let other_preimage = [7u8; 32];
+		let no_preimage = Witness::from_slice(&[
+			&sig[..],
+			&other_preimage[..],
+			clause.tapscript().as_bytes(),
+			&cb.serialize()[..],
+		]);
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
+			&no_preimage,
+			payment_hash.into(),
+		);
+		assert!(extracted.is_none());
+	}
+
+	/// Build a script-path spend of a hash-delay tapscript that carries a BIP341
+	/// annex, and return its witness.
+	///
+	/// Panics if consensus rejects the spend. A caller therefore always asserts
+	/// against a witness that a miner can confirm.
+	fn annexed_hash_delay_spend(
+		tapscript: ScriptBuf,
+		sequence: Sequence,
+		preimage: [u8; 32],
+	) -> Witness {
+		let (taproot, cb) = taproot_material(tapscript.clone());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		let mut tx = transaction();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence,
+			witness: Witness::new(),
+		});
+
+		// A final witness item that starts with 0x50 is the annex. The sighash
+		// commits to the annex, but script execution removes it before the
+		// tapscript runs. The stack the tapscript reads is unchanged.
+		let annex = [0x50u8, 0xde, 0xad, 0xbe, 0xef];
+
+		let leaf_hash = taproot::TapLeafHash::from_script(
+			&tapscript,
+			taproot::LeafVersion::TapScript,
+		);
+		let mut shc = sighash::SighashCache::new(&tx);
+		let sighash = shc.taproot_signature_hash(
+			0,
+			&sighash::Prevouts::All(&[tx_in.clone()]),
+			Some(sighash::Annex::new(&annex).unwrap()),
+			Some((leaf_hash, 0xFFFFFFFF)),
+			sighash::TapSighashType::Default,
+		).expect("all prevouts provided");
+		let sig = SECP.sign_schnorr(&sighash.into(), &*USER_KEYPAIR);
+
+		let witness = Witness::from_slice(&[
+			&sig[..],
+			&preimage[..],
+			tapscript.as_bytes(),
+			&cb.serialize()[..],
+			&annex[..],
+		]);
+		assert!(witness.taproot_annex().is_some());
+		tx.input[0].witness = witness.clone();
+
+		// The annex makes this spend nonstandard to relay, but not invalid.
+		// Consensus accepts it, so a miner can confirm a spend that a parser
+		// which expects a four-item witness does not recognize.
+		verify_tx(&[tx_in], 0, &tx).expect("annexed spend is invalid");
+
+		witness
+	}
+
+	#[test]
+	fn test_extract_preimage_from_annexed_witness() {
+		let preimage_bytes = [42u8; 32];
+		let payment_hash = sha256::Hash::hash(&preimage_bytes);
+
+		let clause = HashDelaySignClause {
+			pubkey: USER_KEYPAIR.public_key(),
+			hash: payment_hash,
+			block_delta: BlockDelta::new(24),
+		};
+		let witness = annexed_hash_delay_spend(
+			clause.tapscript(), clause.sequence(), preimage_bytes,
+		);
+		let extracted = HashDelaySignClause::extract_preimage_from_witness(
+			&witness,
+			payment_hash.into(),
+		).expect("no preimage extracted from annexed witness");
+		assert_eq!(extracted.as_ref(), &preimage_bytes);
+
+		let clause_v0 = HashDelaySignClause_v0 {
+			pubkey: USER_KEYPAIR.public_key(),
+			hash: payment_hash,
+			block_delta: BlockDelta::new(24),
+		};
+		let witness = annexed_hash_delay_spend(
+			clause_v0.tapscript(), clause_v0.sequence(), preimage_bytes,
+		);
+		let extracted = HashDelaySignClause_v0::extract_preimage_from_witness(
+			&witness,
+			payment_hash.into(),
+		).expect("no preimage extracted from annexed witness");
+		assert_eq!(extracted.as_ref(), &preimage_bytes);
+	}
+
+	#[test]
+	fn test_hash_sign_clause() {
+		let preimage = [0u8; 32];
+		let hash = sha256::Hash::hash(&preimage);
+
+		// HashSignClause uses an x-only aggregate public key
+		let agg_pk = musig::combine_keys([USER_KEYPAIR.public_key(), SERVER_KEYPAIR.public_key()]);
+
+		let clause = HashSignClause_v0 {
+			pubkey: agg_pk,
+			hash,
+		};
+
+		// We compute taproot material for the clause
+		let (taproot, cb) = taproot_material(clause.tapscript());
+		let tx_in = TxOut {
+			script_pubkey: taproot.script_pubkey(),
+			value: Amount::from_sat(1_000_000),
+		};
+
+		// We build transaction spending input containing clause
+		let mut tx = transaction();
+		tx.input.push(TxIn {
+			previous_output: OutPoint::new(Txid::all_zeros(), 0),
+			script_sig: ScriptBuf::default(),
+			sequence: Sequence::ZERO, // HashSignClause has no relative timelock
+			witness: Witness::new(),
+		});
+
+		// For HashSignClause, we need a MuSig signature from both parties
+		let leaf_hash = taproot::TapLeafHash::from_script(
+			&clause.tapscript(),
+			taproot::LeafVersion::TapScript,
+		);
+
+		let mut shc = sighash::SighashCache::new(&tx);
+		let sighash = shc.taproot_script_spend_signature_hash(
+			0, &sighash::Prevouts::All(&[tx_in.clone()]), leaf_hash, sighash::TapSighashType::Default,
+		).expect("all prevouts provided");
+
+		// Create MuSig signature
+		let (user_sec_nonce, user_pub_nonce) = musig::nonce_pair(&*USER_KEYPAIR);
+		let (server_pub_nonce, server_part_sig) = musig::deterministic_partial_sign(
+			&*SERVER_KEYPAIR,
+			[USER_KEYPAIR.public_key()],
+			&[&user_pub_nonce],
+			sighash.to_byte_array(),
+			None,
+		);
+		let agg_nonce = musig::nonce_agg(&[&user_pub_nonce, &server_pub_nonce]);
+
+		let (_user_part_sig, final_sig) = musig::partial_sign(
+			[USER_KEYPAIR.public_key(), SERVER_KEYPAIR.public_key()],
+			agg_nonce,
+			&*USER_KEYPAIR,
+			user_sec_nonce,
+			sighash.to_byte_array(),
+			None,
+			Some(&[&server_part_sig]),
+		);
+		let final_sig = final_sig.expect("should have final signature");
+
+		tx.input[0].witness = clause.witness(&(final_sig, preimage), &cb);
+
+		// We verify the transaction
+		verify_tx(&[tx_in], 0, &tx).expect("transaction is invalid");
+	}
+}

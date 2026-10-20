@@ -1,0 +1,604 @@
+//! Client-side Ark server connector.
+//!
+//! This module provides a managed, version-aware gRPC connection between a
+//! Bark client and a paired Ark server. Its responsibilities are:
+//! - Negotiating and enforcing a compatible wire protocol version via a
+//!   handshake.
+//! - Establishing a gRPC channel (optionally with TLS) with sensible timeouts
+//!   and keepalives.
+//! - Injecting the negotiated protocol version into every RPC call so the
+//!   server can route/validate requests correctly.
+//! - Fetching and exposing the server's runtime configuration ([ArkInfo]) so
+//!   the client can adapt its behavior (e.g., network, round cadence, limits).
+//!
+//! Overview
+//! - Version negotiation: The client first calls the server's handshake RPC,
+//!   which returns the supported protocol version range. The client checks its
+//!   own supported range ([MIN_PROTOCOL_VERSION]..=[MAX_PROTOCOL_VERSION]) and
+//!   picks the highest mutually supported version.
+//! - Metadata propagation: After negotiation, all subsequent RPCs carry the
+//!   selected protocol version in the request metadata using a gRPC
+//!   interceptor.
+//! - TLS: If the server URI is HTTPS, a TLS configuration with the configured
+//!   crate roots is set up; otherwise the connection proceeds in cleartext.
+//! - Server info: Once connected, the client retrieves [ArkInfo] to validate
+//!   that the selected Bitcoin [Network] matches the wallet and to learn
+//!   server-side parameters that drive client behavior.
+//!
+
+use std::cmp;
+use std::convert::TryFrom;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bitcoin::{FeeRate, Network};
+use log::warn;
+use tokio::sync::RwLock;
+use tonic::codec::CompressionEncoding;
+use tonic::metadata::AsciiMetadataValue;
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::service::interceptor::{InterceptedService, Interceptor};
+
+use ark::ArkInfo;
+
+use crate::{
+	mailbox, protos, ArkServiceClient, ConvertError, RequestExt,
+	MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+};
+
+
+#[cfg(all(feature = "tonic-native", feature = "tonic-web"))]
+compile_error!("features `tonic-native` and `tonic-web` are mutually exclusive");
+
+#[cfg(all(feature = "socks5-proxy", not(feature = "tonic-native")))]
+compile_error!("the `socks5-proxy` feature is only usable in conjunction with `tonic-native`");
+
+
+/// The HTTP header used for private server access tokens
+#[deprecated(
+	since = "0.2.4",
+	note = "access tokens are not enforced by the server; this header will be removed",
+)]
+pub const ACCESS_TOKEN_HEADER: &str = "ark-access-token";
+/// The HTTP header used to identify the client implementation.
+///
+/// We use `x-user-agent` rather than `user-agent` because browsers control the
+/// latter for `fetch`-based transports (gRPC-web from WASM), and `x-user-agent`
+/// is the established gRPC-web convention for client-set identifiers.
+///
+/// Expected value: `<name>/<version>` where `name` is 1-32 chars of lowercase
+/// ASCII alphanumeric / `-` / `_`. Anything else (uppercase, missing slash,
+/// invalid chars, too long) is rejected server-side with `invalid_argument`.
+pub const USER_AGENT_HEADER: &str = "x-user-agent";
+/// Error text used when no Ark RPC transport backend was compiled into the binary.
+pub const NO_TRANSPORT_BACKEND_MESSAGE: &str =
+	"no Ark RPC transport backend compiled in this build; enable `bark-server-rpc/tonic-native` or `bark-server-rpc/tonic-web`";
+
+/// Default timeout to add on requests to the server
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+
+#[cfg(feature = "tonic-native")]
+mod transport {
+	use std::str::FromStr;
+	use std::time::Duration;
+
+	use http::Uri;
+	use log::info;
+	use tonic::transport::{Channel, Endpoint};
+
+	use super::CreateEndpointError;
+
+	pub type Transport = Channel;
+
+	/// Build a tonic endpoint from a server address, configuring timeouts and TLS if required.
+	///
+	/// - Supports `http` and `https` URIs. Any other scheme results in an error.
+	/// - Uses a 10-minute keep-alive and overall request timeout to accommodate long-running RPCs.
+	/// - When `https` is used, the crate-configured root CAs are enabled and the SNI domain is set.
+	pub async fn connect(address: &str) -> Result<Transport, CreateEndpointError> {
+		Ok(create_endpoint(address)?.connect().await?)
+	}
+
+	/// Similar to [connect] but the HTTP/HTTPS connection is wrapped with a SOCKS5 proxy.
+	#[cfg(feature = "socks5-proxy")]
+	pub async fn connect_with_proxy(
+		address: &str,
+		proxy: &str,
+	) -> Result<Transport, CreateEndpointError> {
+		use hyper_socks2::SocksConnector;
+		use hyper_util::client::legacy::connect::HttpConnector;
+
+		let endpoint = create_endpoint(address)?;
+		let proxy_uri = proxy.parse::<Uri>().map_err(CreateEndpointError::InvalidProxyUri)?;
+		let connector = {
+			// TLS is handled by tonic's `tls_config()` on the endpoint, so this connector only
+			// needs to establish the SOCKS5 tunnel.
+			let mut http = HttpConnector::new();
+			http.enforce_http(false);
+			SocksConnector {
+				proxy_addr: proxy_uri,
+				auth: None,
+				connector: http,
+			}
+		};
+		info!("Connecting to Ark server via SOCKS5 proxy {}...", proxy);
+		Ok(endpoint.connect_with_connector(connector).await?)
+	}
+
+	/// Creates an endpoint for the given server address which the application can use to create a
+	/// connection. Any required TLS configuration will be added so both HTTP and HTTPS are
+	/// supported.
+	fn create_endpoint(address: &str) -> Result<Endpoint, CreateEndpointError> {
+		let uri = Uri::from_str(address)?;
+
+		let scheme = uri.scheme_str().unwrap_or("");
+		if scheme != "http" && scheme != "https" {
+			return Err(CreateEndpointError::InvalidScheme(scheme.to_string()));
+		}
+
+		#[cfg_attr(not(any(feature = "tls-native-roots", feature = "tls-webpki-roots")), allow(unused_mut))]
+		let mut endpoint = Channel::builder(uri.clone())
+			// nb how often we check if server is still there
+			.http2_keep_alive_interval(Duration::from_secs(20))
+			// nb time we allow server to respond to ping before we consider dead
+			.keep_alive_timeout(Duration::from_secs(60)) // 1 min
+			.keep_alive_while_idle(true);
+
+		#[cfg(any(feature = "tls-native-roots", feature = "tls-webpki-roots"))]
+		if scheme == "https" {
+			use tonic::transport::ClientTlsConfig;
+
+			info!("Connecting to Ark server at {} using TLS...", address);
+			let uri_auth = uri.clone().into_parts().authority
+				.ok_or(CreateEndpointError::MissingAuthority)?;
+			let domain = uri_auth.host();
+
+			let tls_config = ClientTlsConfig::new()
+					.with_enabled_roots()
+					.domain_name(domain);
+			endpoint = endpoint.tls_config(tls_config).map_err(CreateEndpointError::Transport)?;
+			return Ok(endpoint);
+		}
+		#[cfg(not(any(feature = "tls-native-roots", feature = "tls-webpki-roots")))]
+		if scheme == "https" {
+			return Err(CreateEndpointError::InvalidScheme(
+				"Missing TLS roots, https is unsupported".to_owned(),
+			));
+		}
+		info!("Connecting to Ark server at {} without TLS...", address);
+		Ok(endpoint)
+	}
+}
+
+#[cfg(feature = "tonic-web")]
+mod transport {
+	use super::CreateEndpointError;
+	use tonic_web_wasm_client::Client as WasmClient;
+
+	pub type Transport = WasmClient;
+
+	pub async fn connect(address: &str) -> Result<Transport, CreateEndpointError> {
+		Ok(tonic_web_wasm_client::Client::new(address.to_string()))
+	}
+}
+
+/// Dummy transport used so the generated tonic clients still have a concrete transport type in
+/// transportless builds. `connect()` rejects these builds before any RPC is attempted, but
+/// if a client somehow does call into this transport we still return a clean gRPC error.
+#[cfg(not(any(feature = "tonic-native", feature = "tonic-web")))]
+mod transport {
+	use std::convert::Infallible;
+	use std::future::{ready, Ready};
+	use std::task::{Context, Poll};
+
+	use http::{Request, Response};
+	use tonic::Status;
+	use tonic::body::Body;
+	use tonic::codegen::Service;
+
+	use super::NO_TRANSPORT_BACKEND_MESSAGE;
+
+	pub async fn connect(_address: &str) -> Result<Transport, crate::client::CreateEndpointError> {
+		Err(crate::client::CreateEndpointError::NoTransportBackend)
+	}
+
+	#[derive(Debug, Clone, Default)]
+	pub struct Transport;
+
+	impl Service<Request<Body>> for Transport {
+		type Response = Response<Body>;
+		type Error = Infallible;
+		type Future = Ready<Result<Self::Response, Self::Error>>;
+
+		fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, _req: Request<Body>) -> Self::Future {
+			let status = Status::failed_precondition(NO_TRANSPORT_BACKEND_MESSAGE);
+			ready(Ok(status.into_http::<Body>()))
+		}
+	}
+}
+
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to create gRPC endpoint: {msg}")]
+pub enum CreateEndpointError {
+	#[error("{NO_TRANSPORT_BACKEND_MESSAGE}")]
+	NoTransportBackend,
+	#[error("failed to parse Ark server as a URI")]
+	InvalidUri(#[from] http::uri::InvalidUri),
+	#[error("Ark server scheme must be either http or https. Found: {0}")]
+	InvalidScheme(String),
+	#[error("Ark server URI is missing an authority part")]
+	MissingAuthority,
+	#[cfg(feature = "tonic-native")]
+	#[error(transparent)]
+	Transport(#[from] tonic::transport::Error),
+	#[cfg(feature = "socks5-proxy")]
+	#[error("invalid SOCKS5 proxy URI: {0:#}")]
+	InvalidProxyUri(http::uri::InvalidUri),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to connect to Ark server: {msg}")]
+pub enum ConnectError {
+	#[error("missing info '{0}' to connect")]
+	MissingInfo(&'static str),
+	#[deprecated(
+		since = "0.2.4",
+		note = "access tokens are not enforced by the server; this variant will be removed",
+	)]
+	#[error("invalid access token: {0}")]
+	InvalidAccessToken(#[source] InvalidMetadataValue),
+	#[error("invalid user agent: {0}")]
+	InvalidUserAgent(#[source] InvalidMetadataValue),
+	#[error(transparent)]
+	CreateEndpoint(#[from] CreateEndpointError),
+	#[error("handshake request failed: {0}")]
+	Handshake(tonic::Status),
+	#[error("version mismatch. Client max is: {client_max}, server min is: {server_min}")]
+	ProtocolVersionMismatchClientTooOld { client_max: u64, server_min: u64 },
+	#[error("version mismatch. Client min is: {client_min}, server max is: {server_max}")]
+	ProtocolVersionMismatchServerTooOld { client_min: u64, server_max: u64 },
+	#[error("error getting ark info: {0}")]
+	GetArkInfo(tonic::Status),
+	#[error("invalid ark info from ark server: {0}")]
+	InvalidArkInfo(#[from] ConvertError),
+	#[error("network mismatch. Expected: {expected}, Got: {got}")]
+	NetworkMismatch { expected: Network, got: Network },
+	#[error("error getting offboard fee rate: {0}")]
+	GetOffboardFeeRate(tonic::Status),
+	#[error("tokio channel error: {0}")]
+	Tokio(#[from] tokio::sync::oneshot::error::RecvError),
+}
+
+/// A gRPC interceptor that attaches the negotiated protocol version to each request.
+///
+/// After the handshake determines the mutually supported protocol version, this
+/// interceptor injects it into the outgoing request metadata so the server can
+/// process calls according to the agreed wire format and semantics.
+#[derive(Clone)]
+#[deprecated(since = "0.1.3", note = "should not be used directly")]
+pub struct ProtocolVersionInterceptor {
+	pver: u64,
+}
+
+#[allow(deprecated)]
+impl tonic::service::Interceptor for ProtocolVersionInterceptor {
+	fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+		#[allow(deprecated)]
+		req.set_pver(self.pver);
+		Ok(req)
+	}
+}
+
+/// A gRPC interceptor that attaches ark-specific headers to each request
+///
+/// - pver: the negotiated protocol version
+/// - if no timeout is set yet, it sets [DEFAULT_REQUEST_TIMEOUT]
+/// - access_token: the access token to use for private servers
+/// - user_agent: client identifier sent on every RPC so the server can
+///   attribute traffic per implementation (see [USER_AGENT_HEADER]).
+#[derive(Clone)]
+pub struct ArkServiceInterceptor {
+	pver: Option<u64>,
+	access_token: Option<AsciiMetadataValue>,
+	user_agent: AsciiMetadataValue,
+}
+
+impl tonic::service::Interceptor for ArkServiceInterceptor {
+	fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+		req.set_default_timeout(DEFAULT_REQUEST_TIMEOUT);
+		if let Some(pver) = self.pver {
+			req.set_pver(pver);
+		}
+		if let Some(ref access_token) = self.access_token {
+			#[allow(deprecated)]
+			req.metadata_mut().insert(ACCESS_TOKEN_HEADER, access_token.clone());
+		}
+		req.metadata_mut().insert(USER_AGENT_HEADER, self.user_agent.clone());
+		Ok(req)
+	}
+}
+
+/// A handle to the Ark info.
+///
+/// This handle is used to wait for the Ark info to be updated, if needed.
+pub struct ArkInfoHandle {
+	pub info: ArkInfo,
+	pub waiter: Option<tokio::sync::oneshot::Receiver<Result<ArkInfo, ConnectError>>>,
+}
+
+impl Deref for ArkInfoHandle {
+	type Target = ArkInfo;
+
+	fn deref(&self) -> &Self::Target {
+		&self.info
+	}
+}
+
+pub struct ServerInfo {
+	/// Protocol version used for rpc protocol.
+	///
+	/// For info on protocol versions, see [server_rpc](crate) module documentation.
+	pub pver: u64,
+	/// Server-side configuration and network parameters returned after connection.
+	pub info: ArkInfo,
+}
+
+impl ServerInfo {
+	pub fn new(pver: u64, info: ArkInfo) -> Self {
+		Self { pver, info }
+	}
+}
+
+#[derive(Default)]
+pub struct ServerConnectionBuilder {
+	address: Option<String>,
+	network: Option<Network>,
+	#[cfg(feature = "socks5-proxy")]
+	proxy: Option<String>,
+	access_token: Option<String>,
+	user_agent: Option<String>,
+}
+
+impl ServerConnectionBuilder {
+	pub fn address(mut self, address: impl Into<String>) -> Self {
+		self.address = Some(address.into());
+		self
+	}
+
+	pub fn network(mut self, network: Network) -> Self {
+		self.network = Some(network);
+		self
+	}
+
+	#[cfg(feature = "socks5-proxy")]
+	pub fn proxy(mut self, proxy: impl Into<String>) -> Self {
+		self.proxy = Some(proxy.into());
+		self
+	}
+
+	#[deprecated(
+		since = "0.2.4",
+		note = "access tokens are not enforced by the server; this method will be removed",
+	)]
+	pub fn access_token(mut self, access_token: impl Into<String>) -> Self {
+		self.access_token = Some(access_token.into());
+		self
+	}
+
+	/// Override the client identifier sent on every RPC.
+	///
+	/// Defaults to `bark/<bark-server-rpc version>` when not set. Integrators
+	/// (FFI bindings, WASM wallets, custom apps) should pass their own ident
+	/// (e.g. `"aqua/1.4.2"`) so server-side telemetry can attribute traffic.
+	pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+		self.user_agent = Some(user_agent.into());
+		self
+	}
+
+	pub async fn connect(self) -> Result<ServerConnection, ConnectError> {
+		ServerConnection::inner_connect(self).await
+	}
+}
+
+/// A managed connection to the Ark server.
+///
+/// This type encapsulates:
+/// - `pver`: The negotiated protocol version for the current session.
+/// - `info`: The server's [ArkInfo] configuration snapshot retrieved at connection time.
+/// - `client`: A ready-to-use gRPC client bound to the same channel used for the handshake.
+#[derive(Clone)]
+pub struct ServerConnection {
+	info: Arc<RwLock<ServerInfo>>,
+	/// The gRPC client to call Ark RPCs.
+	pub client: ArkServiceClient<InterceptedService<transport::Transport, ArkServiceInterceptor>>,
+	/// The mailbox gRPC client to call mailbox RPCs.
+	pub mailbox_client: mailbox::MailboxServiceClient<InterceptedService<transport::Transport, ArkServiceInterceptor>>,
+}
+
+impl ServerConnection {
+	fn handshake_req() -> protos::HandshakeRequest {
+		protos::HandshakeRequest {
+			bark_version: Some(crate::BARK_CRATE_VERSION.into()),
+		}
+	}
+
+	/// Establish a connection to an Ark server and perform protocol negotiation.
+	///
+	/// Steps performed:
+	/// 1. Build and connect a gRPC channel to `address` (with TLS for https).
+	/// 2. Perform the handshake RPC, sending the Bark client version.
+	/// 3. Validate the server's supported protocol range against
+	///    [MIN_PROTOCOL_VERSION]..=[MAX_PROTOCOL_VERSION] and select a version.
+	/// 4. Create a client with a protocol-version interceptor to tag future calls.
+	/// 5. Fetch [ArkInfo] and verify it matches the provided Bitcoin [Network].
+	///
+	/// Returns a [ServerConnection] with:
+	/// - the negotiated protocol version,
+	/// - the server's configuration snapshot,
+	/// - and a gRPC client bound to the established channel.
+	///
+	/// Errors if the server cannot be reached, handshake fails, protocol versions
+	/// are incompatible, or the server's network does not match `network`.
+	pub fn builder() -> ServerConnectionBuilder {
+		ServerConnectionBuilder::default()
+	}
+
+	//TODO(stevenroose) can rename to connect once original removed
+	async fn inner_connect(builder: ServerConnectionBuilder) -> Result<ServerConnection, ConnectError> {
+		let address = builder.address.ok_or(ConnectError::MissingInfo("address"))?;
+		let network = builder.network.ok_or(ConnectError::MissingInfo("network"))?;
+
+		#[cfg(feature = "socks5-proxy")]
+		let transport = if let Some(proxy) = builder.proxy {
+			transport::connect_with_proxy(&address, &proxy).await?
+		} else {
+			transport::connect(&address).await?
+		};
+		#[cfg(not(feature = "socks5-proxy"))]
+		let transport = transport::connect(&address).await?;
+
+		let user_agent = builder.user_agent
+			.unwrap_or_else(|| format!("bark/{}", env!("CARGO_PKG_VERSION")));
+		let user_agent: AsciiMetadataValue = user_agent.try_into()
+			.map_err(ConnectError::InvalidUserAgent)?;
+
+		let mut interceptor = ArkServiceInterceptor {
+			pver: None,
+			#[allow(deprecated)]
+			access_token: builder.access_token
+				.map(AsciiMetadataValue::try_from)
+				.transpose()
+				.map_err(ConnectError::InvalidAccessToken)?,
+			user_agent,
+		};
+
+		let mut handshake_client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone());
+		let handshake = handshake_client.handshake(Self::handshake_req()).await
+			.map_err(ConnectError::Handshake)?.into_inner();
+
+		let pver = check_handshake(handshake)?;
+		interceptor.pver = Some(pver);
+
+		// Advertise zstd so capable servers compress their responses; the
+		// savings are mostly on the response path. We only accept_compressed,
+		// never send_compressed: gRPC can't negotiate request-body compression,
+		// so the client leaves its own requests uncompressed.
+		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
+			.accept_compressed(CompressionEncoding::Zstd)
+			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
+
+		let info = client.ark_info(network).await?;
+
+		let mailbox_client = mailbox::MailboxServiceClient::with_interceptor(transport, interceptor)
+			.accept_compressed(CompressionEncoding::Zstd)
+			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
+
+		let info = Arc::new(RwLock::new(ServerInfo::new(pver, info)));
+		Ok(ServerConnection {
+			info,
+			client,
+			mailbox_client,
+		})
+	}
+
+	#[deprecated(since = "0.1.3", note = "use builder() instead")]
+	pub async fn connect(
+		address: &str,
+		network: Network,
+	) -> Result<ServerConnection, ConnectError> {
+		Self::builder().address(address).network(network).connect().await
+	}
+
+	#[cfg(feature = "socks5-proxy")]
+	#[deprecated(since = "0.1.3", note = "use builder() instead")]
+	pub async fn connect_via_proxy(
+		address: &str,
+		network: Network,
+		proxy: &str,
+	) -> Result<ServerConnection, ConnectError> {
+		Self::builder().address(address).network(network).proxy(proxy).connect().await
+	}
+
+	/// Checks the connection to the Ark server by performing an handshake request.
+	pub async fn check_connection(&self) -> Result<(), ConnectError> {
+		let mut client = self.client.clone();
+		let handshake = client.handshake(Self::handshake_req()).await
+			.map_err(ConnectError::Handshake)?.into_inner();
+		check_handshake(handshake)?;
+		Ok(())
+	}
+
+	/// Returns the cached [ArkInfo].
+	pub async fn ark_info(&self) -> ArkInfo {
+		self.info.read().await.info.clone()
+	}
+
+	/// Fetches the current offboard fee rate from the server.
+	pub async fn offboard_feerate(&self) -> Result<FeeRate, ConnectError> {
+		let resp = self.client.clone()
+			.get_offboard_fee_rate(protos::Empty {}).await
+			.map_err(ConnectError::GetOffboardFeeRate)?
+			.into_inner();
+		Ok(FeeRate::from_sat_per_kwu(resp.sat_vkb / 4))
+	}
+}
+trait ArkServiceClientExt {
+	async fn ark_info(&mut self, network: Network) -> Result<ArkInfo, ConnectError>;
+}
+
+impl<I: Interceptor> ArkServiceClientExt for ArkServiceClient<InterceptedService<transport::Transport, I>> {
+	async fn ark_info(&mut self, network: Network) -> Result<ArkInfo, ConnectError> {
+		let res = self.get_ark_info(protos::Empty {}).await
+			.map_err(ConnectError::GetArkInfo)?;
+		let info = ArkInfo::try_from(res.into_inner())
+			.map_err(ConnectError::InvalidArkInfo)?;
+		if network != info.network {
+			return Err(ConnectError::NetworkMismatch { expected: network, got: info.network });
+		}
+
+		Ok(info)
+	}
+}
+
+fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectError> {
+	if let Some(ref msg) = handshake.psa {
+		warn!("Message from Ark server: \"{}\"", msg);
+	}
+
+	if MAX_PROTOCOL_VERSION < handshake.min_protocol_version {
+		return Err(ConnectError::ProtocolVersionMismatchClientTooOld {
+			client_max: MAX_PROTOCOL_VERSION, server_min: handshake.min_protocol_version
+		});
+	}
+	if MIN_PROTOCOL_VERSION > handshake.max_protocol_version {
+		return Err(ConnectError::ProtocolVersionMismatchServerTooOld {
+			client_min: MIN_PROTOCOL_VERSION, server_max: handshake.max_protocol_version
+		});
+	}
+
+	let pver = cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version);
+	assert!((MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver));
+	assert!((handshake.min_protocol_version..=handshake.max_protocol_version).contains(&pver));
+
+	Ok(pver)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+
+	#[test]
+	fn no_transport_backend_error_mentions_feature_selection() {
+		let err = CreateEndpointError::NoTransportBackend;
+		assert_eq!(err.to_string(), NO_TRANSPORT_BACKEND_MESSAGE);
+		assert!(err.to_string().contains("bark-server-rpc/tonic-native"));
+		assert!(err.to_string().contains("bark-server-rpc/tonic-web"));
+	}
+}

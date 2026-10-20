@@ -1,0 +1,137 @@
+[package]
+name = "bark-wallet"
+version = "0.7.1"
+license = "MIT"
+authors = [ "Team Second <hello@second.tech>" ]
+repository = "https://gitlab.com/ark-bitcoin/bark"
+description = "Wallet library and CLI for the bitcoin Ark protocol built by Second"
+edition = "2024"
+readme = "README.md"
+
+[features]
+default = ["rand", "sqlite", "native", "tls-native-roots", "bitcoind-rpc"]
+
+onchain-bdk = ["bdk_wallet", "bark-bitcoin-ext/bdk"]
+
+# Native bitcoind JSON-RPC backend for the on-chain layer.
+bitcoind-rpc = ["dep:bitcoind-async-client", "dep:zeromq", "bark-bitcoin-ext/rpc-async"]
+
+# The default persistence
+sqlite = ["rusqlite", "bdk_wallet/rusqlite"]
+# Compile SQLite from source instead of linking against the system library; useful for cross-compilation.
+sqlite-bundled = ["sqlite", "rusqlite/bundled"]
+# Used for testing, enables testing storage adaptor implementation
+filestore = ["tokio/fs"]
+indexed-db = ["dep:indexed-db", "dep:web-sys", "dep:serde-wasm-bindgen"]
+
+rand = ["bitcoin/rand", "bip39/rand"]
+
+# TLS implementations
+tls-native-roots = ["bark-server-rpc/tls-native-roots"]
+tls-webpki-roots = ["bark-server-rpc/tls-webpki-roots"]
+
+# Native features
+native = ["bark-server-rpc/tonic-native"]
+socks5-proxy = ["bark-bitcoin-ext/rpc-socks5-proxy", "bark-server-rpc/socks5-proxy", "http"]
+
+# Web features
+wasm-web = [
+	"ark-lib/wasm-web",
+	"bark-server-rpc/tonic-web",
+	"bark-bitcoin-ext/wasm-web",
+	"getrandom",
+	"wasm-bindgen-futures",
+	"dep:wasm-bindgen",
+	"dep:js-sys",
+]
+
+[lib]
+name = "bark"
+path = "src/lib.rs"
+
+[dependencies]
+
+# OWN
+ark-lib = { version = "0.7.1", path = "../lib" }
+bark-common = { version = "0.7.1", path = "../bark-common" }
+bark-runtime = { version = "0.7.1", path = "../bark-runtime" }
+bark-bitcoin-ext = { version = "0.7.1", path = "../bitcoin-ext", default-features = false, features = [
+	"bdk", "rpc",
+]}
+bark-server-rpc = { version = "0.7.1", path = "../server-rpc", default-features = false }
+bip321 = { version = "0.4.0", path = "../bip321"  }
+
+# EXPORTED
+bitcoin.workspace = true
+lightning-invoice.workspace = true
+lnurl-rs.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+tokio-util.workspace = true
+
+# INTERNAL
+rand.workspace = true
+
+lazy_static.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+config.workspace = true
+
+bip39.workspace = true
+bdk_core = { workspace = true }
+bdk_bitcoind_rpc = { workspace = true }
+bdk_esplora = { workspace = true }
+bitcoind-async-client = { workspace = true, optional = true }
+# crate used by bdk_esplora, first version with submit_package
+esplora-client = { workspace = true }
+lightning.workspace = true
+
+tonic = { version = "0.14.2", default-features = false }
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream.workspace = true
+# ZMQ block notifications for the bitcoind tip watcher
+zeromq = { version = "0.6", optional = true }
+futures.workspace = true
+parking_lot.workspace = true
+http = { workspace = true, optional = true }
+
+# Only used for built-in BDK Wallet
+bdk_wallet = { workspace = true, optional = true }
+
+indexed-db = { version = "0.4.2", optional = true }
+web-sys = { version = "0.3.83", optional = true }
+serde-wasm-bindgen = { version = "0.6.5", optional = true }
+
+# Storage clients crates
+rusqlite = { version = "0.31.0", features = ["chrono"], optional = true }
+
+wasm-bindgen-futures = { version = "0.4.56", optional = true }
+# Used by lock_manager::web_locks to call navigator.locks via js-sys::Reflect.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+# needed to force dependencies to use js features
+getrandom = { version = "0.4.2", features = ["wasm_js"], optional = true }
+
+# Used by lock_manager for POSIX fcntl advisory locks (Linux/macOS/iOS/Android).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# tokio/fs is not available on wasm32 (no filesystem).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+ark-lib = { path = "../lib", features = [ "test-util" ] }
+bdk_wallet = { workspace = true, features = ["test-utils"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+console_log = "1.0.0"
+
+# tempfile doesn't work on WASM (no filesystem), only include for native tests
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = "3"

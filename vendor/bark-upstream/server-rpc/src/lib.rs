@@ -1,0 +1,191 @@
+//!
+//!
+//! # Note on protocol version
+//!
+//! Whenever anything changes related to the interactions between client and
+//! server, including protocol encoding versions, gRPC data fields, expected
+//! behavior etc, that is not automatically backwards compatible, the protocol
+//! version is bumped.
+//!
+//! Both the server and the client can be implemented so as to support multiple
+//! different protocol versions. This gives maximum flexibility to implement
+//! compatibility for both sides.
+//!
+//! The server advertises the protocol versions it supports and the client picks
+//! one and sets it in the header of each subsequent request.
+//!
+//! However, the server will only check the protocol version in cases where
+//! behavior can be different for different versions. This gives outdated or
+//! exotic clients an extra level of flexibility, as calls that have not
+//! changed since the latest supported protocol version might still work.
+//!
+//! This makes the server maximally flexible and puts all the responsibility
+//! on the client. Our own client implementation bails out if it cannot speak
+//! any of the supported protocol versions the server supports.
+//!
+//! ## Protocol version changelog
+//!
+//! * `1`: initial version
+//! * `2`: fixed the offboard sighash for multi-input offboards
+//! * `3`: checkpoint the lightning-receive claim so the watchman can't
+//!   force-exit a freshly claimed VTXO
+//! * `4`: ppm fees round up to a satoshi instead of down; ppm expiry fees
+//!   are calculated on the exact total across all VTXOs
+
+#[cfg(all(any(target_os = "android", target_os = "ios"), feature = "tls-native-roots"))]
+compile_error!("feature `tls-native-roots` can't be used on Android or iOS, use `tls-webpki-roots` instead");
+
+pub extern crate tonic;
+
+// Generated gRPC method lookup from proto files (server-only)
+#[cfg(feature = "server")]
+include!(concat!(env!("OUT_DIR"), "/grpc_methods.rs"));
+
+mod convert;
+pub use crate::convert::{ConvertError, TryFromBytes};
+
+mod error;
+pub use crate::error::StatusExt;
+
+pub mod pver;
+
+pub mod client;
+/// Terms of service may apply, check your server's `ArkInfo.tos_link`.
+pub mod protos {
+	pub mod core {
+		tonic::include_proto!("core");
+	}
+	pub use self::core::*;
+	pub mod bark_server {
+		tonic::include_proto!("bark_server");
+	}
+	pub use self::bark_server::*;
+	pub mod intman {
+		tonic::include_proto!("intman");
+	}
+	pub mod mailbox_server {
+		tonic::include_proto!("mailbox_server");
+	}
+}
+
+pub use client::ServerConnection;
+pub use crate::protos::bark_server::ark_service_client::ArkServiceClient;
+
+pub mod admin {
+	pub use crate::protos::bark_server::wallet_admin_service_client::WalletAdminServiceClient;
+	pub use crate::protos::bark_server::round_admin_service_client::RoundAdminServiceClient;
+	pub use crate::protos::bark_server::lightning_admin_service_client::LightningAdminServiceClient;
+	pub use crate::protos::bark_server::sweep_admin_service_client::SweepAdminServiceClient;
+	pub use crate::protos::bark_server::ban_admin_service_client::BanAdminServiceClient;
+	pub use crate::protos::bark_server::nursery_admin_service_client::NurseryAdminServiceClient;
+}
+
+#[cfg(feature = "intman")]
+pub mod intman {
+	pub use crate::protos::intman::integration_service_client::IntegrationServiceClient;
+}
+
+#[cfg(feature = "server")]
+pub mod server {
+	pub use crate::protos::bark_server::ark_service_server::{ArkService, ArkServiceServer};
+	pub use crate::protos::bark_server::wallet_admin_service_server::{WalletAdminService, WalletAdminServiceServer};
+	pub use crate::protos::bark_server::round_admin_service_server::{RoundAdminService, RoundAdminServiceServer};
+	pub use crate::protos::bark_server::lightning_admin_service_server::{LightningAdminService, LightningAdminServiceServer};
+	pub use crate::protos::bark_server::sweep_admin_service_server::{SweepAdminService, SweepAdminServiceServer};
+	pub use crate::protos::bark_server::ban_admin_service_server::{BanAdminService, BanAdminServiceServer};
+	pub use crate::protos::bark_server::nursery_admin_service_server::{NurseryAdminService, NurseryAdminServiceServer};
+	pub use crate::protos::intman::integration_service_server::{IntegrationService, IntegrationServiceServer};
+	pub use crate::protos::mailbox_server::mailbox_service_server::{MailboxService, MailboxServiceServer};
+}
+
+pub mod mailbox {
+	pub use crate::protos::mailbox_server::mailbox_service_client::MailboxServiceClient;
+}
+
+
+use std::borrow::BorrowMut;
+use std::str::FromStr;
+use std::time::Duration;
+
+use bitcoin::{Address, Amount, OutPoint};
+use bitcoin::address::NetworkUnchecked;
+
+
+/// The minimum protocol version supported by the client.
+///
+/// For info on protocol versions, see [server_rpc](crate) module documentation.
+pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
+
+/// The maximum protocol version supported by the client.
+///
+/// For info on protocol versions, see [server_rpc](crate) module documentation.
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
+
+/// The bark client version sent in HandshakeRequest. Exposed so
+/// alternate callers (e.g. integration tests) send the same string a
+/// real client would.
+pub const BARK_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The string used in the gRPC HTTP header for the protocol version.
+pub const PROTOCOL_VERSION_HEADER: &str = "pver";
+
+/// The maximum number of recovery IDs that the server accepts per request.
+pub const MAX_NB_MAILBOX_RECOVERY_IDS: usize = 20;
+
+/// The maximum number of vtxo IDs that the server accepts per forfeit nonces request.
+pub const MAX_NB_FORFEIT_NONCE_IDS: usize = 1000;
+
+/// The maximum number of vtxos that the server accepts per arkoor mailbox
+/// post. Generous for a single payment's outputs to one recipient; clients
+/// sending more should split into multiple posts.
+pub const MAX_NB_MAILBOX_ARKOOR_VTXOS: usize = 100;
+
+/// The maximum number of inputs of a board funding tx
+pub const MAX_NB_BOARD_FUNDING_INPUTS: usize = 100;
+
+
+#[derive(Debug, Clone)]
+pub struct WalletStatus {
+	pub address: Address<NetworkUnchecked>,
+	pub total_balance: Amount,
+	pub trusted_balance: Amount,
+	pub untrusted_balance: Amount,
+	pub confirmed_utxos: Vec<OutPoint>,
+	pub unconfirmed_utxos: Vec<OutPoint>,
+}
+
+/// Extension trait on [tonic::Request].
+pub trait RequestExt<T>: BorrowMut<tonic::Request<T>> {
+	/// Check for the protocol version header.
+	///
+	/// Returns None in case of missing header.
+	fn try_pver(&self) -> Result<Option<u64>, tonic::Status> {
+		self.borrow().metadata().get(PROTOCOL_VERSION_HEADER).map(|v| {
+			v.to_str().ok().and_then(|s| u64::from_str(s).ok())
+				.ok_or_else(|| tonic::Status::invalid_argument("invalid protocol version header"))
+		}).transpose()
+	}
+
+	/// Check for the protocol version header.
+	///
+	/// Returns error in case of missing header.
+	fn pver(&self) -> Result<u64, tonic::Status> {
+		self.try_pver()?.ok_or_else(|| tonic::Status::invalid_argument("missing pver header"))
+	}
+
+	/// Set the protocol version header.
+	fn set_pver(&mut self, pver: u64) {
+		self.borrow_mut().metadata_mut().insert(PROTOCOL_VERSION_HEADER, pver.into());
+	}
+
+	/// Sets a request timeout only if no timeout has already been set
+	fn set_default_timeout(&mut self, timeout: Duration) {
+		const GRPC_TIMEOUT_HEADER: &str = "grpc-timeout";
+
+		let slf = self.borrow_mut();
+		if slf.metadata().get(GRPC_TIMEOUT_HEADER).is_none () {
+			slf.set_timeout(timeout);
+		}
+	}
+}
+impl<T> RequestExt<T> for tonic::Request<T> {}

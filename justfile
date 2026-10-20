@@ -23,6 +23,19 @@ check:
 check-lib-arithmetic:
 	cargo clippy --locked -p ark-lib --tests
 
+# Rebuild sdk/protocol/rpc from vendor/bark-upstream + patches/.
+bark-sync:
+	bash contrib/bark/sync.sh
+
+# Fail if the patched crates are out of sync with patches/.
+bark-check:
+	bash contrib/bark/sync.sh
+	git diff --exit-code -- sdk protocol rpc
+
+# Vendor a new upstream bark revision, then run bark-sync.
+bark-update REV:
+	bash contrib/bark/update.sh {{REV}}
+
 checks: prechecks check-lib-arithmetic check
 
 build:

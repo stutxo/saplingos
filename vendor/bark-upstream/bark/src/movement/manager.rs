@@ -1,0 +1,554 @@
+use std::cmp::PartialEq;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+
+use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem};
+use crate::movement::error::MovementError;
+use crate::movement::update::MovementUpdate;
+use crate::notification::NotificationDispatch;
+use crate::persist::BarkPersister;
+use crate::subsystem::Subsystem;
+
+/// A minimalist helper class to handle movement registration and updating based on unique
+/// [Subsystem] values.
+pub struct MovementManager {
+	db: Arc<dyn BarkPersister>,
+	subsystem_ids: RwLock<HashSet<Subsystem>>,
+	active_movements: RwLock<HashMap<MovementId, Arc<Mutex<Movement>>>>,
+	notifications: NotificationDispatch,
+}
+
+impl MovementManager {
+	/// Creates an instances of the [MovementManager].
+	pub(crate) fn new(
+		db: Arc<dyn BarkPersister>,
+		notifications: NotificationDispatch,
+	) -> Self {
+		Self {
+			db, notifications,
+			subsystem_ids: RwLock::new(HashSet::new()),
+			active_movements: RwLock::new(HashMap::new()),
+		}
+	}
+
+	/// Registers a subsystem with the movement manager. Subsystems are identified using unique
+	/// names, to maintain this guarantee a unique [Subsystem] will be generated and returned by
+	/// this function. Future calls to register or modify movements must provide this ID.
+	pub async fn register_subsystem(&self, id: Subsystem) -> anyhow::Result<(), MovementError> {
+		let mut guard = self.subsystem_ids.write().await;
+		if guard.contains(&id) {
+			Err(MovementError::SubsystemError {
+				id, error: "Subsystem already registered".into(),
+			})
+		} else {
+			guard.insert(id);
+			Ok(())
+		}
+	}
+
+	/// Persists the new movement to the db
+	///
+	/// This is a helper for the constructors but doesn't emit a notification.
+	async fn persist_new_movement(
+		&self,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		action_id: Option<&str>,
+	) -> anyhow::Result<MovementId, MovementError> {
+		self.db.create_new_movement(
+			MovementStatus::Pending,
+			&MovementSubsystem {
+				name: subsystem_id.as_name().to_string(),
+				kind: movement_kind.into(),
+			},
+			chrono::Local::now(),
+			action_id,
+		).await.map_err(|e| MovementError::CreationError { e })
+	}
+
+	/// Begins the process of creating a new movement. This newly created movement will be defaulted
+	/// to a [MovementStatus::Pending] state. It can then be updated by using [MovementUpdate] in
+	/// combination with [MovementManager::update_movement].
+	///
+	/// [MovementManager::finish_movement] can be used once a movement has finished (whether
+	/// successful or not).
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - subsystem_id: The ID of the subsystem that wishes to start a new movement.
+	/// - movement_kind: A descriptor for the type of movement being performed, e.g. "send",
+	///   "receive", "round".
+	///
+	/// Errors:
+	/// - If the subsystem ID is not recognized.
+	/// - If a database error occurs.
+	pub async fn new_movement(
+		&self,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+	) -> anyhow::Result<MovementId, MovementError> {
+		let id = self.persist_new_movement(subsystem_id, movement_kind, None).await?;
+		let movement = self.db.get_movement_by_id(id).await
+			.map_err(|e| MovementError::LoadError { id, e })?;
+		self.notifications.dispatch_movement_created(movement);
+		Ok(id)
+	}
+
+	/// Creates a new [Movement] and returns a [MovementGuard] to manage it. The guard will call
+	/// [MovementManager::finish_movement] on drop unless [MovementGuard::success] has already been
+	/// called.
+	///
+	/// See [MovementManager::new_movement] and [MovementGuard::new] for more information.
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - subsystem_id: The ID of the subsystem that wishes to start a new movement.
+	/// - movement_kind: A descriptor for the type of movement being performed, e.g. "send",
+	///   "receive", "round".
+	/// - on_drop: Determines what status the movement will be set to when the guard is dropped.
+	pub async fn new_guarded_movement(
+		self: &Arc<Self>,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		on_drop: OnDropStatus,
+	) -> anyhow::Result<MovementGuard, MovementError> {
+		Ok(MovementGuard::new(
+			self.new_movement(subsystem_id, movement_kind).await?, self.clone(), on_drop,
+		))
+	}
+
+	/// Similar to [MovementManager::new_movement] but it immediately calls
+	/// [MovementManager::update_movement] afterward.
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - subsystem_id: The ID of the subsystem that wishes to start a new movement.
+	/// - movement_kind: A descriptor for the type of movement being performed, e.g. "send",
+	///   "receive", "round".
+	/// - update: Describes the initial state of the movement.
+	///
+	/// Errors:
+	/// - If the subsystem ID is not recognized.
+	/// - If a database error occurs.
+	pub async fn new_movement_with_update(
+		&self,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		update: MovementUpdate,
+	) -> anyhow::Result<MovementId, MovementError> {
+		let id = self.persist_new_movement(subsystem_id, movement_kind, None).await?;
+		self.update_movement(id, update).await?;
+		let movement = self.db.get_movement_by_id(id).await
+			.map_err(|e| MovementError::LoadError { id, e })?;
+		self.notifications.dispatch_movement_created(movement);
+		Ok(id)
+	}
+
+	/// Find-or-create the movement owned by `action_id`, applying `update` on
+	/// first creation.
+	///
+	/// This is the idempotent counterpart to [MovementManager::new_movement_with_update]
+	/// for movements created mid-way through a wallet action: a re-driven step
+	/// (crash recovery, an early wake, the reentrancy double-drive) reuses the
+	/// existing movement instead of inserting a duplicate. The `created`
+	/// notification is dispatched only on the first, real insert.
+	pub async fn get_or_create_movement_with_action(
+		&self,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		action_id: &str,
+		update: MovementUpdate,
+	) -> anyhow::Result<MovementId, MovementError> {
+		let subsystem = MovementSubsystem {
+			name: subsystem_id.as_name().to_string(),
+			kind: movement_kind.into(),
+		};
+		let (id, created) = self.db.get_or_create_movement_for_action(
+			&subsystem, chrono::Local::now(), action_id, update,
+		).await.map_err(|e| MovementError::CreationError { e })?;
+
+		// Only the first, real insert should announce the movement.
+		if created {
+			let movement = self.db.get_movement_by_id(id).await
+				.map_err(|e| MovementError::LoadError { id, e })?;
+			self.notifications.dispatch_movement_created(movement);
+		}
+		Ok(id)
+	}
+
+	/// Similar to [MovementManager::new_guarded_movement] but it immediately calls
+	/// [MovementManager::update_movement] after creating the [Movement].
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - subsystem_id: The ID of the subsystem that wishes to start a new movement.
+	/// - movement_kind: A descriptor for the type of movement being performed, e.g. "send",
+	///   "receive", "round".
+	/// - on_drop: Determines what status the movement will be set to when the guard is dropped.
+	/// - update: Describes the initial state of the movement.
+	///
+	/// Errors:
+	/// - If the subsystem ID is not recognized.
+	/// - If a database error occurs.
+	pub async fn new_guarded_movement_with_update(
+		self: &Arc<Self>,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		on_drop: OnDropStatus,
+		update: MovementUpdate,
+	) -> anyhow::Result<MovementGuard, MovementError> {
+		Ok(MovementGuard::new(
+			self.new_movement_with_update(subsystem_id, movement_kind, update).await?,
+			self.clone(),
+			on_drop,
+		))
+	}
+
+	/// Creates and marks a [Movement] as finished based on the given parameters. This is useful for
+	/// one-shot movements where the details are known at the time of creation, an example would be
+	/// when receiving funds asynchronously from a third party.
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - subsystem_id: The ID of the subsystem that wishes to start a new movement.
+	/// - movement_kind: A descriptor for the type of movement being performed, e.g. "send",
+	///   "receive", "round".
+	/// - status: The [MovementStatus] to set. This can't be [MovementStatus::Pending].
+	/// - details: Contains information about the movement, e.g. what VTXOs were consumed or
+	///   produced.
+	///
+	/// Errors:
+	/// - If the subsystem ID is not recognized.
+	/// - If [MovementStatus::Pending] is given.
+	/// - If a database error occurs.
+	pub async fn new_finished_movement(
+		&self,
+		subsystem_id: Subsystem,
+		movement_kind: impl Into<String>,
+		status: MovementStatus,
+		details: MovementUpdate,
+	) -> anyhow::Result<MovementId, MovementError> {
+		if status == MovementStatus::Pending {
+			return Err(MovementError::IncorrectPendingStatus);
+		}
+		let id = self.persist_new_movement(subsystem_id, movement_kind, None).await?;
+		let mut movement = self.db.get_movement_by_id(id).await
+			.map_err(|e| MovementError::LoadError { id, e })?;
+		let at = chrono::Local::now();
+		details.apply_to(&mut movement, at);
+		movement.status = status;
+		movement.time.completed_at = Some(at);
+		self.db.update_movement(&movement).await
+			.map_err(|e| MovementError::PersisterError { id, e })?;
+		self.notifications.dispatch_movement_created(movement);
+		Ok(id)
+	}
+
+	/// Updates a movement with the given parameters.
+	///
+	/// See also: [MovementManager::new_movement] and [MovementManager::finish_movement]
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - id: The ID of the movement previously created by [MovementManager::new_movement].
+	/// - update: Specifies properties to set on the movement. `Option` fields will be ignored if
+	///   they are `None`. `Some` will result in that particular field being overwritten.
+	///
+	/// Errors:
+	/// - If the [MovementId] is not recognized.
+	/// - If a movement is not [MovementStatus::Pending].
+	/// - If a database error occurs.
+	pub async fn update_movement(
+		&self,
+		id: MovementId,
+		update: MovementUpdate,
+	) -> anyhow::Result<(), MovementError> {
+		// Ensure the movement is loaded.
+		let mut guard = self.get_cached_movement(id).await?;
+
+		// Apply the update to the movement.
+		update.apply_to(&mut *guard, chrono::Local::now());
+
+		// Persist the changes using a read lock.
+		self.db.update_movement(&guard).await
+			.map_err(|e| MovementError::PersisterError { id, e })?;
+
+		self.notifications.dispatch_movement_updated(guard.clone());
+
+		// Drop the movement if it's in a finished state as this was likely a one-time update.
+		if guard.status != MovementStatus::Pending {
+			drop(guard);
+			self.unload_movement_from_cache(id).await?;
+		}
+		Ok(())
+	}
+
+	/// Applies an [RFC 7396](https://www.rfc-editor.org/rfc/rfc7396) JSON Merge Patch to a
+	/// movement's metadata. A non-object patch resets metadata to an empty object.
+	pub async fn patch_metadata(
+		&self,
+		id: MovementId,
+		patch: &serde_json::Value,
+	) -> anyhow::Result<(), MovementError> {
+		let mut guard = self.get_cached_movement(id).await?;
+
+		let mut value = serde_json::Value::Object(std::mem::take(&mut guard.metadata));
+		crate::utils::json_patch::merge(&mut value, patch);
+		guard.metadata = match value {
+			serde_json::Value::Object(map) => map,
+			_ => serde_json::Map::new(),
+		};
+		guard.time.updated_at = chrono::Local::now();
+
+		self.db.update_movement(&guard).await
+			.map_err(|e| MovementError::PersisterError { id, e })?;
+		self.notifications.dispatch_movement_updated(guard.clone());
+
+		if guard.status != MovementStatus::Pending {
+			drop(guard);
+			self.unload_movement_from_cache(id).await?;
+		}
+		Ok(())
+	}
+
+	/// Finalizes a movement, setting it to the given [MovementStatus].
+	///
+	/// See also: [MovementManager::new_movement] and [MovementManager::update_movement]
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - id: The ID of the movement previously created by [MovementManager::new_movement].
+	/// - new_status: The final [MovementStatus] to set. This can't be [MovementStatus::Pending].
+	///
+	/// Errors:
+	/// - If the movement ID is not recognized.
+	/// - If [MovementStatus::Pending] is given.
+	/// - If a database error occurs.
+	pub async fn finish_movement(
+		&self,
+		id: MovementId,
+		new_status: MovementStatus,
+	) -> anyhow::Result<(), MovementError> {
+		if new_status == MovementStatus::Pending {
+			return Err(MovementError::IncorrectPendingStatus);
+		}
+
+		// Ensure the movement is loaded.
+		let mut guard = self.get_cached_movement(id).await?;
+
+		// Update the status and persist it.
+		guard.status = new_status;
+		guard.time.completed_at = Some(chrono::Local::now());
+		self.db.update_movement(&*guard).await
+			.map_err(|e| MovementError::PersisterError { id, e })?;
+
+		self.notifications.dispatch_movement_updated(guard.clone());
+
+		drop(guard);
+		self.unload_movement_from_cache(id).await
+	}
+
+	/// Applies a [MovementUpdate] before finalizing the movement with
+	/// [MovementManager::finish_movement].
+	///
+	/// This method also dispatches the movement as a notification.
+	///
+	/// Parameters:
+	/// - id: The ID of the movement previously created by [MovementManager::new_movement].
+	/// - new_status: The final [MovementStatus] to set. This can't be [MovementStatus::Pending].
+	/// - update: Contains information to apply to the movement before finalizing it.
+	///
+	/// Errors:
+	/// - If the movement ID is not recognized.
+	/// - If [MovementStatus::Pending] is given.
+	/// - If a database error occurs.
+	pub async fn finish_movement_with_update(
+		&self,
+		id: MovementId,
+		new_status: MovementStatus,
+		update: MovementUpdate,
+	) -> anyhow::Result<(), MovementError> {
+		if new_status == MovementStatus::Pending {
+			return Err(MovementError::IncorrectPendingStatus);
+		}
+
+		let mut guard = self.get_cached_movement(id).await?;
+
+		update.apply_to(&mut *guard, chrono::Local::now());
+		guard.status = new_status;
+		guard.time.completed_at = Some(chrono::Local::now());
+		self.db.update_movement(&*guard).await
+			.map_err(|e| MovementError::PersisterError { id, e })?;
+
+		self.notifications.dispatch_movement_updated(guard.clone());
+
+		drop(guard);
+		self.unload_movement_from_cache(id).await
+	}
+
+	async fn get_cached_movement(
+		&self,
+		id: MovementId,
+	) -> anyhow::Result<OwnedMutexGuard<Movement>, MovementError> {
+		if let Some(lock) = self.active_movements.read().await.get(&id).cloned() {
+			return Ok(lock.lock_owned().await);
+		}
+
+		let movement_lock = {
+			// Acquire a write lock and check if another thread already loaded the movement.
+			let active_guard = self.active_movements.write().await;
+			if let Some(lock) = active_guard.get(&id).cloned() {
+				lock
+			} else {
+				Arc::new(Mutex::new(
+					self.db.get_movement_by_id(id).await
+						.map_err(|e| MovementError::LoadError { id, e })?
+				))
+			}
+		};
+		Ok(movement_lock.lock_owned().await)
+	}
+
+	async fn unload_movement_from_cache(&self, id: MovementId) -> anyhow::Result<(), MovementError> {
+		let mut lock = self.active_movements.write().await;
+		lock.remove(&id);
+		Ok(())
+	}
+}
+
+/// Determines the state to set a [Movement] to when a [MovementGuard] is dropped.
+///
+/// See [MovementGuard::new] for more information.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum OnDropStatus {
+	/// Marks the [Movement] as [MovementStatus::Canceled].
+	Canceled,
+	/// Marks the [Movement] as [MovementStatus::Failed].
+	Failed,
+}
+
+impl From<OnDropStatus> for MovementStatus {
+	fn from(status: OnDropStatus) -> Self {
+		match status {
+			OnDropStatus::Canceled => MovementStatus::Canceled,
+			OnDropStatus::Failed => MovementStatus::Failed,
+		}
+	}
+}
+
+/// A RAII helper class to ensure that pending movements get marked as finished in case an error
+/// occurs. You can construct a guard for an existing [Movement] with [MovementGuard::new].
+/// Alternatively, a [MovementGuard] can be coupled to a movement using
+/// [MovementGuard::new].
+///
+/// When the [MovementGuard] is dropped from the stack, it will finalize the movement according to
+/// the configured [OnDropStatus] unless [MovementGuard::success] has already been called.
+pub struct MovementGuard {
+	id: MovementId,
+	manager: Arc<MovementManager>,
+	on_drop: OnDropStatus,
+	has_finished: bool,
+}
+
+impl<'a> MovementGuard {
+	/// Constructs a [MovementGuard] to manage a pre-existing [Movement].
+	///
+	/// Parameters:
+	/// - id: The ID of the [Movement] to update.
+	/// - manager: A reference to the [MovementManager] so the guard can update the [Movement].
+	/// - on_drop: Determines what status the movement will be set to when the guard is dropped.
+	pub fn new(
+		id: MovementId,
+		manager: Arc<MovementManager>,
+		on_drop: OnDropStatus,
+	) -> Self {
+		Self {
+			id,
+			manager,
+			on_drop,
+			has_finished: false,
+		}
+	}
+
+	/// Gets the [MovementId] stored by this guard.
+	pub fn id(&self) -> MovementId {
+		self.id
+	}
+
+	/// Sets a different [OnDropStatus] to apply to the movement upon dropping the [MovementGuard].
+	///
+	/// Parameters:
+	/// - on_drop: Determines what status the movement will be set to when the guard is dropped.
+	pub fn set_on_drop_status(&mut self, status: OnDropStatus) {
+		self.on_drop = status;
+	}
+
+	/// Applies an update to the managed [Movement].
+	///
+	/// See [MovementManager::update_movement] for more information.
+	///
+	/// Parameters:
+	/// - update: Specifies properties to set on the movement. `Option` fields will be ignored if
+	///   they are `None`. `Some` will result in that particular field being overwritten.
+	pub async fn apply_update(
+		&self,
+		update: MovementUpdate,
+	) -> anyhow::Result<(), MovementError> {
+		self.manager.update_movement(self.id, update).await
+	}
+
+	/// Same as [MovementGuard::success] but sets [Movement::status] to [MovementStatus::Canceled].
+	pub async fn cancel(&mut self) -> anyhow::Result<(), MovementError> {
+		self.stop();
+		self.manager.finish_movement(self.id, MovementStatus::Canceled).await
+	}
+
+	/// Same as [MovementGuard::success] but sets [Movement::status] to [MovementStatus::Failed].
+	pub async fn fail(&mut self) -> anyhow::Result<(), MovementError> {
+		self.stop();
+		self.manager.finish_movement(self.id, MovementStatus::Failed).await
+	}
+
+	/// Finalizes a movement, setting it to [MovementStatus::Successful]. If the [MovementGuard] is
+	/// dropped after calling this function, no further changes will be made to the [Movement].
+	///
+	/// See [MovementManager::finish_movement] for more information.
+	pub async fn success(
+		&mut self,
+	) -> anyhow::Result<(), MovementError> {
+		self.stop();
+		self.manager.finish_movement(self.id, MovementStatus::Successful).await
+	}
+
+	/// Prevents the guard from making further changes to the movement after being dropped. Manual
+	/// actions such as [MovementGuard::apply_update] will continue to work.
+	pub fn stop(&mut self) {
+		self.has_finished = true;
+	}
+}
+
+impl Drop for MovementGuard {
+	fn drop(&mut self) {
+		if !self.has_finished {
+			// Asynchronously mark the movement as finished since we are being dropped.
+			let manager = self.manager.clone();
+			let id = self.id;
+			let on_drop = self.on_drop;
+
+			crate::utils::spawn(async move {
+				if let Err(e) = manager.finish_movement(id, on_drop.into()).await {
+					log::error!("An error occurred in MovementGuard::drop(): {:#}", e);
+				}
+			});
+		}
+	}
+}

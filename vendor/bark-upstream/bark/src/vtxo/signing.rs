@@ -1,0 +1,73 @@
+
+use bitcoin::secp256k1::schnorr;
+use bitcoin::{taproot, TapSighash, Witness};
+use bitcoin::key::Keypair;
+use log::error;
+
+use ark::VtxoPolicy;
+use ark::vtxo::{TapScriptClause, Vtxo, VtxoClause};
+use ark::vtxo::policy::signing::VtxoSigner;
+
+use crate::{SECP, Wallet};
+
+impl Wallet {
+	pub (crate) async fn clause_keypair(&self, clause: &VtxoClause) -> Option<Keypair> {
+		let clause_pubkey = clause.pubkey();
+		self.pubkey_keypair(&clause_pubkey).await.ok()
+			.flatten().map(|(_, keypair)| keypair)
+	}
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl VtxoSigner for Wallet {
+	async fn sign_keyspend<G: Sync + Send>(
+		&self,
+		vtxo: &Vtxo<G, VtxoPolicy>,
+		_sighash: TapSighash,
+	) -> Option<schnorr::Signature> {
+		error!(
+			"CODE BUG: wallet was asked to sign a keyspend clause but that should never happen \
+				(VTXO ID: {}; policy type: {})", vtxo.id(), vtxo.policy_type(),
+		);
+		None
+	}
+
+	async fn witness(
+		&self,
+		clause: &VtxoClause,
+		control_block: &taproot::ControlBlock,
+		sighash: TapSighash,
+	) -> Option<Witness> {
+		let signature = match self.clause_keypair(clause).await {
+			Some(keypair) => {
+				SECP.sign_schnorr_with_aux_rand(&sighash.into(), &keypair, &rand::random())
+			},
+			None => return None,
+		};
+
+		match clause {
+			VtxoClause::DelayedSign(c) => Some(c.witness(&signature, control_block)),
+			VtxoClause::DelayedTimelockSign(c) => Some(c.witness(&signature, &control_block)),
+			VtxoClause::TimelockSign(c) => Some(c.witness(&signature, &control_block)),
+			VtxoClause::HashDelaySign(c) => {
+				let preimage = self.lightning_receive_preimage(c.hash.into())
+					.await.ok().flatten();
+
+				preimage.map(|p| c.witness(
+					&(signature, p.to_byte_array()), &control_block,
+				))
+			},
+			VtxoClause::HashDelaySign_v0(c) => {
+				let preimage = self.lightning_receive_preimage(c.hash.into())
+					.await.ok().flatten();
+
+				preimage.map(|p| c.witness(
+					&(signature, p.to_byte_array()), &control_block,
+				))
+			},
+			VtxoClause::HashSign(_) => None, // Not used by bark
+			VtxoClause::HashSign_v0(_) => None, // Not used by bark
+		}
+	}
+}

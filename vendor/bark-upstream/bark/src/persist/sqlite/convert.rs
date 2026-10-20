@@ -1,0 +1,120 @@
+
+use std::borrow::Borrow;
+use std::fmt;
+use std::str::FromStr;
+
+use bitcoin::{Amount, SignedAmount, Weight};
+use chrono::DateTime;
+use rusqlite::{Row, RowIndex, Rows};
+use rusqlite::types::FromSql;
+use serde::Deserialize;
+
+use ark::{ProtocolEncoding, Vtxo};
+
+use crate::WalletVtxo;
+use crate::movement::{
+	MovementDestination, Movement, MovementId, MovementStatus, MovementSubsystem, MovementTimestamp,
+	PaymentMethod,
+};
+use crate::vtxo::VtxoState;
+
+#[allow(unused)]
+pub trait RowExt<'a>: Borrow<Row<'a>> {
+	/// We need the value from a potentially optional column
+	fn need<I, T>(&self, idx: I) -> anyhow::Result<T>
+	where
+		I: RowIndex + Clone + fmt::Display,
+		T: FromSql,
+	{
+		match self.borrow().get::<I, Option<T>>(idx.clone())? {
+			Some(v) => Ok(v),
+			None => bail!("missing value for column '{}'", idx),
+		}
+	}
+}
+
+impl<'a> RowExt<'a> for Row<'a> {}
+
+pub(crate) fn row_to_movement(row: &Row) -> anyhow::Result<Movement> {
+	fn from_json_text_to_vec<T: for<'de> Deserialize<'de>>(json: String) -> anyhow::Result<Vec<T>, rusqlite::Error> {
+		if json == "null" {
+			Ok(Vec::new())
+		} else {
+			let r = from_json_text(&json)?;
+			Ok(r)
+		}
+	}
+	fn from_json_text<T: for<'de> Deserialize<'de>>(json: &str) -> anyhow::Result<T, rusqlite::Error> {
+		serde_json::from_str(json)
+			.map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+				12, rusqlite::types::Type::Text, Box::new(e),
+			))
+	}
+	Ok(Movement {
+		id: MovementId::new(row.get("id")?),
+		status: MovementStatus::from_str(&row.get::<_, String>("status")?)?,
+		subsystem: MovementSubsystem {
+			name: row.get("subsystem_name")?,
+			kind: row.get("movement_kind")?,
+		},
+		metadata: row.get::<_, Option<String>>("metadata")?
+			.map(|s| from_json_text(&s))
+			.unwrap_or_else(|| Ok(serde_json::Map::new()))?,
+		intended_balance: SignedAmount::from_sat(row.get("intended_balance")?),
+		effective_balance: SignedAmount::from_sat(row.get("effective_balance")?),
+		offchain_fee: Amount::from_sat(row.get("offchain_fee")?),
+		sent_to: destinations_from_json(row.get("sent_to")?)?,
+		received_on: destinations_from_json(row.get("received_on")?)?,
+		input_vtxos: from_json_text_to_vec(row.get("input_vtxos")?)?,
+		output_vtxos: from_json_text_to_vec(row.get("output_vtxos")?)?,
+		exited_vtxos: from_json_text_to_vec(row.get("exited_vtxos")?)?,
+		time: MovementTimestamp {
+			created_at: row.get::<_, DateTime<chrono::Utc>>("created_at")?
+				.with_timezone(&chrono::Local),
+			updated_at: row.get::<_, DateTime<chrono::Utc>>("updated_at")?
+				.with_timezone(&chrono::Local),
+			completed_at: row.get::<_, Option<DateTime<chrono::Utc>>>("completed_at")?
+				.map(|ts| ts.with_timezone(&chrono::Local)),
+		},
+	})
+}
+
+#[derive(Deserialize)]
+struct SqlDestination {
+	destination_type: String,
+	destination_value: String,
+	amount: u64,
+}
+
+fn destinations_from_json(json: String) -> anyhow::Result<Vec<MovementDestination>> {
+	if json == "null" {
+		return Ok(Vec::new());
+	}
+	let rows: Vec<SqlDestination> = serde_json::from_str(&json)?;
+	rows.into_iter().map(|row| {
+		let destination = PaymentMethod::from_type_value(&row.destination_type, &row.destination_value)?;
+		let amount = Amount::from_sat(row.amount);
+		Ok(MovementDestination { destination, amount })
+	}).collect()
+}
+
+pub (crate) fn row_to_wallet_vtxo(row: &Row<'_>) -> anyhow::Result<WalletVtxo> {
+	let raw_bare = row.get::<_, Vec<u8>>("raw_bare")?;
+	let vtxo = Vtxo::deserialize(&raw_bare)?;
+
+	let state = serde_json::from_slice::<VtxoState>(&row.get::<_, Vec<u8>>("state")?)?;
+
+	let exit_depth = row.get::<_, i64>("exit_depth")? as u16;
+	let exit_tx_weight = Weight::from_wu(row.get::<_, i64>("exit_tx_weight")? as u64);
+	let registered = row.get::<_, bool>("registered")?;
+
+	Ok(WalletVtxo { vtxo, state, exit_depth, exit_tx_weight, registered })
+}
+
+pub (crate) fn rows_to_wallet_vtxos(mut rows: Rows<'_>) -> anyhow::Result<Vec<WalletVtxo>> {
+	let mut vtxos = Vec::new();
+	while let Some(row) = rows.next()? {
+		vtxos.push(row_to_wallet_vtxo(&row)?);
+	}
+	Ok(vtxos)
+}

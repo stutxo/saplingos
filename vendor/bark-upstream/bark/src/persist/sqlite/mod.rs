@@ -1,0 +1,607 @@
+//! SQLite persistence backend for Bark.
+//!
+//! This module provides a concrete implementation of the `BarkPersister` trait
+//! backed by a local SQLite database. It encapsulates schema creation and
+//! migrations, typed query helpers, and conversions between in-memory models
+//! and their stored representations. Operations are performed using explicit
+//! connections and transactions to ensure atomic updates across related tables,
+//! covering wallet properties, movements, vtxos and their states, round
+//! lifecycle data, Lightning receives, exit tracking, and sync metadata.
+
+mod convert;
+mod migrations;
+mod query;
+
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use bitcoin::{Amount, Txid};
+use bitcoin::secp256k1::PublicKey;
+use chrono::DateTime;
+use lightning_invoice::Bolt11Invoice;
+use log::debug;
+use rusqlite::Connection;
+
+use ark::{Vtxo, VtxoId};
+use ark::lightning::{PaymentHash, Preimage};
+use ark::vtxo::Full;
+
+use crate::WalletProperties;
+use crate::actions::{WalletActionCheckpoint, WalletActionId};
+use crate::exit::{ExitStateKind, ExitTxOrigin};
+use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
+use crate::movement::update::MovementUpdate;
+use crate::persist::{BarkPersister, RoundStateId, StoredRoundState, Unlocked};
+use crate::persist::models::{PaidInvoice, SettledLightningReceive, StoredExit};
+use crate::round::RoundState;
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+
+
+/// The default sqlite db file for when no file path was provided
+pub const DEFAULT_DB_FILE: &str = "db.sqlite";
+
+/// An implementation of the BarkPersister using rusqlite. Changes are persisted using the given
+/// [PathBuf].
+#[derive(Debug, Clone)]
+pub struct SqliteClient {
+	connection_string: PathBuf,
+}
+
+impl SqliteClient {
+	/// Open a new [SqliteClient] with the given file path
+	pub fn open(db_file: impl AsRef<Path>) -> anyhow::Result<SqliteClient> {
+		let path = db_file.as_ref().to_path_buf();
+
+		debug!("Opening database at {}", path.display());
+		let mut conn = rusqlite::Connection::open(&path)
+			.with_context(|| format!("Error connecting to database {}", path.display()))?;
+
+		// The db holds wallet state. New wallets are hardened at creation; for
+		// older or externally-created dbs we only warn rather than chmod on
+		// every open, which would override a deliberate setup.
+		crate::fs_perms::warn_if_loose(&path, 0o600);
+
+		let migrations = migrations::MigrationContext::new();
+		migrations.do_all_migrations(&mut conn)?;
+
+		Ok( Self { connection_string: path })
+	}
+
+	fn connect(&self) -> anyhow::Result<Connection> {
+		rusqlite::Connection::open(&self.connection_string)
+			.with_context(|| format!("Error connecting to database {}", self.connection_string.display()))
+	}
+}
+
+#[async_trait]
+impl BarkPersister for SqliteClient {
+	async fn init_wallet(&self, properties: &WalletProperties) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+
+		query::set_properties(&tx, properties)?;
+
+		tx.commit()?;
+		Ok(())
+	}
+
+	#[cfg(feature = "onchain-bdk")]
+	async fn initialize_bdk_wallet(&self) -> anyhow::Result<bdk_wallet::ChangeSet> {
+	    let mut conn = self.connect()?;
+		Ok(bdk_wallet::WalletPersister::initialize(&mut conn)?)
+	}
+
+	#[cfg(feature = "onchain-bdk")]
+	async fn store_bdk_wallet_changeset(&self, changeset: &bdk_wallet::ChangeSet) -> anyhow::Result<()> {
+	    let mut conn = self.connect()?;
+		bdk_wallet::WalletPersister::persist(&mut conn, changeset)?;
+		Ok(())
+	}
+
+	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
+		let conn = self.connect()?;
+		Ok(query::fetch_properties(&conn)?)
+	}
+
+	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::set_server_pubkey(&conn, &server_pubkey)?;
+		Ok(())
+	}
+
+	async fn set_server_mailbox_pubkey(&self, server_mailbox_pubkey: PublicKey) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::set_server_mailbox_pubkey(&conn, &server_mailbox_pubkey)?;
+		Ok(())
+	}
+
+	async fn create_new_movement(&self,
+		status: MovementStatus,
+		subsystem: &MovementSubsystem,
+		time: DateTime<chrono::Local>,
+		action_id: Option<&str>,
+	) -> anyhow::Result<MovementId> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let movement_id = query::create_new_movement(&tx, status, subsystem, time, action_id)?;
+		tx.commit()?;
+		Ok(movement_id)
+	}
+
+	async fn get_or_create_movement_for_action(
+		&self,
+		subsystem: &MovementSubsystem,
+		time: DateTime<chrono::Local>,
+		action_id: &str,
+		update: MovementUpdate,
+	) -> anyhow::Result<(MovementId, bool)> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let result = match query::get_movement_id_by_action(&tx, action_id)? {
+			Some(id) => (id, false),
+			None => {
+				let id = query::create_new_movement(
+					&tx, MovementStatus::Pending, subsystem, time, Some(action_id))?;
+				let mut movement = query::get_movement_by_id(&tx, id)?;
+				update.apply_to(&mut movement, time);
+				query::update_movement(&tx, &movement)?;
+				(id, true)
+			},
+		};
+		tx.commit()?;
+		Ok(result)
+	}
+
+	async fn update_movement(&self, movement: &Movement) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::update_movement(&tx, movement)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn get_movement_by_id(&self, movement_id: MovementId) -> anyhow::Result<Movement> {
+		let conn = self.connect()?;
+		query::get_movement_by_id(&conn, movement_id)
+	}
+
+	async fn get_all_movements(&self) -> anyhow::Result<Vec<Movement>> {
+		let conn = self.connect()?;
+		query::get_all_movements(&conn)
+	}
+
+	async fn get_movements_by_payment_method(
+		&self,
+		payment_method: &PaymentMethod,
+	) -> anyhow::Result<Vec<Movement>> {
+		let conn = self.connect()?;
+		query::get_movements_by_payment_method(&conn, payment_method)
+	}
+
+	async fn store_round_state(&self, round_state: &RoundState) -> anyhow::Result<RoundStateId> {
+		let conn = self.connect()?;
+		query::store_round_state(&conn, round_state)
+	}
+
+	async fn update_round_state(&self, state: &StoredRoundState) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::update_round_state(&conn, state)?;
+		Ok(())
+	}
+
+	async fn remove_round_state(&self, round_state: &StoredRoundState) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::remove_round_state(&conn, round_state.id())?;
+		Ok(())
+	}
+
+	async fn get_round_state_by_id(&self, id: RoundStateId) -> anyhow::Result<Option<StoredRoundState<Unlocked>>> {
+		let conn = self.connect()?;
+		query::get_round_state_by_id(&conn, id)
+	}
+
+	async fn get_pending_round_state_ids(&self) -> anyhow::Result<Vec<RoundStateId>> {
+		let conn = self.connect()?;
+		query::get_pending_round_state_ids(&conn)
+	}
+
+	async fn store_vtxos(
+		&self,
+		vtxos: &[(&Vtxo<Full>, &VtxoState)],
+	) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+
+		for (vtxo, state) in vtxos {
+			query::store_vtxo_with_initial_state(&tx, vtxo, state)?;
+		}
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn get_wallet_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<WalletVtxo>> {
+		let conn = self.connect()?;
+		query::get_wallet_vtxo_by_id(&conn, id)
+	}
+
+	async fn get_wallet_vtxos(&self, ids: &[VtxoId]) -> anyhow::Result<Vec<WalletVtxo>> {
+		let conn = self.connect()?;
+		query::get_wallet_vtxos_by_ids(&conn, ids)
+	}
+
+	async fn get_all_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		let conn = self.connect()?;
+		query::get_all_vtxos(&conn)
+	}
+
+	/// Get all VTXOs that are in one of the provided states
+	async fn get_vtxos_by_state(&self, state: &[VtxoStateKind]) -> anyhow::Result<Vec<WalletVtxo>> {
+		let conn = self.connect()?;
+		query::get_vtxos_by_state(&conn, state)
+	}
+
+	async fn has_spent_vtxo(&self, id: VtxoId) -> anyhow::Result<bool> {
+		let conn = self.connect()?;
+		let state : Option<VtxoState> = query::get_vtxo_state(&conn, id)?;
+		let result = state.map(|s| s == VtxoState::Spent).unwrap_or(false);
+		Ok(result)
+	}
+
+	async fn get_full_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<Vtxo<Full>>> {
+		let conn = self.connect()?;
+		query::get_full_vtxo_by_id(&conn, id)
+	}
+
+	async fn get_full_vtxos(&self, ids: &[VtxoId]) -> anyhow::Result<Vec<Vtxo<Full>>> {
+		let conn = self.connect()?;
+		query::get_full_vtxos_by_ids(&conn, ids)
+	}
+
+	async fn remove_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<Vtxo<Full>>> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction().context("Failed to start transaction")?;
+		let result = query::delete_vtxo(&tx, id);
+		tx.commit().context("Failed to commit transaction")?;
+		result
+	}
+
+	async fn store_vtxo_key(&self, index: u32, public_key: PublicKey) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::store_vtxo_key(&conn, index, public_key)
+	}
+
+	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
+		let conn = self.connect()?;
+		query::get_last_vtxo_key_index(&conn)
+	}
+
+	async fn get_public_key_idx(&self, public_key: &PublicKey) -> anyhow::Result<Option<u32>> {
+		let conn = self.connect()?;
+		query::get_public_key_idx(&conn, public_key)
+	}
+
+	async fn get_mailbox_checkpoint(&self) -> anyhow::Result<u64> {
+		let conn = self.connect()?;
+		query::get_mailbox_checkpoint(&conn)
+	}
+
+	async fn store_mailbox_checkpoint(&self, checkpoint: u64) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::store_mailbox_checkpoint(&conn, checkpoint)?;
+		Ok(())
+	}
+
+	async fn upsert_wallet_action_checkpoint(
+		&self,
+		id: &WalletActionId,
+		checkpoint: &WalletActionCheckpoint,
+	) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::upsert_wallet_action_checkpoint(&conn, id, checkpoint)
+	}
+
+	async fn get_wallet_action_checkpoint(
+		&self,
+		id: &WalletActionId,
+	) -> anyhow::Result<Option<WalletActionCheckpoint>> {
+		let conn = self.connect()?;
+		query::get_wallet_action_checkpoint(&conn, id)
+	}
+
+	async fn get_all_wallet_action_checkpoints(
+		&self,
+	) -> anyhow::Result<Vec<WalletActionCheckpoint>> {
+		let conn = self.connect()?;
+		query::get_all_wallet_action_checkpoints(&conn)
+	}
+
+	async fn remove_wallet_action_checkpoint(
+		&self,
+		id: &WalletActionId,
+	) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::remove_wallet_action_checkpoint(&conn, id)
+	}
+
+	async fn record_paid_invoice(
+		&self,
+		payment_hash: PaymentHash,
+		preimage: Preimage,
+	) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::record_paid_invoice(&conn, payment_hash, preimage)
+	}
+
+	async fn get_paid_invoice(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<PaidInvoice>> {
+		let conn = self.connect()?;
+		query::get_paid_invoice(&conn, payment_hash)
+	}
+
+	async fn record_settled_lightning_receive(
+		&self,
+		payment_hash: PaymentHash,
+		preimage: Preimage,
+		invoice: &Bolt11Invoice,
+		amount: Amount,
+	) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount)
+	}
+
+	async fn get_settled_lightning_receive(
+		&self,
+		payment_hash: PaymentHash,
+	) -> anyhow::Result<Option<SettledLightningReceive>> {
+		let conn = self.connect()?;
+		query::get_settled_lightning_receive(&conn, payment_hash)
+	}
+
+	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::store_exit_vtxo_entry(&tx, exit)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn remove_exit_vtxo_entry(&self, id: &VtxoId) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::remove_exit_vtxo_entry(&tx, &id)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn get_exit_vtxo_entries(&self) -> anyhow::Result<Vec<StoredExit>> {
+		let conn = self.connect()?;
+		query::get_exit_vtxo_entries(&conn)
+	}
+
+	async fn get_exit_vtxo_entries_with_states(
+		&self,
+		states: &[ExitStateKind],
+	) -> anyhow::Result<Vec<StoredExit>> {
+		let conn = self.connect()?;
+		query::get_exit_vtxo_entries_with_states(&conn, states)
+	}
+
+	async fn get_exit_vtxo_entry(&self, id: &VtxoId) -> anyhow::Result<Option<StoredExit>> {
+		let conn = self.connect()?;
+		query::get_exit_vtxo_entry(&conn, id)
+	}
+
+	async fn store_exit_child_tx(
+		&self,
+		exit_txid: Txid,
+		child_tx: &bitcoin::Transaction,
+		origin: ExitTxOrigin,
+	) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::store_exit_child_tx(&tx, exit_txid, child_tx, origin)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn get_exit_child_tx(
+		&self,
+		exit_txid: Txid,
+	) -> anyhow::Result<Option<(bitcoin::Transaction, ExitTxOrigin)>> {
+		let conn = self.connect()?;
+		query::get_exit_child_tx(&conn, exit_txid)
+	}
+
+	async fn update_vtxo_state_checked(
+		&self,
+		vtxo_id: VtxoId,
+		new_state: VtxoState,
+		allowed_old_states: &[VtxoStateKind]
+	) -> anyhow::Result<WalletVtxo> {
+		let conn = self.connect()?;
+		query::update_vtxo_state_checked(&conn, vtxo_id, new_state, allowed_old_states)
+	}
+
+	async fn release_vtxo_lock(
+		&self,
+		vtxo_id: VtxoId,
+		holder: Option<&VtxoLockHolder>,
+	) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::release_vtxo_lock(&conn, vtxo_id, holder)
+	}
+
+	async fn update_vtxo_states_checked(
+		&self,
+		vtxo_ids: &[VtxoId],
+		new_state: VtxoState,
+		allowed_old_states: &[VtxoStateKind],
+	) -> anyhow::Result<()> {
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::update_vtxo_states_checked(&tx, vtxo_ids, new_state, allowed_old_states)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	async fn mark_vtxos_registered(&self, vtxo_ids: &[VtxoId]) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::mark_vtxos_registered(&conn, vtxo_ids)
+	}
+
+	async fn get_unregistered_vtxo_ids(&self) -> anyhow::Result<Vec<VtxoId>> {
+		let conn = self.connect()?;
+		query::get_unregistered_vtxo_ids(&conn)
+	}
+
+}
+
+#[cfg(any(test, doc))]
+pub mod helpers {
+	use std::path::PathBuf;
+	use std::str::FromStr;
+
+	use rusqlite::Connection;
+
+	/// Creates an in-memory sqlite connection.
+	///
+	/// It returns a [PathBuf] and a [Connection].
+	/// The user should ensure the [Connection] isn't dropped
+	/// until the test completes. If all connections are dropped during
+	/// the test the entire database might be cleared.
+	#[cfg(any(test, feature = "rand"))]
+	pub fn in_memory_db() -> (PathBuf, Connection) {
+		use rand::{distr, RngExt};
+
+		// All tests run in the same process and share the same
+		// cache. To ensure that each call to `in_memory` results
+		// in a new database a random file-name is generated.
+		//
+		// This database is deleted once all connections are dropped
+		let mut rng = rand::rng();
+		let filename: String = (&mut rng).sample_iter(distr::Alphanumeric)
+			.take(16).map(char::from).collect();
+
+		let connection_string = format!("file:{}?mode=memory&cache=shared", filename);
+		let pathbuf = PathBuf::from_str(&connection_string).unwrap();
+
+		let conn = Connection::open(pathbuf.clone()).unwrap();
+		(pathbuf.clone(), conn)
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use ark::ProtocolEncoding;
+	use ark::test_util::VTXO_VECTORS;
+
+	use crate::{persist::sqlite::helpers::in_memory_db, vtxo::VtxoState};
+	use crate::persist::test_suite::bark_persister_tests;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn test_add_and_retrieve_vtxos() {
+		let vtxo_1 = &VTXO_VECTORS.board_vtxo;
+		let vtxo_2 = &VTXO_VECTORS.arkoor_htlc_out_vtxo;
+		let vtxo_3 = &VTXO_VECTORS.round2_vtxo;
+
+		let (cs, conn) = in_memory_db();
+		let db = SqliteClient::open(cs).unwrap();
+
+		db.store_vtxos(&[
+			(vtxo_1, &VtxoState::Spendable), (vtxo_2, &VtxoState::Spendable)
+		]).await.unwrap();
+
+		// Check that vtxo-1 can be retrieved from the database. Listings
+		// return the bare form, so compare against `to_bare()`.
+		let vtxo_1_db = db.get_wallet_vtxo(vtxo_1.id()).await.expect("No error").expect("A vtxo was found");
+		assert_eq!(vtxo_1_db.vtxo, vtxo_1.to_bare());
+
+		// Hydrating to full should round-trip back to the original bytes.
+		let vtxo_1_full = db.get_full_vtxo(vtxo_1.id()).await.unwrap().unwrap();
+		assert_eq!(vtxo_1_full.serialize(), vtxo_1.serialize());
+
+		// Verify that vtxo 3 is not in the database
+		assert!(db.get_wallet_vtxo(vtxo_3.id()).await.expect("No error").is_none());
+
+		// Verify that we have two entries in the database
+		let vtxos = db.get_vtxos_by_state(&[VtxoStateKind::Spendable]).await.unwrap();
+		assert_eq!(vtxos.len(), 2);
+		assert!(vtxos.iter().any(|v| v.vtxo == vtxo_1.to_bare()));
+		assert!(vtxos.iter().any(|v| v.vtxo == vtxo_2.to_bare()));
+		assert!(!vtxos.iter().any(|v| v.vtxo == vtxo_3.to_bare()));
+
+		// Verify that we can mark a vtxo as spent
+		db.update_vtxo_state_checked(
+			vtxo_1.id(), VtxoState::Spent, &VtxoStateKind::UNSPENT_STATES,
+		).await.unwrap();
+
+		let vtxos = db.get_vtxos_by_state(&[VtxoStateKind::Spendable]).await.unwrap();
+		assert_eq!(vtxos.len(), 1);
+
+		// Add the third entry to the database
+		db.store_vtxos(&[(vtxo_3, &VtxoState::Spendable)]).await.unwrap();
+
+		let vtxos = db.get_vtxos_by_state(&[VtxoStateKind::Spendable]).await.unwrap();
+		assert_eq!(vtxos.len(), 2);
+		assert!(vtxos.iter().any(|v| v.vtxo == vtxo_2.to_bare()));
+		assert!(vtxos.iter().any(|v| v.vtxo == vtxo_3.to_bare()));
+
+		conn.close().unwrap();
+	}
+
+	#[tokio::test]
+	#[cfg(feature = "onchain-bdk")]
+	async fn test_create_wallet_then_load() {
+		use bdk_wallet::chain::DescriptorExt;
+
+		let (connection_string, conn) = in_memory_db();
+
+		let db = SqliteClient::open(connection_string).unwrap();
+		let network = bitcoin::Network::Testnet;
+
+		let seed = bip39::Mnemonic::generate(12).unwrap().to_seed("");
+		let xpriv = bitcoin::bip32::Xpriv::new_master(network, &seed).unwrap();
+
+		let desc = format!("tr({}/84'/0'/0'/*)", xpriv);
+
+		// need to call init before we call store
+		let _ = db.initialize_bdk_wallet().await.unwrap();
+		let mut created = bdk_wallet::Wallet::create_single(desc.clone())
+			.network(network)
+			.create_wallet_no_persist()
+			.unwrap();
+		db.store_bdk_wallet_changeset(&created.take_staged().unwrap()).await.unwrap();
+
+		let loaded = {
+			let changeset = db.initialize_bdk_wallet().await.unwrap();
+			bdk_wallet::Wallet::load()
+				.descriptor(bdk_wallet::KeychainKind::External, Some(desc.clone()))
+				.extract_keys()
+				.check_network(network)
+				.load_wallet_no_persist(changeset)
+				.unwrap()
+		};
+
+		assert!(loaded.is_some());
+		assert_eq!(
+			created.public_descriptor(bdk_wallet::KeychainKind::External).descriptor_id(),
+			loaded.unwrap().public_descriptor(bdk_wallet::KeychainKind::External).descriptor_id()
+		);
+
+		// Explicitly close the connection here
+		// This ensures the database isn't dropped during the test
+		conn.close().unwrap();
+	}
+
+	async fn setup(_test: &str) -> (Connection, SqliteClient) {
+		let (path, conn) = helpers::in_memory_db();
+		(conn, SqliteClient::open(path).unwrap())
+	}
+
+	bark_persister_tests!(setup);
+}

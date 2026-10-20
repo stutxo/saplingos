@@ -1,0 +1,157 @@
+use bitcoin::{Amount, Txid};
+use bitcoin::address::FromScriptError;
+use thiserror::Error;
+
+use ark::VtxoId;
+use ark::vtxo::VtxoStandardnessError;
+use bitcoin_ext::BlockHeight;
+
+use crate::chain::BroadcastError;
+use crate::exit::models::ExitStateKind;
+use crate::exit::models::states::ExitTxStatus;
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ExitError {
+	#[error("Transaction Retrieval Failure: Unable to retrieve ancestral data for TX {txid}: {error}")]
+	AncestorRetrievalFailure {
+		txid: Txid,
+		error: String
+	},
+
+	#[error("Block Retrieval Failure: Unable to retrieve a block at height {height}: {error}")]
+	BlockRetrievalFailure { height: BlockHeight, error: String },
+
+	#[error("Cannot Cancel Exit: The exit for VTXO {vtxo} can no longer be canceled (state: {state})")]
+	CannotCancelExit { vtxo: VtxoId, state: ExitStateKind },
+
+	#[error("Claim Missing Inputs: No inputs given to claim")]
+	ClaimMissingInputs,
+
+	#[error("Claim Fee Exceeds Output: Cost to claim exits was {needed}, but the total output was {output}")]
+	ClaimFeeExceedsOutput {
+		needed: Amount,
+		output: Amount,
+	},
+
+	#[error("Claim Missing Signable Clause: Couldn't find a signable clause for VTXO {vtxo}")]
+	ClaimMissingSignableClause { vtxo: VtxoId },
+
+	#[error("Claim Signing Error: Unable to sign claim: {error}")]
+	ClaimSigningError { error: String },
+
+	#[error("Cyclic Exit Transactions Error: The exit transactions for VTXO {vtxo} are cyclic")]
+	CyclicExitTransactions {
+		vtxo: VtxoId
+	},
+
+	#[error("Database Store Failure: Unable to update exit VTXO {vtxo_id} in the database: {error}")]
+	DatabaseVtxoStoreFailure {
+		vtxo_id: VtxoId,
+		error: String
+	},
+
+	#[error("Database Retrieval Failure: Unable to get child tx: {error}")]
+	DatabaseChildRetrievalFailure { error: String },
+
+	#[error("Database Store Failure: Unable to store child tx: {error}")]
+	DatabaseChildStoreFailure { error: String },
+
+	#[error("Dust Limit Error: The dust limit for a VTXO is {dust} but vtxo {vtxo} is only {amount}")]
+	DustLimit {
+		vtxo: VtxoId,
+		amount: Amount,
+		dust: Amount
+	},
+
+	#[error("Exit Package Broadcast Failure: Unable to broadcast exit transaction package {txid}: {error}")]
+	ExitPackageBroadcastFailure {
+		txid: Txid,
+		error: BroadcastError,
+	},
+
+	#[error("Exit Package Finalize Failure: Unable to create exit transaction package: {error}")]
+	ExitPackageFinalizeFailure { error: String },
+
+	#[error("Exit Package Store Failure: Unable to store exit transaction package {txid}: {error}")]
+	ExitPackageStoreFailure {
+		txid: Txid,
+		error: String
+	},
+
+	#[error("Exit Tx Already Broadcast: Cannot cancel the exit for VTXO {vtxo}, its final exit tx {txid} has already been broadcast")]
+	ExitTxAlreadyBroadcast { vtxo: VtxoId, txid: Txid },
+
+	#[error("Insufficient Confirmed Funds: {needed} is needed but only {available} is available")]
+	InsufficientConfirmedFunds {
+		needed: Amount,
+		available: Amount
+	},
+
+	#[error("Internal Error: An unexpected problem occurred, {error}")]
+	InternalError { error: String },
+
+	#[error("Invalid Exit Transaction Status: Exit tx {txid} has an invalid status ({status}): {error}")]
+	InvalidExitTransactionStatus {
+		txid: Txid,
+		status: ExitTxStatus,
+		error: String
+	},
+
+	#[error("Invalid Fee Margin: {margin} must be finite and non-negative and keep the fee in range")]
+	InvalidFeeMargin { margin: String },
+
+	#[error("Invalid Locktime ({tip}): {error}")]
+	InvalidLocktime { tip: BlockHeight, error: String },
+
+	#[error("Invalid Wallet State: {error}")]
+	InvalidWalletState { error: String },
+
+	#[error("Missing Anchor Output: Malformed exit tx {txid}")]
+	MissingAnchorOutput { txid: Txid },
+
+	#[error("Missing VTXO Transaction: Couldn't find exit tx {txid}")]
+	MissingExitTransaction { txid: Txid },
+
+	#[error("Non-Standard VTXO {vtxo}: exit chain is not relayable: {error}")]
+	NonStandardVtxo {
+		vtxo: VtxoId,
+		error: VtxoStandardnessError,
+	},
+
+	#[error("Movement Registration Failure: {error}")]
+	MovementRegistrationFailure { error: String },
+
+	#[error("Not Exiting: VTXO {vtxo} has no unilateral exit")]
+	NotExiting { vtxo: VtxoId },
+
+	#[error("Tip Retrieval Failure: Unable to retrieve the blockchain tip height: {error}")]
+	TipRetrievalFailure { error: String },
+
+	#[error("Transaction Retrieval Failure: Unable to check the status of TX {txid}: {error}")]
+	TransactionRetrievalFailure { txid: Txid, error: String },
+
+	#[error("VTXO Not Spendable Error: Attempted to claim a VTXO which is not in a spendable state: {vtxo}")]
+	VtxoNotClaimable { vtxo: VtxoId },
+
+	#[error("Unknown VTXO: {vtxo} is not known to this wallet")]
+	UnknownVtxo { vtxo: VtxoId },
+
+	#[error("VTXO Already Exited: {vtxo} has already completed its unilateral exit")]
+	VtxoAlreadyExited { vtxo: VtxoId },
+
+	#[error("VTXO Already Spent: {vtxo} has already been spent and can no longer be exited")]
+	VtxoAlreadySpent { vtxo: VtxoId },
+
+	#[error("VTXO Swept: an output the exit chain of {vtxo} needs was spent on chain, so it can \
+		no longer be exited")]
+	VtxoSwept { vtxo: VtxoId },
+
+	#[error("VTXO ScriptPubKey Invalid: {error}")]
+	VtxoScriptPubKeyInvalid { error: String },
+}
+
+impl From<FromScriptError> for ExitError {
+	fn from(e: FromScriptError) -> Self {
+		ExitError::VtxoScriptPubKeyInvalid { error: e.to_string() }
+	}
+}

@@ -1,0 +1,52 @@
+#![cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
+
+use std::sync::Arc;
+
+use bitcoin::Network;
+
+use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
+
+async fn example() -> anyhow::Result<()> {
+	use bark::persist::adaptor::StorageAdaptorWrapper;
+
+	let mnemonic = "super secret ...".parse()?;
+	let cfg = Config {
+		server_address: "https://ark.signet.2nd.dev".into(),
+		esplora_address: Some("https://esplora.signet.2nd.dev".into()),
+		..Config::network_default(Network::Signet)
+	};
+	let db = Arc::new(StorageAdaptorWrapper::new_memory());
+	let wallet = Wallet::open(
+		Network::Signet,
+		WalletSeed::new_from_mnemonic(Network::Signet, &mnemonic),
+		cfg,
+		OpenWalletArgs {
+			persister: Some(db),
+			..Default::default()
+		},
+	).await?;
+
+	let address = wallet.new_address().await?;
+	println!("My first Ark address: {}", address);
+
+	let invoice = wallet.bolt11_invoice("10000sat".parse()?, None, None).await?;
+	println!("Send me some sats: {}", invoice);
+
+	// Wait for someone to send the sats...
+	wallet.try_claim_all_lightning_receives(true).await?;
+
+	let balance = wallet.balance().await?;
+	println!("I now have sats: {}!", balance.spendable);
+
+	// Let's give back!
+	let invoice = "lnbc1... get this from someone you like";
+	wallet.pay_lightning_invoice(invoice, None, false).await?;
+
+	Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+	example().await.unwrap();
+}
+

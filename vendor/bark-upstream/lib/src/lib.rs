@@ -1,0 +1,315 @@
+
+pub extern crate bitcoin;
+
+#[macro_use] extern crate serde;
+#[macro_use] extern crate lazy_static;
+
+#[macro_use] pub mod util;
+
+pub mod address;
+pub mod arkoor;
+pub mod attestations;
+pub mod board;
+pub mod connectors;
+pub mod encode;
+pub mod error;
+pub mod fees;
+pub mod forfeit;
+pub mod lightning;
+pub mod mailbox;
+pub mod musig;
+pub mod offboard;
+pub mod rounds;
+pub mod message;
+pub mod tree;
+pub mod vtxo;
+pub mod integration;
+
+pub use crate::address::Address;
+pub use crate::encode::{ProtocolEncoding, WriteExt, ReadExt, ProtocolDecodingError};
+pub use crate::vtxo::{Vtxo, VtxoId, VtxoPolicy, ServerVtxoPolicy, ServerVtxo};
+
+#[cfg(test)]
+mod napkin;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
+
+
+use std::time::Duration;
+
+use bitcoin::{Amount, FeeRate, Network};
+use bitcoin::secp256k1::{self, PublicKey};
+
+use bitcoin_ext::BlockDelta;
+
+use crate::fees::FeeSchedule;
+
+lazy_static! {
+	/// Global secp context.
+	pub static ref SECP: secp256k1::Secp256k1<secp256k1::All> = secp256k1::Secp256k1::new();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArkInfo {
+	/// The bitcoin network the server operates on
+	pub network: Network,
+	/// The Ark server pubkey
+	pub server_pubkey: PublicKey,
+	/// The pubkey used for blinding unified mailbox IDs
+	pub mailbox_pubkey: PublicKey,
+	/// The interval between each round
+	pub round_interval: Duration,
+	/// Number of nonces per round
+	pub nb_round_nonces: usize,
+	/// Delta between exit confirmation and coins becoming spendable
+	pub vtxo_exit_delta: BlockDelta,
+	/// The number of blocks a VTXO lives before it expires
+	pub vtxo_lifetime: BlockDelta,
+	/// The number of blocks after which an HTLC-send VTXO expires once granted.
+	pub htlc_send_expiry_delta: BlockDelta,
+	/// The number of blocks to keep between Lightning and Ark HTLCs expiries
+	pub htlc_expiry_delta: BlockDelta,
+	/// Maximum amount of a VTXO
+	pub max_vtxo_amount: Option<Amount>,
+	/// The number of confirmations required to register a board vtxo
+	pub required_board_confirmations: usize,
+	/// Maximum CLTV delta server will allow clients to request an
+	/// invoice generation with.
+	pub max_user_invoice_cltv_delta: BlockDelta,
+	/// Minimum amount for a board the server will cosign
+	pub min_board_amount: Amount,
+
+	/// The number of blocks a VTXO lives before it expires.
+	///
+	/// Deprecated in favour of [ArkInfo::vtxo_lifetime]. This field is still
+	/// populated with the same value for backwards compatibility with older
+	/// clients.
+	#[deprecated(note = "renamed to vtxo_lifetime")]
+	pub vtxo_expiry_delta: BlockDelta,
+
+	/// The feerate for offboard transactions.
+	///
+	/// Deprecated in favour of the dedicated `GetOffboardFeeRate` RPC.
+	/// This field is still populated for backwards compatibility with
+	/// older clients but may be stale; prefer
+	/// `ServerConnection::offboard_feerate` which calls the dedicated
+	/// endpoint.
+	#[deprecated(since = "0.1.5", note = "use ServerConnection::offboard_feerate instead")]
+	pub offboard_feerate: FeeRate,
+
+	/// The maximum number of inputs for an offboard
+	pub max_offboard_inputs: usize,
+
+	/// Indicates whether the Ark server requires clients to either
+	/// provide a VTXO ownership proof, or a lightning receive token
+	/// when preparing a lightning claim.
+	pub ln_receive_anti_dos_required: bool,
+
+	/// Fee schedule for all Ark operations
+	pub fees: FeeSchedule,
+
+	/// Maximum exit depth (genesis chain length) allowed for a VTXO.
+	/// Once a VTXO's exit depth reaches this value the server will refuse to
+	/// cosign further OOR transactions spending it. Clients should refresh
+	/// their VTXOs into a round before this limit is reached.
+	pub max_vtxo_exit_depth: u16,
+
+	/// Link to the server's terms of service, if any.
+	pub tos_link: Option<String>,
+}
+
+/// Request for the creation of an vtxo.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct VtxoRequest {
+	pub amount: Amount,
+	#[serde(with = "crate::encode::serde")]
+	pub policy: VtxoPolicy,
+}
+
+impl AsRef<VtxoRequest> for VtxoRequest {
+	fn as_ref(&self) -> &VtxoRequest {
+	    self
+	}
+}
+
+/// Request for the creation of an vtxo in a signed round
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct SignedVtxoRequest {
+	/// The actual VTXO request.
+	pub vtxo: VtxoRequest,
+	/// The public key used by the client to cosign the transaction tree
+	/// The client SHOULD forget this key after signing it
+	pub cosign_pubkey: PublicKey,
+	/// The public cosign nonces for the cosign pubkey
+	pub nonces: Vec<musig::PublicNonce>,
+}
+
+impl AsRef<VtxoRequest> for SignedVtxoRequest {
+	fn as_ref(&self) -> &VtxoRequest {
+	    &self.vtxo
+	}
+}
+
+pub mod scripts {
+	use bitcoin::{opcodes, ScriptBuf, TapSighash, TapTweakHash, Transaction};
+	use bitcoin::hashes::{sha256, ripemd160, Hash};
+	use bitcoin::secp256k1::{schnorr, PublicKey, XOnlyPublicKey};
+
+	use bitcoin_ext::{BlockDelta, BlockHeight, TAPROOT_KEYSPEND_WEIGHT};
+
+	use crate::musig;
+
+	/// Create a tapscript that is a checksig and a relative timelock.
+	pub fn delayed_sign(delay_blocks: BlockDelta, pubkey: XOnlyPublicKey) -> ScriptBuf {
+		let csv = bitcoin::Sequence::from(delay_blocks);
+		bitcoin::Script::builder()
+			.push_int(csv.to_consensus_u32() as i64)
+			.push_opcode(opcodes::all::OP_CSV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	/// Create a tapscript that is a checksig and an absolute timelock.
+	pub fn timelock_sign(timelock_height: BlockHeight, pubkey: XOnlyPublicKey) -> ScriptBuf {
+		let lt = timelock_height.to_locktime().unwrap();
+		bitcoin::Script::builder()
+			.push_int(lt.to_consensus_u32() as i64)
+			.push_opcode(opcodes::all::OP_CLTV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	/// Create a tapscript
+	pub fn delay_timelock_sign(
+		delay_blocks: BlockDelta,
+		timelock_height: BlockHeight,
+		pubkey: XOnlyPublicKey,
+	) -> ScriptBuf {
+		let csv = bitcoin::Sequence::from(delay_blocks);
+		let lt = timelock_height.to_locktime().unwrap();
+		bitcoin::Script::builder()
+			.push_int(lt.to_consensus_u32().try_into().unwrap())
+			.push_opcode(opcodes::all::OP_CLTV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_int(csv.to_consensus_u32().try_into().unwrap())
+			.push_opcode(opcodes::all::OP_CSV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	/// Contract that requires revealing the preimage to the given hash
+	/// and a signature using the given (aggregate) pubkey
+	///
+	/// The expected spending script witness is the preimage followed by
+	/// the signature.
+	pub fn hash_and_sign(hash: sha256::Hash, pubkey: XOnlyPublicKey) -> ScriptBuf {
+		let hash_160 = ripemd160::Hash::hash(&hash[..]);
+
+		bitcoin::Script::builder()
+			.push_opcode(opcodes::all::OP_SIZE)
+			.push_int(32)
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_opcode(opcodes::all::OP_HASH160)
+			.push_slice(hash_160.as_byte_array())
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	/// Contract that requires revealing the preimage to the given hash
+	/// and a signature using the given (aggregate) pubkey
+	///
+	/// The expected spending script witness is the preimage followed by
+	/// the signature.
+	pub fn hash_and_sign_v0(hash: sha256::Hash, pubkey: XOnlyPublicKey) -> ScriptBuf {
+		let hash_160 = ripemd160::Hash::hash(&hash[..]);
+
+		bitcoin::Script::builder()
+			.push_opcode(opcodes::all::OP_HASH160)
+			.push_slice(hash_160.as_byte_array())
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	pub fn hash_delay_sign(
+		hash: sha256::Hash,
+		delay_blocks: BlockDelta,
+		pubkey: XOnlyPublicKey,
+	) -> ScriptBuf {
+		let hash_160 = ripemd160::Hash::hash(&hash[..]);
+		let csv = bitcoin::Sequence::from(delay_blocks);
+
+		bitcoin::Script::builder()
+			.push_int(csv.to_consensus_u32().try_into().unwrap())
+			.push_opcode(opcodes::all::OP_CSV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_opcode(opcodes::all::OP_SIZE)
+			.push_int(32)
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_opcode(opcodes::all::OP_HASH160)
+			.push_slice(hash_160.as_byte_array())
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	pub fn hash_delay_sign_v0(
+		hash: sha256::Hash,
+		delay_blocks: BlockDelta,
+		pubkey: XOnlyPublicKey,
+	) -> ScriptBuf {
+		let hash_160 = ripemd160::Hash::hash(&hash[..]);
+		let csv = bitcoin::Sequence::from(delay_blocks);
+
+		bitcoin::Script::builder()
+			.push_int(csv.to_consensus_u32().try_into().unwrap())
+			.push_opcode(opcodes::all::OP_CSV)
+			.push_opcode(opcodes::all::OP_DROP)
+			.push_opcode(opcodes::all::OP_HASH160)
+			.push_slice(hash_160.as_byte_array())
+			.push_opcode(opcodes::all::OP_EQUALVERIFY)
+			.push_x_only_key(&pubkey)
+			.push_opcode(opcodes::all::OP_CHECKSIG)
+			.into_script()
+	}
+
+	/// Fill in the signatures into the unsigned transaction.
+	///
+	/// Panics if the nb of inputs and signatures doesn't match or if some input
+	/// witnesses are not empty.
+	pub fn fill_taproot_sigs(tx: &mut Transaction, sigs: &[schnorr::Signature]) {
+		assert_eq!(tx.input.len(), sigs.len());
+		for (input, sig) in tx.input.iter_mut().zip(sigs.iter()) {
+			assert!(input.witness.is_empty());
+			input.witness.push(&sig[..]);
+			debug_assert_eq!(TAPROOT_KEYSPEND_WEIGHT.to_wu(), input.witness.size() as u64);
+		}
+	}
+
+	/// Verify a partial signature from either of the two parties cosigning a tx.
+	pub fn verify_partial_sig(
+		sighash: TapSighash,
+		tweak: TapTweakHash,
+		signer: (PublicKey, &musig::PublicNonce),
+		other: (PublicKey, &musig::PublicNonce),
+		partial_signature: &musig::PartialSignature,
+	) -> bool {
+		let agg_nonce = musig::nonce_agg(&[&signer.1, &other.1]);
+		let agg_pk = musig::tweaked_key_agg([signer.0, other.0], tweak.to_byte_array()).0;
+
+		let session = musig::Session::new(&agg_pk, agg_nonce, &sighash.to_byte_array());
+		session.partial_verify(
+			&agg_pk, partial_signature, signer.1, musig::pubkey_to(signer.0),
+		)
+	}
+}

@@ -1,0 +1,87 @@
+
+syntax = "proto3";
+
+package mailbox_server;
+
+import "core.proto";
+
+// Public mailbox service.
+service MailboxService {
+	// Deposits your VTXOs into the mailbox (blinded ID is unblinded with the VTXOs’ shared user pubkey; all VTXOs must have identical user pubkeys).
+	rpc PostArkoorMessage(PostArkoorMessageRequest) returns (core.Empty) {};
+	rpc SubscribeMailbox(MailboxRequest) returns (stream MailboxMessage);
+	rpc ReadMailbox(MailboxRequest) returns (MailboxMessages);
+	// Deposits your VTXO IDs into your recovery mailbox.
+	rpc PostRecoveryVtxoIds(PostRecoveryVtxoIdsRequest) returns (core.Empty) {};
+}
+
+message PostArkoorMessageRequest {
+	// The blinded mailbox ID
+	bytes blinded_id = 1;
+	repeated bytes vtxos = 2;
+}
+
+message MailboxRequest {
+	// The mailbox ID to obtain data from
+	bytes mailbox_id = 1;
+	// A signed proof that you are allowed to read from this mailbox
+	optional bytes authorization = 2;
+	// The last checkpoint you have seen/processed
+	uint64 checkpoint = 3;
+}
+
+message MailboxMessage {
+	reserved 3;
+	oneof message {
+		ArkoorMessage arkoor = 1;
+		RoundParticipationCompleted round_participation_completed = 4;
+		IncomingLightningPaymentMessage incoming_lightning_payment = 5;
+		RecoveryVtxoIdsMessage recovery_vtxo_ids = 6;
+		LightningSendFinishedMessage lightning_send_finished = 7;
+	}
+	// Strictly ascending time based number.
+	uint64 checkpoint = 2;
+}
+
+message ArkoorMessage {
+	repeated bytes vtxos = 1;
+}
+
+message RoundParticipationCompleted {
+	// compat for <= v0.1.1
+	repeated bytes payment_hashes = 1 [deprecated = true];
+	bytes unlock_hash = 2;
+
+}
+
+message IncomingLightningPaymentMessage {
+	bytes payment_hash = 1;
+	uint64 amount_msat = 2;
+}
+
+message RecoveryVtxoIdsMessage {
+	repeated bytes vtxo_ids = 1;
+}
+
+message LightningSendFinishedMessage {
+	bytes payment_hash = 1;
+	// The preimage, present only on success (proves payment was made).
+	// Absent when payment failed.
+	optional bytes preimage = 2;
+}
+
+message MailboxMessages {
+	repeated MailboxMessage messages = 1;
+	// Whether the server has more messages for you
+	bool have_more = 2;
+}
+
+message PostRecoveryVtxoIdsRequest {
+	// The recovery mailbox ID
+	bytes mailbox_id = 1;
+	// The recovery IDs.
+	// Maximum number of IDs is set in the `MAX_NB_MAILBOX_RECOVERY_IDS` constant
+	repeated bytes vtxo_ids = 2;
+	// Signed proof of mailbox ownership. Optional for now for backward compat.
+	optional bytes authorization = 3;
+}
