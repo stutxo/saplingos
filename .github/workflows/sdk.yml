@@ -22,6 +22,8 @@ jobs:
         with:
           extra_nix_config: |
             accept-flake-config = true
+      - name: Check bark patch series
+        run: nix develop .#build --command just bark-check
       - name: Check SDK and support libraries
         run: nix develop .#build --command just checks
       - name: Run unit tests
