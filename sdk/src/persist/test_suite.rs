@@ -68,9 +68,11 @@ macro_rules! bark_persister_tests {
 			test_init_and_read_properties,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
+			test_set_recovery_incomplete,
 
 			test_mailbox_checkpoint_empty_db,
 			test_mailbox_checkpoint_roundtrip,
+			test_mailbox_checkpoint_no_rewind,
 			test_vtxo_keys_empty,
 			test_vtxo_key_roundtrip,
 			test_vtxo_key_last_index_advances,
@@ -98,6 +100,7 @@ macro_rules! bark_persister_tests {
 			test_remove_vtxo,
 			test_has_spent_vtxo,
 			test_store_vtxos_idempotent,
+			test_store_vtxos_existing_record_is_strict_noop,
 			test_steal_lock_to_spent,
 			test_steal_lock,
 
@@ -147,6 +150,7 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
+		recovery_incomplete: false,
 	}
 }
 
@@ -417,6 +421,23 @@ pub async fn test_set_server_mailbox_pubkey(db: &impl WalletPersister) {
 	assert_eq!(read, WalletProperties { server_mailbox_pubkey: Some(pk), ..test_properties() });
 }
 
+/// The recovery-incomplete flag flips both ways: an incomplete scan sets it
+/// (so the next wallet open resumes the scan) and a complete one clears it.
+pub async fn test_set_recovery_incomplete(db: &impl WalletPersister) {
+	db.init_wallet(&test_properties()).await.expect("init_wallet");
+
+	let read = db.read_properties().await.expect("read_properties").expect("properties present");
+	assert!(!read.recovery_incomplete, "fresh wallets start complete");
+
+	db.set_recovery_incomplete(true).await.expect("set incomplete");
+	let read = db.read_properties().await.expect("read_properties").expect("properties present");
+	assert_eq!(read, WalletProperties { recovery_incomplete: true, ..test_properties() });
+
+	db.set_recovery_incomplete(false).await.expect("clear incomplete");
+	let read = db.read_properties().await.expect("read_properties").expect("properties present");
+	assert_eq!(read, test_properties(), "clearing restores the initial state");
+}
+
 // ---------------------------------------------------------------------------
 // VTXO keys and mailbox checkpoint
 // ---------------------------------------------------------------------------
@@ -431,6 +452,24 @@ pub async fn test_mailbox_checkpoint_roundtrip(db: &impl WalletPersister) {
 
 	let checkpoint = db.get_mailbox_checkpoint().await.expect("get_mailbox_checkpoint");
 	assert_eq!(checkpoint, 42, "stored checkpoint should be returned");
+}
+
+/// Storing a lower or equal checkpoint must fail on every backend and must
+/// leave the cursor unchanged, per the [WalletPersister] contract.
+pub async fn test_mailbox_checkpoint_no_rewind(db: &impl WalletPersister) {
+	db.store_mailbox_checkpoint(100).await.expect("store 100");
+
+	let lower = db.store_mailbox_checkpoint(50).await;
+	assert!(lower.is_err(), "storing a lower checkpoint must fail, got {lower:?}");
+	let equal = db.store_mailbox_checkpoint(100).await;
+	assert!(equal.is_err(), "storing an equal checkpoint must fail, got {equal:?}");
+
+	let checkpoint = db.get_mailbox_checkpoint().await.expect("get_mailbox_checkpoint");
+	assert_eq!(checkpoint, 100, "cursor must be unchanged after rejected stores");
+
+	db.store_mailbox_checkpoint(101).await.expect("storing a higher checkpoint must succeed");
+	let checkpoint = db.get_mailbox_checkpoint().await.expect("get_mailbox_checkpoint");
+	assert_eq!(checkpoint, 101, "cursor must advance after a higher store");
 }
 
 pub async fn test_vtxo_keys_empty(db: &impl WalletPersister) {
@@ -767,6 +806,38 @@ pub async fn test_store_vtxos_idempotent(db: &impl WalletPersister) {
 	assert_eq!(stored.state, VtxoState::Spendable, "the state survives a repeated store");
 	assert_eq!(db.get_all_vtxos().await.expect("get_all_vtxos").len(), 1,
 		"a repeated store must not insert a second row");
+}
+
+pub async fn test_store_vtxos_existing_record_is_strict_noop(db: &impl WalletPersister) {
+	let locked = &VTXO_VECTORS.board_vtxo;
+	let held = VtxoState::Locked { holder: Some(MovementId::new(1).into()) };
+	db.store_vtxos(&[(locked, &held)]).await.expect("initial store_vtxos");
+	db.mark_vtxos_registered(&[locked.id()]).await.expect("mark_vtxos_registered");
+
+	// A stale retry from a re-driven/recovered flow must be a strict no-op
+	// for the existing record: the current state, the signed bytes and the
+	// monotonic registered flag all survive unchanged on every backend.
+	db.store_vtxos(&[(locked, &VtxoState::Spendable)]).await.expect("stale live retry");
+	let stored = db.get_wallet_vtxo(locked.id()).await.expect("get_wallet_vtxo").unwrap();
+	assert_eq!(stored.state, held, "stale retry must not regress a Locked state");
+	assert!(stored.registered, "stale retry must not reset the registered flag");
+	assert!(db.get_unregistered_vtxo_ids().await.unwrap().is_empty(),
+		"a registered vtxo must not re-enter the unregistered listing");
+	assert_eq!(db.get_full_vtxo(locked.id()).await.unwrap().as_ref(), Some(locked),
+		"stale retry must not touch the signed bytes");
+
+	// A same-state retry must not reset the registered flag either.
+	db.store_vtxos(&[(locked, &held)]).await.expect("same-state retry");
+	assert!(db.get_wallet_vtxo(locked.id()).await.unwrap().unwrap().registered,
+		"same-state retry must not reset the registered flag");
+
+	// Terminal direction: a live replay over a terminal record is a silent
+	// no-op (SQLite INSERT OR IGNORE parity), preserving the terminal state.
+	let spent = &VTXO_VECTORS.round1_vtxo;
+	db.store_vtxos(&[(spent, &VtxoState::Spent)]).await.expect("store spent");
+	db.store_vtxos(&[(spent, &VtxoState::Spendable)]).await.expect("live replay over spent");
+	assert_eq!(db.get_wallet_vtxo(spent.id()).await.unwrap().unwrap().state, VtxoState::Spent,
+		"live replay must leave the terminal state untouched");
 }
 
 pub async fn test_steal_lock_to_spent(db: &impl WalletPersister) {

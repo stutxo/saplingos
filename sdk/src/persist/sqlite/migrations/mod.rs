@@ -42,6 +42,7 @@ mod m0041_offboard_action_checkpoint;
 mod m0042_vtxo_registered;
 mod m0043_program_ownership;
 mod m0044_program_recovery_reservation;
+mod m0045_recovery_incomplete;
 
 use anyhow::Context;
 use log::debug;
@@ -91,6 +92,7 @@ use m0041_offboard_action_checkpoint::Migration0041;
 use m0042_vtxo_registered::Migration0042;
 use m0043_program_ownership::Migration0043;
 use m0044_program_recovery_reservation::Migration0044;
+use m0045_recovery_incomplete::Migration0045;
 
 pub struct MigrationContext {}
 
@@ -152,6 +154,7 @@ impl MigrationContext {
 		self.try_migration(conn, &Migration0042{})?;
 		self.try_migration(conn, &Migration0043{})?;
 		self.try_migration(conn, &Migration0044{})?;
+		self.try_migration(conn, &Migration0045{})?;
 
 		Ok(())
 	}
@@ -306,7 +309,7 @@ mod test {
 
 		// Perform the migrations and confirm it took effect
 		migs.do_all_migrations(&mut conn).unwrap();
-		assert_current_version(&conn, 44).unwrap();
+		assert_current_version(&conn, 45).unwrap();
 
 		assert!(table_exists(&conn, "bark_vtxo").unwrap());
 		assert!(table_exists(&conn, "bark_vtxo_state").unwrap());
