@@ -1304,7 +1304,21 @@ impl <S: StorageAdaptor> WalletPersister for StorageAdaptorWrapper<S> {
 	}
 
 	async fn store_mailbox_checkpoint(&self, checkpoint: u64) -> anyhow::Result<()> {
+		// Read-compare-write under the write lock, mirroring the SQLite
+		// backend and the WalletPersister contract: the mailbox cursor must
+		// never rewind. A stale or replayed lower value would re-serve
+		// already-processed messages and invalidate the monotone-cursor
+		// assumption the mailbox no-bury logic relies on.
 		let mut lock = self.inner.write().await;
+		let current = match lock.get(partition::MAILBOX_CHECKPOINT, &[]).await? {
+			Some(record) => record.to_data::<u64>()?,
+			None => 0,
+		};
+		anyhow::ensure!(
+			checkpoint > current,
+			"mailbox checkpoint not advanced: refusing to store {checkpoint} \
+				over the current cursor {current}",
+		);
 		let record = Record::from_data(
 			partition::MAILBOX_CHECKPOINT,
 			&[],

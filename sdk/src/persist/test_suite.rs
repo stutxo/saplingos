@@ -71,6 +71,7 @@ macro_rules! bark_persister_tests {
 
 			test_mailbox_checkpoint_empty_db,
 			test_mailbox_checkpoint_roundtrip,
+			test_mailbox_checkpoint_no_rewind,
 			test_vtxo_keys_empty,
 			test_vtxo_key_roundtrip,
 			test_vtxo_key_last_index_advances,
@@ -432,6 +433,24 @@ pub async fn test_mailbox_checkpoint_roundtrip(db: &impl WalletPersister) {
 
 	let checkpoint = db.get_mailbox_checkpoint().await.expect("get_mailbox_checkpoint");
 	assert_eq!(checkpoint, 42, "stored checkpoint should be returned");
+}
+
+/// Storing a lower or equal checkpoint must fail on every backend and must
+/// leave the cursor unchanged, per the [WalletPersister] contract.
+pub async fn test_mailbox_checkpoint_no_rewind(db: &impl WalletPersister) {
+	db.store_mailbox_checkpoint(100).await.expect("store 100");
+
+	let lower = db.store_mailbox_checkpoint(50).await;
+	assert!(lower.is_err(), "storing a lower checkpoint must fail, got {lower:?}");
+	let equal = db.store_mailbox_checkpoint(100).await;
+	assert!(equal.is_err(), "storing an equal checkpoint must fail, got {equal:?}");
+
+	let checkpoint = db.get_mailbox_checkpoint().await.expect("get_mailbox_checkpoint");
+	assert_eq!(checkpoint, 100, "cursor must be unchanged after rejected stores");
+
+	db.store_mailbox_checkpoint(101).await.expect("storing a higher checkpoint must succeed");
+	let checkpoint = db.get_mailbox_checkpoint().await.expect("get_mailbox_checkpoint");
+	assert_eq!(checkpoint, 101, "cursor must advance after a higher store");
 }
 
 pub async fn test_vtxo_keys_empty(db: &impl WalletPersister) {
