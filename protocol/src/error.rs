@@ -23,3 +23,20 @@ impl fmt::Debug for IncorrectSigningKeyError {
 			.finish()
 	}
 }
+
+/// An error cosigning a branch of a VTXO tree.
+#[derive(Debug, thiserror::Error)]
+pub enum CosignBranchError {
+	/// The provided keypair doesn't match the leaf's cosign pubkey.
+	#[error(transparent)]
+	IncorrectSigningKey(#[from] IncorrectSigningKeyError),
+	/// The provided number of aggregate cosign nonces doesn't match the
+	/// number of internal nodes in the tree.
+	#[error("expected {expected} aggregate cosign nonces, got {provided}")]
+	InvalidNonceCount {
+		/// The number of internal nodes in the tree.
+		expected: usize,
+		/// The number of aggregate cosign nonces provided.
+		provided: usize,
+	},
+}
