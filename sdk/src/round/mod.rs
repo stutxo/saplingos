@@ -850,7 +850,7 @@ impl RoundState {
 							error: "server reports round participation not found".into(),
 						};
 						if let Some(movement_id) = self.movement_id {
-							wallet.inner.movements.finish_movement(movement_id, MovementStatus::Failed).await
+							fail_round_movement(&wallet.inner.movements, movement_id).await
 								.context("failed to mark refresh movement as failed")?;
 						}
 						Ok(RoundStatus::Failed {
@@ -1932,6 +1932,24 @@ async fn persist_round_success(
 	Ok(())
 }
 
+/// Finalize a round participation's movement as failed.
+///
+/// Participation start records a fee-negative effective balance for the
+/// round's nominal fee (see [RoundParticipation::to_movement_update]).
+/// A failed round never moved funds, so the effective balance must be
+/// zeroed on failure: otherwise every failed round reports spurious
+/// negative drift of the nominal fee.
+async fn fail_round_movement(
+	movements: &crate::movement::manager::MovementManager,
+	movement_id: MovementId,
+) -> anyhow::Result<()> {
+	movements.finish_movement_with_update(
+		movement_id,
+		MovementStatus::Failed,
+		MovementUpdate::new().effective_balance(SignedAmount::ZERO),
+	).await.context("failed to finalize failed round movement")
+}
+
 async fn persist_round_failure(
 	wallet: &Wallet,
 	participation: &RoundParticipation,
@@ -1944,7 +1962,7 @@ async fn persist_round_failure(
 		&participation.inputs, movement_id.map(|m| m.into()),
 	).await;
 	let finish_result = if let Some(movement_id) = movement_id {
-		wallet.inner.movements.finish_movement(movement_id, MovementStatus::Failed).await
+		fail_round_movement(&wallet.inner.movements, movement_id).await
 	} else {
 		Ok(())
 	};
@@ -3424,5 +3442,52 @@ mod test {
 
 		let taken = store.take(&key.public_key()).expect("nonces present");
 		assert_eq!(taken.len(), 0);
+	}
+
+	/// A failed round never moved funds: failing its movement must zero
+	/// the fee-negative effective balance recorded at participation
+	/// start ([RoundParticipation::to_movement_update]) instead of
+	/// reporting the nominal fee as negative drift. Regression test for
+	/// the failure paths (persist_round_failure, refresh "round not
+	/// found") that finished the movement without clearing it.
+	#[tokio::test]
+	async fn failed_round_movement_zeroes_effective_balance() {
+		use std::sync::Arc;
+
+		use crate::notification::NotificationDispatch;
+		use crate::persist::WalletPersister;
+		use crate::persist::adaptor::StorageAdaptorWrapper;
+		use crate::subsystem::Subsystem;
+
+		let input = ark::test_util::VTXO_VECTORS.board_vtxo.clone();
+		let fee = Amount::from_sat(1_000);
+		let participation = RoundParticipation {
+			inputs: vec![input.clone()],
+			outputs: vec![round_request(input.amount().to_sat() - 1_000, input.policy())],
+			unblinded_mailbox_id: None,
+		};
+
+		let db = Arc::new(StorageAdaptorWrapper::new_memory());
+		let movements = crate::movement::manager::MovementManager::new(
+			db.clone(), NotificationDispatch::new(),
+		);
+		movements.register_subsystem(Subsystem::ROUND).await.unwrap();
+		let id = movements.new_movement_with_update(
+			Subsystem::ROUND, "refresh", participation.to_movement_update().unwrap(),
+		).await.unwrap();
+
+		// Participation start records the nominal fee as negative
+		// effective balance.
+		let movement = db.get_movement_by_id(id).await.unwrap();
+		assert_eq!(movement.effective_balance, - fee.to_signed().unwrap());
+
+		fail_round_movement(&movements, id).await.unwrap();
+
+		let movement = db.get_movement_by_id(id).await.unwrap();
+		assert_eq!(movement.status, MovementStatus::Failed);
+		assert_eq!(
+			movement.effective_balance, SignedAmount::ZERO,
+			"a failed round that never moved funds must report zero",
+		);
 	}
 }

@@ -516,7 +516,15 @@ impl<'a, T: ProtocolEncoding + Clone> ProtocolEncoding for LengthPrefixedVector<
 	}
 
 	fn decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, ProtocolDecodingError> {
-		let count = r.read_compact_size()? as usize;
+		let count = r.read_compact_size()?;
+		// Fallible `usize::try_from` instead of `as usize`: on 32-bit
+		// targets a declared count above `usize::MAX` would silently
+		// truncate (e.g. u32::MAX + 1 wraps to 0) and slip past the
+		// OversizedVectorError bound check below. On 64-bit the
+		// conversion always succeeds and the bound check decides.
+		let count = usize::try_from(count).map_err(|_| {
+			ProtocolDecodingError::invalid("compact-size vector count exceeds addressable memory")
+		})?;
 		OversizedVectorError::check::<T>(count)?;
 
 		let mut buf = Vec::with_capacity(count);
@@ -759,6 +767,25 @@ mod test {
 		let result = LengthPrefixedVector::<sha256::Hash>::deserialize(&encoded);
 		assert!(matches!(result, Err(ProtocolDecodingError::OversizedVector(error))
 			if error.requested == max + 1 && error.max == max));
+	}
+
+	/// A 0xff-class compact-size count (u64 range) must decode-error via
+	/// the public `deserialize` path, regardless of pointer width. On
+	/// 64-bit hosts the count converts to `usize` and
+	/// `OversizedVectorError::check` rejects it; on 32-bit targets
+	/// `usize::try_from` itself fails where the old `as usize` cast
+	/// would have truncated the declared count (e.g. `u32::MAX + 1`
+	/// wraps to 0) and let a malicious length prefix through the
+	/// allocation guard.
+	#[test]
+	fn length_prefixed_vector_rejects_wide_compact_size_count() {
+		for count in [u64::from(u32::MAX) + 1, u64::MAX] {
+			let mut encoded = Vec::new();
+			encoded.emit_compact_size(count).unwrap();
+			assert_eq!(encoded[0], 0xff, "count must use the 0xff (u64) class");
+			let result = LengthPrefixedVector::<sha256::Hash>::deserialize(&encoded);
+			assert!(result.is_err(), "wide count {count} must not decode");
+		}
 	}
 
 	#[test]

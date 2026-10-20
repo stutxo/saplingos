@@ -1445,7 +1445,15 @@ impl VtxoVersionedEncoding for Full {
 		r: &mut R,
 		version: u16,
 	) -> Result<Self, ProtocolDecodingError> {
-		let nb_genesis_items = r.read_compact_size()? as usize;
+		let nb_genesis_items = r.read_compact_size()?;
+		// Fallible `usize::try_from` instead of `as usize`: on 32-bit
+		// targets a declared count above `usize::MAX` would silently
+		// truncate and slip past the OversizedVectorError bound check
+		// below. On 64-bit the conversion always succeeds and the bound
+		// check decides.
+		let nb_genesis_items = usize::try_from(nb_genesis_items).map_err(|_| {
+			ProtocolDecodingError::invalid("genesis item count exceeds addressable memory")
+		})?;
 		OversizedVectorError::check::<GenesisItem>(nb_genesis_items)?;
 		let mut genesis = Vec::with_capacity(nb_genesis_items);
 		for _ in 0..nb_genesis_items {
@@ -1626,6 +1634,39 @@ mod test {
 
 		// this passes because the Eq is based on id which doesn't compare signatures
 		assert_eq!(g, *v);
+	}
+
+	/// The genesis-item count is a compact-size (u64) field. A
+	/// 0xff-class (wide) count must decode-error via the public
+	/// `deserialize` path regardless of pointer width: on 64-bit hosts
+	/// the count survives conversion to `usize` and the
+	/// OversizedVectorError bound check rejects it; on 32-bit targets
+	/// `usize::try_from` itself fails where the old `as usize` cast
+	/// would have truncated the declared count (e.g. `u32::MAX + 1`
+	/// wraps to 0) before the bound check ever saw the real value.
+	#[test]
+	fn vtxo_genesis_rejects_wide_compact_size_count() {
+		let v = &VTXO_VECTORS.board_vtxo;
+		for count in [u64::from(u32::MAX) + 1, u64::MAX] {
+			// A valid VTXO header up to the genesis-item count, then the
+			// hostile count. Bare still decodes the Full genesis for
+			// compatibility, so it exercises the same count read.
+			let mut bytes = Vec::new();
+			bytes.emit_u16(VTXO_ENCODING_VERSION).unwrap();
+			bytes.emit_u64(v.amount().to_sat()).unwrap();
+			bytes.emit_u32(v.expiry_height().to_u32()).unwrap();
+			v.server_pubkey().encode(&mut bytes).unwrap();
+			bytes.emit_u16(v.exit_delta().to_u16()).unwrap();
+			v.chain_anchor().encode(&mut bytes).unwrap();
+
+			let mut prefix = Vec::new();
+			prefix.emit_compact_size(count).unwrap();
+			assert_eq!(prefix[0], 0xff, "count must use the 0xff (u64) class");
+			bytes.extend_from_slice(&prefix);
+
+			let result = Vtxo::<Bare>::deserialize(&bytes);
+			assert!(result.is_err(), "wide genesis count {count} must not decode");
+		}
 	}
 
 	#[test]

@@ -1357,7 +1357,6 @@ mod test {
 		assert_eq!(rates.slow, MAX_PLAUSIBLE_FEE_RATE);
 		server.await.unwrap();
 	}
-
 	#[cfg(not(target_arch = "wasm32"))]
 	mod esplora_broadcast {
 		use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
