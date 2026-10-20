@@ -123,8 +123,8 @@ impl WalletAction for ArkoorSend {
 			} => {
 				// This stage is already durable. Recipient response loss retries
 				// the saved package rather than re-entering the signer.
-				wallet.ensure_program_recoveries(&signed_destination_vtxos).await?;
-				wallet.ensure_program_recoveries(&signed_change_vtxos).await?;
+				wallet.extension_ensure_recovery(&signed_destination_vtxos).await?;
+				wallet.extension_ensure_recovery(&signed_change_vtxos).await?;
 				wallet.commit_program_receives(
 					&self.destination, &signed_destination_vtxos,
 				).await.map_err(ArkoorCreateError::ProgramGuard)?;
@@ -142,8 +142,8 @@ impl WalletAction for ArkoorSend {
 				movement_id, signed_destination_vtxos, signed_change_vtxos,
 				last_park_error: _,
 			} => {
-				wallet.ensure_program_recoveries(&signed_destination_vtxos).await?;
-				wallet.ensure_program_recoveries(&signed_change_vtxos).await?;
+				wallet.extension_ensure_recovery(&signed_destination_vtxos).await?;
+				wallet.extension_ensure_recovery(&signed_change_vtxos).await?;
 				if is_coordinated_address(&self.destination)? {
 					// Also enforce commit when resuming an older Delivery checkpoint.
 					wallet.commit_program_receives(
@@ -418,7 +418,7 @@ async fn finalize_arkoor_send(
 	signed_change_vtxos: &[Vtxo<Full>],
 	delivery_succeeded: bool,
 ) -> Result<(), AdvanceError> {
-	wallet.ensure_program_recoveries(signed_change_vtxos).await?;
+	wallet.extension_ensure_recovery(signed_change_vtxos).await?;
 	wallet.mark_vtxos_as_spent(input_vtxo_ids).await?;
 
 	if !signed_change_vtxos.is_empty() {

@@ -414,7 +414,7 @@ impl ExitInner {
 			let vtxo = input.get_exit_claim_input();
 
 			if let Some(vtxo) = vtxo {
-				ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
+				ensure!(!wallet.extension_is_program_key(&vtxo.user_pubkey()).await?,
 					"immutable program claims cannot be added to a dynamic PSBT; use Wallet::recover_program_vtxos");
 				let exit_vtxo = claimable.get(&vtxo.id()).context("vtxo is not claimable yet")?;
 
@@ -1107,8 +1107,8 @@ impl Exit {
 		for input in inputs {
 			let i = input.borrow();
 			let vtxo = i.get_full_vtxo(&*guard.persister).await?;
-			if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await
-				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?.is_some()
+			if wallet.extension_is_program_key(&vtxo.user_pubkey()).await
+				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
 			{
 				return Err(ExitError::ClaimSigningError {
 					error: "program recovery beneficiaries are pre-bound; use Wallet::recover_program_vtxos".into(),

@@ -324,7 +324,7 @@ impl Wallet {
 			// response. Keep the original signature even after checkpoint removal.
 			saved
 		} else {
-			self.prepare_program_recoveries(std::slice::from_ref(&candidate)).await?;
+			self.extension_prepare_recovery(std::slice::from_ref(&candidate)).await?;
 			let prepared = user_key.prepare(self, builder.signing_input()?).await?;
 			let builder = builder.with_external_nonce(prepared.public_nonce())?;
 
@@ -369,7 +369,7 @@ impl Wallet {
 		if already_stored {
 			// Do not resurrect a completed board action or lock a VTXO which may
 			// already have been spent since the original response was lost.
-			self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await?;
+			self.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await?;
 			return Ok(PendingBoard {
 				funding_tx: board_psbt.unsigned_tx,
 				vtxos: vec![vtxo_id],

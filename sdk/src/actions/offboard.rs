@@ -664,9 +664,9 @@ async fn store_arkoor_split(
 	created: Vec<Vtxo<Full>>,
 	change: Vec<Vtxo<Full>>,
 ) -> Result<Progress, AdvanceError> {
-	wallet.ensure_program_recoveries(&created).await
+	wallet.extension_ensure_recovery(&created).await
 		.context("offboard output recovery is not ready")?;
-	wallet.ensure_program_recoveries(&change).await
+	wallet.extension_ensure_recovery(&change).await
 		.context("offboard change recovery is not ready")?;
 
 	// The server has marked our VTXOs as spent, so we must update accordingly.
@@ -708,7 +708,7 @@ async fn register_arkoor_split(
 	let full_vtxos = wallet.inner.db.get_full_vtxos(&to_register).await
 		.context("failed to hydrate arkoor split vtxos")?;
 
-	wallet.ensure_program_recoveries(&full_vtxos).await
+	wallet.extension_ensure_recovery(&full_vtxos).await
 		.context("offboard split recovery is not ready")?;
 	wallet.register_vtxo_transactions_with_server(&full_vtxos).await
 		.context("failed to register arkoor split vtxo transactions with server")?;
@@ -852,7 +852,7 @@ async fn prepare_offboard_forfeits(
 		full_inputs.iter().map(|v| v.id()).eq(offboard_vtxo_ids.iter().copied()),
 		"get_full_vtxos should return inputs in the exact same order",
 	);
-	wallet.ensure_program_recoveries(&full_inputs).await
+	wallet.extension_ensure_recovery(&full_inputs).await
 		.context("old offboard position recovery is not ready")?;
 	let ctx = OffboardForfeitContext::new(&full_inputs, &offboard_tx)
 		.context("no offboard inputs")?;
@@ -904,7 +904,7 @@ async fn finish_offboard(
 ) -> Result<Progress, AdvanceError> {
 	let (mut srv, _) = wallet.require_server().await?;
 	let inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await?;
-	wallet.ensure_program_recoveries(&inputs).await
+	wallet.extension_ensure_recovery(&inputs).await
 		.context("old offboard position recovery is not ready")?;
 
 	let offboard_txid = offboard_tx.compute_txid();
@@ -987,7 +987,7 @@ async fn broadcast_offboard(
 	movement_id: MovementId,
 ) -> Result<Progress, AdvanceError> {
 	let inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await?;
-	wallet.ensure_program_recoveries(&inputs).await
+	wallet.extension_ensure_recovery(&inputs).await
 		.context("offboard recovery is not ready for broadcast")?;
 	let offboard_txid = offboard_tx.compute_txid();
 	wallet.inner.chain.broadcast_tx(&offboard_tx).await.with_context(|| format!(

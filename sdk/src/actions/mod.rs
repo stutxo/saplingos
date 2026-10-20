@@ -634,7 +634,7 @@ impl Wallet {
 		// position and change are in inventory before a cancellable stage. Retain
 		// their recovery records, and verify readiness before releasing them.
 		let inputs = self.inner.db.get_full_vtxos(checkpoint.cancellable_input_ids()?).await?;
-		self.ensure_program_recoveries(&inputs).await?;
+		self.extension_ensure_recovery(&inputs).await?;
 		self.cancel_action_movement(checkpoint).await?;
 		self.finish_wallet_action_with_guard(&checkpoint.id(), guard).await
 	}

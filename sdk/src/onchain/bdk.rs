@@ -88,7 +88,7 @@ impl<Cs: Send + Sync> TxBuilderExt for TxBuilder<'_, Cs> {
 			// claim signer can reconstruct the spend.
 			let vtxo = wallet.inner.db.get_full_vtxo(input.id()).await?
 				.context(format!("Unable to load VTXO for exit: {}", input.id()))?;
-			ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
+			ensure!(!wallet.extension_is_program_key(&vtxo.user_pubkey()).await?,
 				"program recovery cannot be added to a dynamic fee transaction; use Wallet::recover_program_vtxos");
 			let mut psbt_in = psbt::Input::default();
 			psbt_in.set_exit_claim_input(&vtxo);

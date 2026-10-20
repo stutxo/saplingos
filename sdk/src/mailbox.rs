@@ -506,7 +506,7 @@ impl Wallet {
 				}
 			};
 
-			let program = self.inner.db.get_program_key(&vtxo.user_pubkey()).await?;
+			let program = self.extension_program_key(&vtxo.user_pubkey()).await?;
 			// Only deterministic rejections are absorbed; a transient
 			// failure (chain backend error, anchor not yet indexed) aborts
 			// here, leaving this message's checkpoint unadvanced so the
@@ -518,7 +518,7 @@ impl Wallet {
 				.with_context(|| format!("cannot vet received arkoor VTXO {}", vtxo.id()))?;
 			if let Some(e) = invalid {
 				if program.is_some() {
-					self.quarantine_program_receive(&vtxo, bytes, "invalid or unverifiable program deposit").await?;
+					self.extension_quarantine_receive(&vtxo, bytes, "invalid or unverifiable program deposit").await?;
 					continue;
 				}
 				error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
@@ -528,7 +528,7 @@ impl Wallet {
 
 			if let Err(e) = check_arkoor_receive_policy(&vtxo, ark_info.server_pubkey) {
 				if program.is_some() {
-					self.quarantine_program_receive(&vtxo, bytes, "program deposit has an unsupported payment policy or server").await?;
+					self.extension_quarantine_receive(&vtxo, bytes, "program deposit has an unsupported payment policy or server").await?;
 					continue;
 				}
 				error!("Refusing received arkoor VTXO {}: {}", vtxo.id(), e);
@@ -542,11 +542,11 @@ impl Wallet {
 					None => Err(anyhow!("program deposit was not prepared")),
 				};
 				if prepared.is_err() {
-					self.quarantine_program_receive(&vtxo, bytes, "program deposit has no verified prepared recovery").await?;
+					self.extension_quarantine_receive(&vtxo, bytes, "program deposit has no verified prepared recovery").await?;
 					continue;
 				}
-				if self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await.is_err() {
-					self.quarantine_program_receive(&vtxo, bytes, "program deposit recovery is not ready").await?;
+				if self.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await.is_err() {
+					self.extension_quarantine_receive(&vtxo, bytes, "program deposit recovery is not ready").await?;
 					continue;
 				}
 			} else if self.find_signable_clause_strict(&vtxo).await?.is_none() {

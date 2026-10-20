@@ -648,8 +648,8 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
 
 	// No preimage leaves the wallet until the native HTLC claim clause has
 	// a fully signed, program-authorized recovery on durable storage.
-	wallet.prepare_program_recoveries(&vtxos).await?;
-	wallet.ensure_program_recoveries(&vtxos).await?;
+	wallet.extension_prepare_recovery(&vtxos).await?;
+	wallet.extension_ensure_recovery(&vtxos).await?;
 	if htlc_claim_window_closed(wallet, &vtxos).await? {
 		return Ok(Grant::Rejected(anyhow!(
 			"saved HTLC recovery cannot confirm before the granted deadlines",
@@ -709,7 +709,7 @@ async fn claim_lightning_receive_htlcs(
 	let inputs = wallet.inner.db.get_full_vtxos(&input_ids).await
 		.context("failed to hydrate htlc input vtxos")?;
 
-	wallet.ensure_program_recoveries(&inputs).await?;
+	wallet.extension_ensure_recovery(&inputs).await?;
 
 	let receive_policy = if let Some(destination) = recv.claim_destination.as_ref() {
 		destination.policy().clone()
@@ -722,9 +722,9 @@ async fn claim_lightning_receive_htlcs(
 		inputs, receive_policy,
 	).context("creating claim arkoor builder failed")?;
 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
-	wallet.prepare_program_recoveries(&candidates).await?;
+	wallet.extension_prepare_recovery(&candidates).await?;
 	if let Some(destination) = recv.claim_destination.as_ref() {
-		wallet.prepare_program_receives(destination, &candidates).await?;
+		wallet.extension_prepare_receive(destination, &candidates).await?;
 	}
 	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
@@ -800,7 +800,7 @@ async fn deliver_lightning_receive(
 			return Ok(());
 		}
 	}
-	wallet.ensure_program_recoveries(&delivery.vtxos).await?;
+	wallet.extension_ensure_recovery(&delivery.vtxos).await?;
 	let external_destination = match recv.claim_destination.as_ref() {
 		Some(destination) => wallet.signing_key(&destination.policy().user_pubkey())
 			.await?.is_none(),
@@ -899,7 +899,7 @@ pub(crate) async fn is_htlc_claim_window_closed(
 	// Bails if any id is missing, so every granted vtxo is checked.
 	let vtxos = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await
 		.context("failed to hydrate htlc vtxos")?;
-	wallet.ensure_program_recoveries(&vtxos).await?;
+	wallet.extension_ensure_recovery(&vtxos).await?;
 	htlc_claim_window_closed(wallet, &vtxos).await
 }
 
@@ -930,7 +930,7 @@ async fn htlc_claim_window_closed(wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> anyh
 			return Ok(true);
 		}
 
-		if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_some() {
+		if wallet.extension_is_program_key(&vtxo.user_pubkey()).await? {
 			let record = wallet.inner.db.get_program_recovery(vtxo.point()).await?
 				.context("missing persisted HTLC recovery claim")?;
 			if !record.claim.lock_time.is_block_height() && median_time.is_none() {

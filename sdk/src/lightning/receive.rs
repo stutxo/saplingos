@@ -25,7 +25,7 @@ impl Wallet {
 	/// A durable program takeover hands progression to recovery-only background sync.
 	/// Caller must own `action_id`'s driver guard for the complete operation.
 	pub(crate) async fn exit_lightning_vtxos(&self, vtxos: &[Vtxo<Full>], action_id: &str) -> anyhow::Result<()> {
-		self.ensure_program_recoveries(vtxos).await?;
+		self.extension_ensure_recovery(vtxos).await?;
 		let mut native = Vec::new();
 		let mut program = Vec::new();
 		for vtxo in vtxos {

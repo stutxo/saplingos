@@ -178,7 +178,7 @@ impl Exit {
 		let mut witness_bytes = 0u64;
 		let mut program_fee = Amount::ZERO;
 		for vtxo in vtxos {
-			if let Some(program) = wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await
+			if let Some(program) = wallet.extension_program_key(&vtxo.user_pubkey()).await
 				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
 			{
 				if destination_override {

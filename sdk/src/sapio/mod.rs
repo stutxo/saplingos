@@ -19,8 +19,59 @@ use bitcoin::secp256k1::{Keypair, PublicKey};
 use ark::sapio::program::{Program, ProgramKey};
 use ark::vtxo::VtxoRef;
 
+use crate::extension::WalletExtension;
 use crate::persist::models::{ProgramRecoveryTemplate, SerdeProgramKey};
 use crate::Wallet;
+
+use ark::{Address, Vtxo};
+use ark::vtxo::Full;
+
+/// Core program lifecycle implementation. A companion crate will replace
+/// this object once the remaining recovery/receive code moves out.
+pub(crate) struct SapioExtension;
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl WalletExtension for SapioExtension {
+	async fn ensure_recovery(&self, wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> Result<()> {
+		wallet.ensure_program_recoveries(vtxos).await
+	}
+
+	async fn prepare_recovery(&self, wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> Result<()> {
+		wallet.prepare_program_recoveries(vtxos).await
+	}
+
+	async fn prepare_receive(
+		&self,
+		wallet: &Wallet,
+		address: &Address,
+		vtxos: &[Vtxo<Full>],
+	) -> Result<()> {
+		wallet.prepare_program_receives(address, vtxos).await
+	}
+
+	async fn quarantine_receive(
+		&self,
+		wallet: &Wallet,
+		vtxo: &Vtxo<Full>,
+		raw: &[u8],
+		reason: &str,
+	) -> Result<()> {
+		wallet.quarantine_program_receive(vtxo, raw, reason).await
+	}
+
+	async fn is_program_key(&self, wallet: &Wallet, public: &PublicKey) -> Result<bool> {
+		Ok(wallet.inner.db.get_program_key(public).await?.is_some())
+	}
+
+	async fn program_key(
+		&self,
+		wallet: &Wallet,
+		public: &PublicKey,
+	) -> Result<Option<SerdeProgramKey>> {
+		wallet.inner.db.get_program_key(public).await
+	}
+}
 
 /// Complete policy and recovery construction for newly issued program keys.
 /// Obtain `root` from independently verified attestation of the expected image.

@@ -16,6 +16,7 @@ pub extern crate lnurl as lnurllib;
 pub mod actions;
 pub mod chain;
 pub mod exit;
+pub mod extension;
 pub use bark_common::fs_perms;
 pub use bark_common::secret;
 pub mod movement;
@@ -513,6 +514,9 @@ struct WalletInner {
 		HashMap<PublicKey, Arc<dyn crate::vtxo::VtxoKeySigner>>,
 	>,
 
+	/// Optional policy lifecycle hooks (program recovery, coordinated receive).
+	extension: Option<Arc<dyn crate::extension::WalletExtension>>,
+
 	/// Coordinates access to the wallet's protected resources. The caller
 	/// picks a backend whose enforcement scope matches how the wallet is
 	/// deployed; see [`crate::lock_manager`].
@@ -840,7 +844,7 @@ impl Wallet {
 		if let Some(index) = self.inner.db.get_public_key_idx(&public_key).await? {
 			let keypair = self.inner.seed.derive_vtxo_keypair(index);
 			if keypair.public_key() != *public_key {
-				ensure!(self.inner.db.get_program_key(public_key).await?.is_some(),
+				ensure!(self.extension_is_program_key(public_key).await?,
 					"stored VTXO key does not match its derivation index");
 				return Ok(None);
 			}
@@ -947,7 +951,7 @@ impl Wallet {
 		address: &ark::Address,
 	) -> anyhow::Result<Option<secp256k1::schnorr::Signature>> {
 		let pubkey = address.policy().user_pubkey();
-		ensure!(self.inner.db.get_program_key(&pubkey).await?.is_none(),
+		ensure!(!self.extension_is_program_key(&pubkey).await?,
 			"program-backed addresses do not support arbitrary message signing");
 		let Some((_, keypair)) = self.pubkey_keypair(&pubkey).await? else {
 			return Ok(None);
@@ -1146,6 +1150,7 @@ impl Wallet {
 			onchain,
 			program_transport: tokio::sync::OnceCell::new(),
 			external_vtxo_signers: parking_lot::RwLock::new(HashMap::new()),
+			extension: Some(Arc::new(sapio::SapioExtension)),
 			daemon: parking_lot::Mutex::new(None),
 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 			round_secret_nonces: RoundSecretNonces::new(),

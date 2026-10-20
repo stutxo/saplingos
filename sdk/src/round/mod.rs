@@ -1002,13 +1002,13 @@ impl StoredRoundState {
 		let Some(bundles) = state.forfeit_bundles.as_ref().filter(|b| !b.is_empty()) else {
 			return Ok(status);
 		};
-		wallet.ensure_program_recoveries(&state.participation.inputs).await
+		wallet.extension_ensure_recovery(&state.participation.inputs).await
 			.context("old round recovery is not ready for forfeit handoff")?;
 		for input in &state.participation.inputs {
 			let ctx = HarkForfeitSigningContext::new(input, *unlock_hash)?;
 			wallet.prepare_hark_recovery(input, &ctx).await?;
 		}
-		wallet.prepare_program_recoveries(&state.new_vtxos).await
+		wallet.extension_prepare_recovery(&state.new_vtxos).await
 			.context("failed to preserve signed hashlocked round recovery ancestors")?;
 		wallet.preserve_hark_unlocks(&state.new_vtxos, &state.participation.inputs, *unlock_hash).await
 			.context("failed to preserve authenticated round unlock dependencies")?;
@@ -1025,7 +1025,7 @@ impl StoredRoundState {
 					// Only explicit nonce loss permits a new native signing session.
 					// Keep the exact saved leaves and forfeit transaction identities.
 					for vtxo in state.participation.inputs.iter().chain(&state.new_vtxos) {
-						ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
+						ensure!(!wallet.extension_is_program_key(&vtxo.user_pubkey()).await?,
 							"program round forfeit nonce loss requires saved offline recovery");
 					}
 					state.forfeit_bundles = Some(prepare_hark_forfeits(
@@ -1054,7 +1054,7 @@ impl StoredRoundState {
 			.context("failed to checkpoint completed round outputs")?;
 		let state = self.state();
 		let funding_tx = state.funding_tx().context("missing finished round transaction")?;
-		wallet.ensure_program_recoveries(&state.new_vtxos).await
+		wallet.extension_ensure_recovery(&state.new_vtxos).await
 			.context("completed round recovery is not ready")?;
 		wallet.register_vtxo_transactions_with_server(&state.new_vtxos).await
 			.context("couldn't register completed round outputs")?;
@@ -1296,9 +1296,9 @@ async fn prepare_hark_swap(
 	sent_forfeit_sigs: bool,
 ) -> anyhow::Result<(Vec<Vtxo<Full>>, Vec<Vec<u8>>)> {
 	let (mut srv, _) = wallet.require_server().await?;
-	wallet.ensure_program_recoveries(&participation.inputs).await
+	wallet.extension_ensure_recovery(&participation.inputs).await
 		.context("old round position recovery is not ready")?;
-	wallet.prepare_program_recoveries(output_vtxos).await
+	wallet.extension_prepare_recovery(output_vtxos).await
 		.context("replacement round recovery preparation failed")?;
 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
 		.context("couldn't send our input vtxo transactions to server")?;
@@ -1899,7 +1899,7 @@ async fn persist_round_success(
 	debug!("Persisting newly finished round. {} new vtxos, movement ID {:?}",
 		new_vtxos.len(), movement_id,
 	);
-	wallet.ensure_program_recoveries(new_vtxos).await
+	wallet.extension_ensure_recovery(new_vtxos).await
 		.context("completed round recovery is not ready")?;
 
 	// we first try all actions that need to happen and only afterwards return errors

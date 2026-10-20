@@ -1,0 +1,781 @@
+diff --git a/sdk/src/actions/arkoor_send.rs b/sdk/src/actions/arkoor_send.rs
+index ff6416516..831cf62c5 100644
+--- a/sdk/src/actions/arkoor_send.rs
++++ b/sdk/src/actions/arkoor_send.rs
+@@ -123,8 +123,8 @@ impl WalletAction for ArkoorSend {
+ 			} => {
+ 				// This stage is already durable. Recipient response loss retries
+ 				// the saved package rather than re-entering the signer.
+-				wallet.ensure_program_recoveries(&signed_destination_vtxos).await?;
+-				wallet.ensure_program_recoveries(&signed_change_vtxos).await?;
++				wallet.extension_ensure_recovery(&signed_destination_vtxos).await?;
++				wallet.extension_ensure_recovery(&signed_change_vtxos).await?;
+ 				wallet.commit_program_receives(
+ 					&self.destination, &signed_destination_vtxos,
+ 				).await.map_err(ArkoorCreateError::ProgramGuard)?;
+@@ -142,8 +142,8 @@ impl WalletAction for ArkoorSend {
+ 				movement_id, signed_destination_vtxos, signed_change_vtxos,
+ 				last_park_error: _,
+ 			} => {
+-				wallet.ensure_program_recoveries(&signed_destination_vtxos).await?;
+-				wallet.ensure_program_recoveries(&signed_change_vtxos).await?;
++				wallet.extension_ensure_recovery(&signed_destination_vtxos).await?;
++				wallet.extension_ensure_recovery(&signed_change_vtxos).await?;
+ 				if is_coordinated_address(&self.destination)? {
+ 					// Also enforce commit when resuming an older Delivery checkpoint.
+ 					wallet.commit_program_receives(
+@@ -418,7 +418,7 @@ async fn finalize_arkoor_send(
+ 	signed_change_vtxos: &[Vtxo<Full>],
+ 	delivery_succeeded: bool,
+ ) -> Result<(), AdvanceError> {
+-	wallet.ensure_program_recoveries(signed_change_vtxos).await?;
++	wallet.extension_ensure_recovery(signed_change_vtxos).await?;
+ 	wallet.mark_vtxos_as_spent(input_vtxo_ids).await?;
+ 
+ 	if !signed_change_vtxos.is_empty() {
+diff --git a/sdk/src/actions/board.rs b/sdk/src/actions/board.rs
+index 6a05b55b1..183ad20bd 100644
+--- a/sdk/src/actions/board.rs
++++ b/sdk/src/actions/board.rs
+@@ -108,7 +108,7 @@ impl Board {
+ 		ensure!(vtxo.id() == self.vtxo_id, "board checkpoint VTXO id mismatch");
+ 		ensure!(vtxo.chain_anchor().txid == self.funding_txid()?,
+ 			"funding transaction does not match the completed board");
+-		wallet.ensure_program_recoveries(std::slice::from_ref(vtxo)).await
++		wallet.extension_ensure_recovery(std::slice::from_ref(vtxo)).await
+ 	}
+ 
+ 	/// Finish funding and its initial network handoff under the original
+@@ -462,7 +462,7 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
+ 	// I know this if is collapsible, but it reads better like this...
+ 	let exit_margin = wallet.config().vtxo_exit_margin;
+ 	if vtxo.expiry_height() <= current_height + exit_margin {
+-		if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_some() {
++		if wallet.extension_is_program_key(&vtxo.user_pubkey()).await? {
+ 			// The normal driver already holds this board's action guard. Recovery
+ 			// tombstones it before chain I/O; no later registration may race the
+ 			// saved recovery, even if this first ancestor cannot be broadcast.
+@@ -509,7 +509,7 @@ async fn run_register(wallet: &Wallet, board: &Board) -> anyhow::Result<()> {
+ 	// serialized bytes to the server.
+ 	let vtxo = wallet.get_full_vtxo(board.vtxo_id).await
+ 		.with_context(|| format!("board vtxo doesn't exist: {}", board.vtxo_id))?;
+-	wallet.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await?;
++	wallet.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await?;
+ 
+ 	srv.client.register_board_vtxo(protos::BoardVtxoRequest {
+ 		board_vtxo: vtxo.serialize(),
+diff --git a/sdk/src/actions/lightning/pay.rs b/sdk/src/actions/lightning/pay.rs
+index f467785ec..cb394cbdc 100644
+--- a/sdk/src/actions/lightning/pay.rs
++++ b/sdk/src/actions/lightning/pay.rs
+@@ -429,7 +429,7 @@ pub(crate) async fn request_lightning_send_htlcs(
+ 	let full_inputs = wallet.inner.db.get_full_vtxos(&send.input_vtxo_ids).await
+ 		.context("failed to hydrate lightning-send input vtxos")?;
+ 
+-	wallet.ensure_program_recoveries(&full_inputs).await?;
++	wallet.extension_ensure_recovery(&full_inputs).await?;
+ 	// Ensure inputs are fully registered server-side before the cosign.
+ 	wallet.register_vtxo_transactions_with_server(&full_inputs).await
+ 		.context("failed to register lightning-send input vtxo transactions with server")?;
+@@ -459,7 +459,7 @@ pub(crate) async fn request_lightning_send_htlcs(
+ 	)
+ 		.context("Failed to construct arkoor package")?;
+ 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+-	wallet.prepare_program_recoveries(&candidates).await?;
++	wallet.extension_prepare_recovery(&candidates).await?;
+ 	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+ 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+ 		part.iter().map(|signature| signature.public_nonce()).collect()
+@@ -553,7 +553,7 @@ async fn record_lightning_send_outputs(
+ 	if htlcs.vtxos.is_empty() {
+ 		return Ok(());
+ 	}
+-	wallet.ensure_program_recoveries(&htlcs.vtxos).await?;
++	wallet.extension_ensure_recovery(&htlcs.vtxos).await?;
+ 	wallet.mark_vtxos_as_spent(&send.input_vtxo_ids).await?;
+ 	wallet.store_locked_vtxos(
+ 		htlcs.vtxos.iter().filter(is_send_htlc as for<'a, 'b> fn(&'a &'b Vtxo<Full>) -> bool),
+@@ -588,7 +588,7 @@ pub(crate) async fn initiate_lightning_send_payment(
+ 	// Legacy checkpoints have only the HTLC IDs.
+ 	if htlcs.vtxos.is_empty() {
+ 		let outputs = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await?;
+-		wallet.ensure_program_recoveries(&outputs).await?;
++		wallet.extension_ensure_recovery(&outputs).await?;
+ 		wallet.register_vtxo_transactions_with_server(&outputs).await?;
+ 	} else {
+ 		wallet.register_vtxo_transactions_with_server(&htlcs.vtxos).await?;
+@@ -750,7 +750,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
+ 			.with_context(|| format!("htlc vtxo with id {} not found", id))?;
+ 		htlc_vtxos.push(vtxo);
+ 	}
+-	wallet.ensure_program_recoveries(&htlc_vtxos).await?;
++	wallet.extension_ensure_recovery(&htlc_vtxos).await?;
+ 
+ 	let revocation_claim_policy = VtxoPolicy::new_pubkey(revocation.key);
+ 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+@@ -759,7 +759,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
+ 	)
+ 		.context("Failed to construct arkoor package")?;
+ 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+-	wallet.prepare_program_recoveries(&candidates).await?;
++	wallet.extension_prepare_recovery(&candidates).await?;
+ 	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+ 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+ 		part.iter().map(|signature| signature.public_nonce()).collect()
+@@ -808,7 +808,7 @@ async fn finish_lightning_send_revocation(
+ 			return Ok(());
+ 		}
+ 	}
+-	wallet.ensure_program_recoveries(vtxos).await?;
++	wallet.extension_ensure_recovery(vtxos).await?;
+ 	wallet.register_vtxo_transactions_with_server(vtxos).await?;
+ 
+ 	// The revoked VTXOs were issued by the server: never `sum`, which panics
+diff --git a/sdk/src/actions/lightning/receive.rs b/sdk/src/actions/lightning/receive.rs
+index b9579f9c3..c6a5bb486 100644
+--- a/sdk/src/actions/lightning/receive.rs
++++ b/sdk/src/actions/lightning/receive.rs
+@@ -648,8 +648,8 @@ pub(crate) async fn prepare_lightning_receive_htlcs(
+ 
+ 	// No preimage leaves the wallet until the native HTLC claim clause has
+ 	// a fully signed, program-authorized recovery on durable storage.
+-	wallet.prepare_program_recoveries(&vtxos).await?;
+-	wallet.ensure_program_recoveries(&vtxos).await?;
++	wallet.extension_prepare_recovery(&vtxos).await?;
++	wallet.extension_ensure_recovery(&vtxos).await?;
+ 	if htlc_claim_window_closed(wallet, &vtxos).await? {
+ 		return Ok(Grant::Rejected(anyhow!(
+ 			"saved HTLC recovery cannot confirm before the granted deadlines",
+@@ -709,7 +709,7 @@ async fn claim_lightning_receive_htlcs(
+ 	let inputs = wallet.inner.db.get_full_vtxos(&input_ids).await
+ 		.context("failed to hydrate htlc input vtxos")?;
+ 
+-	wallet.ensure_program_recoveries(&inputs).await?;
++	wallet.extension_ensure_recovery(&inputs).await?;
+ 
+ 	let receive_policy = if let Some(destination) = recv.claim_destination.as_ref() {
+ 		destination.policy().clone()
+@@ -722,9 +722,9 @@ async fn claim_lightning_receive_htlcs(
+ 		inputs, receive_policy,
+ 	).context("creating claim arkoor builder failed")?;
+ 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+-	wallet.prepare_program_recoveries(&candidates).await?;
++	wallet.extension_prepare_recovery(&candidates).await?;
+ 	if let Some(destination) = recv.claim_destination.as_ref() {
+-		wallet.prepare_program_receives(destination, &candidates).await?;
++		wallet.extension_prepare_receive(destination, &candidates).await?;
+ 	}
+ 	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
+ 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
+@@ -800,7 +800,7 @@ async fn deliver_lightning_receive(
+ 			return Ok(());
+ 		}
+ 	}
+-	wallet.ensure_program_recoveries(&delivery.vtxos).await?;
++	wallet.extension_ensure_recovery(&delivery.vtxos).await?;
+ 	let external_destination = match recv.claim_destination.as_ref() {
+ 		Some(destination) => wallet.signing_key(&destination.policy().user_pubkey())
+ 			.await?.is_none(),
+@@ -899,7 +899,7 @@ pub(crate) async fn is_htlc_claim_window_closed(
+ 	// Bails if any id is missing, so every granted vtxo is checked.
+ 	let vtxos = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await
+ 		.context("failed to hydrate htlc vtxos")?;
+-	wallet.ensure_program_recoveries(&vtxos).await?;
++	wallet.extension_ensure_recovery(&vtxos).await?;
+ 	htlc_claim_window_closed(wallet, &vtxos).await
+ }
+ 
+@@ -930,7 +930,7 @@ async fn htlc_claim_window_closed(wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> anyh
+ 			return Ok(true);
+ 		}
+ 
+-		if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_some() {
++		if wallet.extension_is_program_key(&vtxo.user_pubkey()).await? {
+ 			let record = wallet.inner.db.get_program_recovery(vtxo.point()).await?
+ 				.context("missing persisted HTLC recovery claim")?;
+ 			if !record.claim.lock_time.is_block_height() && median_time.is_none() {
+diff --git a/sdk/src/actions/mod.rs b/sdk/src/actions/mod.rs
+index 343c68b42..298b726f9 100644
+--- a/sdk/src/actions/mod.rs
++++ b/sdk/src/actions/mod.rs
+@@ -634,7 +634,7 @@ impl Wallet {
+ 		// position and change are in inventory before a cancellable stage. Retain
+ 		// their recovery records, and verify readiness before releasing them.
+ 		let inputs = self.inner.db.get_full_vtxos(checkpoint.cancellable_input_ids()?).await?;
+-		self.ensure_program_recoveries(&inputs).await?;
++		self.extension_ensure_recovery(&inputs).await?;
+ 		self.cancel_action_movement(checkpoint).await?;
+ 		self.finish_wallet_action_with_guard(&checkpoint.id(), guard).await
+ 	}
+diff --git a/sdk/src/actions/offboard.rs b/sdk/src/actions/offboard.rs
+index ac44cda9f..cddbd44d9 100644
+--- a/sdk/src/actions/offboard.rs
++++ b/sdk/src/actions/offboard.rs
+@@ -664,9 +664,9 @@ async fn store_arkoor_split(
+ 	created: Vec<Vtxo<Full>>,
+ 	change: Vec<Vtxo<Full>>,
+ ) -> Result<Progress, AdvanceError> {
+-	wallet.ensure_program_recoveries(&created).await
++	wallet.extension_ensure_recovery(&created).await
+ 		.context("offboard output recovery is not ready")?;
+-	wallet.ensure_program_recoveries(&change).await
++	wallet.extension_ensure_recovery(&change).await
+ 		.context("offboard change recovery is not ready")?;
+ 
+ 	// The server has marked our VTXOs as spent, so we must update accordingly.
+@@ -708,7 +708,7 @@ async fn register_arkoor_split(
+ 	let full_vtxos = wallet.inner.db.get_full_vtxos(&to_register).await
+ 		.context("failed to hydrate arkoor split vtxos")?;
+ 
+-	wallet.ensure_program_recoveries(&full_vtxos).await
++	wallet.extension_ensure_recovery(&full_vtxos).await
+ 		.context("offboard split recovery is not ready")?;
+ 	wallet.register_vtxo_transactions_with_server(&full_vtxos).await
+ 		.context("failed to register arkoor split vtxo transactions with server")?;
+@@ -852,7 +852,7 @@ async fn prepare_offboard_forfeits(
+ 		full_inputs.iter().map(|v| v.id()).eq(offboard_vtxo_ids.iter().copied()),
+ 		"get_full_vtxos should return inputs in the exact same order",
+ 	);
+-	wallet.ensure_program_recoveries(&full_inputs).await
++	wallet.extension_ensure_recovery(&full_inputs).await
+ 		.context("old offboard position recovery is not ready")?;
+ 	let ctx = OffboardForfeitContext::new(&full_inputs, &offboard_tx)
+ 		.context("no offboard inputs")?;
+@@ -904,7 +904,7 @@ async fn finish_offboard(
+ ) -> Result<Progress, AdvanceError> {
+ 	let (mut srv, _) = wallet.require_server().await?;
+ 	let inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await?;
+-	wallet.ensure_program_recoveries(&inputs).await
++	wallet.extension_ensure_recovery(&inputs).await
+ 		.context("old offboard position recovery is not ready")?;
+ 
+ 	let offboard_txid = offboard_tx.compute_txid();
+@@ -987,7 +987,7 @@ async fn broadcast_offboard(
+ 	movement_id: MovementId,
+ ) -> Result<Progress, AdvanceError> {
+ 	let inputs = wallet.inner.db.get_full_vtxos(&offboard_vtxo_ids).await?;
+-	wallet.ensure_program_recoveries(&inputs).await
++	wallet.extension_ensure_recovery(&inputs).await
+ 		.context("offboard recovery is not ready for broadcast")?;
+ 	let offboard_txid = offboard_tx.compute_txid();
+ 	wallet.inner.chain.broadcast_tx(&offboard_tx).await.with_context(|| format!(
+diff --git a/sdk/src/arkoor.rs b/sdk/src/arkoor.rs
+index d513234f7..f74a568f0 100644
+--- a/sdk/src/arkoor.rs
++++ b/sdk/src/arkoor.rs
+@@ -275,7 +275,7 @@ impl Wallet {
+ 		let inputs = self.inner.db.get_full_vtxos(&input_ids).await
+ 			.context("failed to hydrate arkoor input vtxos")?;
+ 
+-		self.ensure_program_recoveries(&inputs).await?;
++		self.extension_ensure_recovery(&inputs).await?;
+ 		// Pre-register the input chains so the post-cosign register call
+ 		// for the outputs finds a signed chain anchor:
+ 		// register_vtxo_transactions validates a vtxo against its anchor's
+@@ -310,12 +310,12 @@ impl Wallet {
+ 		let builder = ArkoorPackageBuilder::new_with_checkpoints(inputs, outputs)
+ 			.context("Failed to construct arkoor package")?;
+ 		let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
+-		self.prepare_program_recoveries(&candidates).await.map_err(ArkoorCreateError::ProgramGuard)?;
++		self.extension_prepare_recovery(&candidates).await.map_err(ArkoorCreateError::ProgramGuard)?;
+ 		if let Some(address) = recipient {
+ 			let destination_candidates = candidates.iter()
+ 				.filter(|v| *v.policy() == arkoor_dest.policy)
+ 				.cloned().collect::<Vec<_>>();
+-			self.prepare_program_receives(address, &destination_candidates).await
++			self.extension_prepare_receive(address, &destination_candidates).await
+ 				.map_err(ArkoorCreateError::ProgramGuard)?;
+ 		}
+ 		let (prepared, attestations) = self.prepare_arkoor_signatures(&builder).await
+diff --git a/sdk/src/board.rs b/sdk/src/board.rs
+index bac412a2f..e094931eb 100644
+--- a/sdk/src/board.rs
++++ b/sdk/src/board.rs
+@@ -324,7 +324,7 @@ impl Wallet {
+ 			// response. Keep the original signature even after checkpoint removal.
+ 			saved
+ 		} else {
+-			self.prepare_program_recoveries(std::slice::from_ref(&candidate)).await?;
++			self.extension_prepare_recovery(std::slice::from_ref(&candidate)).await?;
+ 			let prepared = user_key.prepare(self, builder.signing_input()?).await?;
+ 			let builder = builder.with_external_nonce(prepared.public_nonce())?;
+ 
+@@ -369,7 +369,7 @@ impl Wallet {
+ 		if already_stored {
+ 			// Do not resurrect a completed board action or lock a VTXO which may
+ 			// already have been spent since the original response was lost.
+-			self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await?;
++			self.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await?;
+ 			return Ok(PendingBoard {
+ 				funding_tx: board_psbt.unsigned_tx,
+ 				vtxos: vec![vtxo_id],
+diff --git a/sdk/src/exit/estimate.rs b/sdk/src/exit/estimate.rs
+index d81ef9ae7..2443e21ad 100644
+--- a/sdk/src/exit/estimate.rs
++++ b/sdk/src/exit/estimate.rs
+@@ -178,7 +178,7 @@ impl Exit {
+ 		let mut witness_bytes = 0u64;
+ 		let mut program_fee = Amount::ZERO;
+ 		for vtxo in vtxos {
+-			if let Some(program) = wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await
++			if let Some(program) = wallet.extension_program_key(&vtxo.user_pubkey()).await
+ 				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
+ 			{
+ 				if destination_override {
+diff --git a/sdk/src/exit/mod.rs b/sdk/src/exit/mod.rs
+index e170a3370..eecfd36b6 100644
+--- a/sdk/src/exit/mod.rs
++++ b/sdk/src/exit/mod.rs
+@@ -414,7 +414,7 @@ impl ExitInner {
+ 			let vtxo = input.get_exit_claim_input();
+ 
+ 			if let Some(vtxo) = vtxo {
+-				ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
++				ensure!(!wallet.extension_is_program_key(&vtxo.user_pubkey()).await?,
+ 					"immutable program claims cannot be added to a dynamic PSBT; use Wallet::recover_program_vtxos");
+ 				let exit_vtxo = claimable.get(&vtxo.id()).context("vtxo is not claimable yet")?;
+ 
+@@ -1107,8 +1107,8 @@ impl Exit {
+ 		for input in inputs {
+ 			let i = input.borrow();
+ 			let vtxo = i.get_full_vtxo(&*guard.persister).await?;
+-			if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await
+-				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?.is_some()
++			if wallet.extension_is_program_key(&vtxo.user_pubkey()).await
++				.map_err(|e| ExitError::InvalidWalletState { error: e.to_string() })?
+ 			{
+ 				return Err(ExitError::ClaimSigningError {
+ 					error: "program recovery beneficiaries are pre-bound; use Wallet::recover_program_vtxos".into(),
+diff --git a/sdk/src/extension.rs b/sdk/src/extension.rs
+new file mode 100644
+index 000000000..83a054e2b
+--- /dev/null
++++ b/sdk/src/extension.rs
+@@ -0,0 +1,124 @@
++//! Optional wallet extensions for policy-controlled VTXOs.
++//!
++//! The core wallet owns native Ark transfers and exits. Features that need
++//! extra state around a VTXO (for example a local co-signer and its saved
++//! recovery records) implement this trait. Core call sites go through the
++//! helpers below so they never depend on a concrete program implementation.
++
++use std::sync::Arc;
++
++use anyhow::Result;
++use bitcoin::secp256k1::PublicKey;
++
++use ark::{Address, Vtxo};
++use ark::vtxo::Full;
++
++use crate::Wallet;
++
++/// Lifecycle hooks for policy-controlled VTXOs.
++///
++/// Implementations must be idempotent: core calls these at crash-replay
++/// boundaries as well as on first execution.
++#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
++#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
++pub trait WalletExtension: Send + Sync {
++	/// Ensure every program-backed VTXO has a usable saved recovery.
++	async fn ensure_recovery(&self, wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> Result<()>;
++
++	/// Prepare and save recovery for candidate outputs before they commit.
++	async fn prepare_recovery(&self, wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> Result<()>;
++
++	/// Prepare a coordinated receive for an address before acknowledging it.
++	async fn prepare_receive(
++		&self,
++		wallet: &Wallet,
++		address: &Address,
++		vtxos: &[Vtxo<Full>],
++	) -> Result<()>;
++
++	/// Retain a rejected program deposit as bounded diagnostic metadata.
++	async fn quarantine_receive(
++		&self,
++		wallet: &Wallet,
++		vtxo: &Vtxo<Full>,
++		raw: &[u8],
++		reason: &str,
++	) -> Result<()>;
++
++	/// Whether this key belongs to the extension (program-backed or a
++	/// registered external signer).
++	async fn is_program_key(&self, wallet: &Wallet, public: &PublicKey) -> Result<bool>;
++
++	/// The stored program descriptor for a key, when present.
++	async fn program_key(
++		&self,
++		wallet: &Wallet,
++		public: &PublicKey,
++	) -> Result<Option<crate::persist::models::SerdeProgramKey>>;
++}
++
++impl Wallet {
++	pub(crate) fn wallet_extension(&self) -> Option<&Arc<dyn WalletExtension>> {
++		self.inner.extension.as_ref()
++	}
++
++	pub(crate) async fn extension_ensure_recovery(
++		&self,
++		vtxos: &[Vtxo<Full>],
++	) -> Result<()> {
++		match self.wallet_extension() {
++			Some(extension) => extension.ensure_recovery(self, vtxos).await,
++			None => Ok(()),
++		}
++	}
++
++	pub(crate) async fn extension_prepare_recovery(
++		&self,
++		vtxos: &[Vtxo<Full>],
++	) -> Result<()> {
++		match self.wallet_extension() {
++			Some(extension) => extension.prepare_recovery(self, vtxos).await,
++			None => Ok(()),
++		}
++	}
++
++	pub(crate) async fn extension_prepare_receive(
++		&self,
++		address: &Address,
++		vtxos: &[Vtxo<Full>],
++	) -> Result<()> {
++		match self.wallet_extension() {
++			Some(extension) => extension.prepare_receive(self, address, vtxos).await,
++			None => Ok(()),
++		}
++	}
++
++	pub(crate) async fn extension_quarantine_receive(
++		&self,
++		vtxo: &Vtxo<Full>,
++		raw: &[u8],
++		reason: &str,
++	) -> Result<()> {
++		match self.wallet_extension() {
++			Some(extension) => extension.quarantine_receive(self, vtxo, raw, reason).await,
++			None => Ok(()),
++		}
++	}
++
++	pub(crate) async fn extension_is_program_key(&self, public: &PublicKey) -> Result<bool> {
++		match self.wallet_extension() {
++			Some(extension) => extension.is_program_key(self, public).await,
++			None => Ok(false),
++		}
++	}
++
++	pub(crate) async fn extension_program_key(
++		&self,
++		public: &PublicKey,
++	) -> Result<Option<crate::persist::models::SerdeProgramKey>> {
++		match self.wallet_extension() {
++			Some(extension) => extension.program_key(self, public).await,
++			None => Ok(None),
++		}
++	}
++}
+diff --git a/sdk/src/import.rs b/sdk/src/import.rs
+index f91d85a02..8ab59b9cd 100644
+--- a/sdk/src/import.rs
++++ b/sdk/src/import.rs
+@@ -154,7 +154,7 @@ impl Wallet {
+ 		keypair: &VtxoSigningKey,
+ 		args: &ImportVtxoArgs,
+ 	) -> Result<VtxoState, ImportVtxoError> {
+-		self.ensure_program_recoveries(std::slice::from_ref(vtxo)).await?;
++		self.extension_ensure_recovery(std::slice::from_ref(vtxo)).await?;
+ 		if args.skip_status_check {
+ 			return Ok(VtxoState::Spendable);
+ 		}
+diff --git a/sdk/src/lib.rs b/sdk/src/lib.rs
+index 396e63cf1..eb94dd59f 100644
+--- a/sdk/src/lib.rs
++++ b/sdk/src/lib.rs
+@@ -16,6 +16,7 @@ pub extern crate lnurl as lnurllib;
+ pub mod actions;
+ pub mod chain;
+ pub mod exit;
++pub mod extension;
+ pub use bark_common::fs_perms;
+ pub use bark_common::secret;
+ pub mod movement;
+@@ -513,6 +514,9 @@ struct WalletInner {
+ 		HashMap<PublicKey, Arc<dyn crate::vtxo::VtxoKeySigner>>,
+ 	>,
+ 
++	/// Optional policy lifecycle hooks (program recovery, coordinated receive).
++	extension: Option<Arc<dyn crate::extension::WalletExtension>>,
++
+ 	/// Coordinates access to the wallet's protected resources. The caller
+ 	/// picks a backend whose enforcement scope matches how the wallet is
+ 	/// deployed; see [`crate::lock_manager`].
+@@ -840,7 +844,7 @@ impl Wallet {
+ 		if let Some(index) = self.inner.db.get_public_key_idx(&public_key).await? {
+ 			let keypair = self.inner.seed.derive_vtxo_keypair(index);
+ 			if keypair.public_key() != *public_key {
+-				ensure!(self.inner.db.get_program_key(public_key).await?.is_some(),
++				ensure!(self.extension_is_program_key(public_key).await?,
+ 					"stored VTXO key does not match its derivation index");
+ 				return Ok(None);
+ 			}
+@@ -947,7 +951,7 @@ impl Wallet {
+ 		address: &ark::Address,
+ 	) -> anyhow::Result<Option<secp256k1::schnorr::Signature>> {
+ 		let pubkey = address.policy().user_pubkey();
+-		ensure!(self.inner.db.get_program_key(&pubkey).await?.is_none(),
++		ensure!(!self.extension_is_program_key(&pubkey).await?,
+ 			"program-backed addresses do not support arbitrary message signing");
+ 		let Some((_, keypair)) = self.pubkey_keypair(&pubkey).await? else {
+ 			return Ok(None);
+@@ -1146,6 +1150,7 @@ impl Wallet {
+ 			onchain,
+ 			program_transport: tokio::sync::OnceCell::new(),
+ 			external_vtxo_signers: parking_lot::RwLock::new(HashMap::new()),
++			extension: Some(Arc::new(sapio::SapioExtension)),
+ 			daemon: parking_lot::Mutex::new(None),
+ 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+ 			round_secret_nonces: RoundSecretNonces::new(),
+diff --git a/sdk/src/lightning/receive.rs b/sdk/src/lightning/receive.rs
+index ce47b74bb..ea39e8fe8 100644
+--- a/sdk/src/lightning/receive.rs
++++ b/sdk/src/lightning/receive.rs
+@@ -25,7 +25,7 @@ impl Wallet {
+ 	/// A durable program takeover hands progression to recovery-only background sync.
+ 	/// Caller must own `action_id`'s driver guard for the complete operation.
+ 	pub(crate) async fn exit_lightning_vtxos(&self, vtxos: &[Vtxo<Full>], action_id: &str) -> anyhow::Result<()> {
+-		self.ensure_program_recoveries(vtxos).await?;
++		self.extension_ensure_recovery(vtxos).await?;
+ 		let mut native = Vec::new();
+ 		let mut program = Vec::new();
+ 		for vtxo in vtxos {
+diff --git a/sdk/src/mailbox.rs b/sdk/src/mailbox.rs
+index 750df620f..84686f006 100644
+--- a/sdk/src/mailbox.rs
++++ b/sdk/src/mailbox.rs
+@@ -506,7 +506,7 @@ impl Wallet {
+ 				}
+ 			};
+ 
+-			let program = self.inner.db.get_program_key(&vtxo.user_pubkey()).await?;
++			let program = self.extension_program_key(&vtxo.user_pubkey()).await?;
+ 			// Only deterministic rejections are absorbed; a transient
+ 			// failure (chain backend error, anchor not yet indexed) aborts
+ 			// here, leaving this message's checkpoint unadvanced so the
+@@ -518,7 +518,7 @@ impl Wallet {
+ 				.with_context(|| format!("cannot vet received arkoor VTXO {}", vtxo.id()))?;
+ 			if let Some(e) = invalid {
+ 				if program.is_some() {
+-					self.quarantine_program_receive(&vtxo, bytes, "invalid or unverifiable program deposit").await?;
++					self.extension_quarantine_receive(&vtxo, bytes, "invalid or unverifiable program deposit").await?;
+ 					continue;
+ 				}
+ 				error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
+@@ -528,7 +528,7 @@ impl Wallet {
+ 
+ 			if let Err(e) = check_arkoor_receive_policy(&vtxo, ark_info.server_pubkey) {
+ 				if program.is_some() {
+-					self.quarantine_program_receive(&vtxo, bytes, "program deposit has an unsupported payment policy or server").await?;
++					self.extension_quarantine_receive(&vtxo, bytes, "program deposit has an unsupported payment policy or server").await?;
+ 					continue;
+ 				}
+ 				error!("Refusing received arkoor VTXO {}: {}", vtxo.id(), e);
+@@ -542,11 +542,11 @@ impl Wallet {
+ 					None => Err(anyhow!("program deposit was not prepared")),
+ 				};
+ 				if prepared.is_err() {
+-					self.quarantine_program_receive(&vtxo, bytes, "program deposit has no verified prepared recovery").await?;
++					self.extension_quarantine_receive(&vtxo, bytes, "program deposit has no verified prepared recovery").await?;
+ 					continue;
+ 				}
+-				if self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await.is_err() {
+-					self.quarantine_program_receive(&vtxo, bytes, "program deposit recovery is not ready").await?;
++				if self.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await.is_err() {
++					self.extension_quarantine_receive(&vtxo, bytes, "program deposit recovery is not ready").await?;
+ 					continue;
+ 				}
+ 			} else if self.find_signable_clause_strict(&vtxo).await?.is_none() {
+diff --git a/sdk/src/onchain/bdk.rs b/sdk/src/onchain/bdk.rs
+index dce1d4d63..667a3352f 100644
+--- a/sdk/src/onchain/bdk.rs
++++ b/sdk/src/onchain/bdk.rs
+@@ -88,7 +88,7 @@ impl<Cs: Send + Sync> TxBuilderExt for TxBuilder<'_, Cs> {
+ 			// claim signer can reconstruct the spend.
+ 			let vtxo = wallet.inner.db.get_full_vtxo(input.id()).await?
+ 				.context(format!("Unable to load VTXO for exit: {}", input.id()))?;
+-			ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
++			ensure!(!wallet.extension_is_program_key(&vtxo.user_pubkey()).await?,
+ 				"program recovery cannot be added to a dynamic fee transaction; use Wallet::recover_program_vtxos");
+ 			let mut psbt_in = psbt::Input::default();
+ 			psbt_in.set_exit_claim_input(&vtxo);
+diff --git a/sdk/src/recovery.rs b/sdk/src/recovery.rs
+index 9ca51cf42..c91cbc20b 100644
+--- a/sdk/src/recovery.rs
++++ b/sdk/src/recovery.rs
+@@ -439,7 +439,7 @@ impl Wallet {
+ 				// A row from an earlier, failed recovery attempt is forced along.
+ 				self.store_vtxos([vtxo], &VtxoState::Exited).await?;
+ 				self.mark_vtxos_as_exited(&[vtxo.id()]).await?;
+-				if self.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none() {
++				if !self.extension_is_program_key(&vtxo.user_pubkey()).await? {
+ 					self.exit_mgr()
+ 						.start_exit_for_vtxos_including_non_standard(&[vtxo.to_bare()]).await?;
+ 				}
+@@ -693,9 +693,9 @@ impl Wallet {
+ 	) -> anyhow::Result<()> {
+ 		let id = vtxo.id();
+ 
+-		if let Err(e) = self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await {
++		if let Err(e) = self.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await {
+ 			warn!("Recovery vtxo {id} has no usable saved program recovery: {e:#}");
+-			self.quarantine_program_receive(
++			self.extension_quarantine_receive(
+ 				&vtxo, &vtxo.serialize(), "program deposit has no verified complete recovery",
+ 			).await?;
+ 			report.push_failed(id, Some(vtxo.amount()));
+@@ -1038,6 +1038,7 @@ mod test {
+ 				onchain: None,
+ 				program_transport: tokio::sync::OnceCell::new(),
+ 				external_vtxo_signers: parking_lot::RwLock::new(std::collections::HashMap::new()),
++				extension: None,
+ 				daemon: parking_lot::Mutex::new(None),
+ 				last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+ 				round_secret_nonces: RoundSecretNonces::new(),
+diff --git a/sdk/src/round/mod.rs b/sdk/src/round/mod.rs
+index 8311bb536..3d9b0d078 100644
+--- a/sdk/src/round/mod.rs
++++ b/sdk/src/round/mod.rs
+@@ -1002,13 +1002,13 @@ impl StoredRoundState {
+ 		let Some(bundles) = state.forfeit_bundles.as_ref().filter(|b| !b.is_empty()) else {
+ 			return Ok(status);
+ 		};
+-		wallet.ensure_program_recoveries(&state.participation.inputs).await
++		wallet.extension_ensure_recovery(&state.participation.inputs).await
+ 			.context("old round recovery is not ready for forfeit handoff")?;
+ 		for input in &state.participation.inputs {
+ 			let ctx = HarkForfeitSigningContext::new(input, *unlock_hash)?;
+ 			wallet.prepare_hark_recovery(input, &ctx).await?;
+ 		}
+-		wallet.prepare_program_recoveries(&state.new_vtxos).await
++		wallet.extension_prepare_recovery(&state.new_vtxos).await
+ 			.context("failed to preserve signed hashlocked round recovery ancestors")?;
+ 		wallet.preserve_hark_unlocks(&state.new_vtxos, &state.participation.inputs, *unlock_hash).await
+ 			.context("failed to preserve authenticated round unlock dependencies")?;
+@@ -1025,7 +1025,7 @@ impl StoredRoundState {
+ 					// Only explicit nonce loss permits a new native signing session.
+ 					// Keep the exact saved leaves and forfeit transaction identities.
+ 					for vtxo in state.participation.inputs.iter().chain(&state.new_vtxos) {
+-						ensure!(wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none(),
++						ensure!(!wallet.extension_is_program_key(&vtxo.user_pubkey()).await?,
+ 							"program round forfeit nonce loss requires saved offline recovery");
+ 					}
+ 					state.forfeit_bundles = Some(prepare_hark_forfeits(
+@@ -1054,7 +1054,7 @@ impl StoredRoundState {
+ 			.context("failed to checkpoint completed round outputs")?;
+ 		let state = self.state();
+ 		let funding_tx = state.funding_tx().context("missing finished round transaction")?;
+-		wallet.ensure_program_recoveries(&state.new_vtxos).await
++		wallet.extension_ensure_recovery(&state.new_vtxos).await
+ 			.context("completed round recovery is not ready")?;
+ 		wallet.register_vtxo_transactions_with_server(&state.new_vtxos).await
+ 			.context("couldn't register completed round outputs")?;
+@@ -1296,9 +1296,9 @@ async fn prepare_hark_swap(
+ 	sent_forfeit_sigs: bool,
+ ) -> anyhow::Result<(Vec<Vtxo<Full>>, Vec<Vec<u8>>)> {
+ 	let (mut srv, _) = wallet.require_server().await?;
+-	wallet.ensure_program_recoveries(&participation.inputs).await
++	wallet.extension_ensure_recovery(&participation.inputs).await
+ 		.context("old round position recovery is not ready")?;
+-	wallet.prepare_program_recoveries(output_vtxos).await
++	wallet.extension_prepare_recovery(output_vtxos).await
+ 		.context("replacement round recovery preparation failed")?;
+ 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
+ 		.context("couldn't send our input vtxo transactions to server")?;
+@@ -1899,7 +1899,7 @@ async fn persist_round_success(
+ 	debug!("Persisting newly finished round. {} new vtxos, movement ID {:?}",
+ 		new_vtxos.len(), movement_id,
+ 	);
+-	wallet.ensure_program_recoveries(new_vtxos).await
++	wallet.extension_ensure_recovery(new_vtxos).await
+ 		.context("completed round recovery is not ready")?;
+ 
+ 	// we first try all actions that need to happen and only afterwards return errors
+diff --git a/sdk/src/sapio/mod.rs b/sdk/src/sapio/mod.rs
+index 4ec1aaaca..30862a0f0 100644
+--- a/sdk/src/sapio/mod.rs
++++ b/sdk/src/sapio/mod.rs
+@@ -19,9 +19,60 @@ use bitcoin::secp256k1::{Keypair, PublicKey};
+ use ark::sapio::program::{Program, ProgramKey};
+ use ark::vtxo::VtxoRef;
+ 
++use crate::extension::WalletExtension;
+ use crate::persist::models::{ProgramRecoveryTemplate, SerdeProgramKey};
+ use crate::Wallet;
+ 
++use ark::{Address, Vtxo};
++use ark::vtxo::Full;
++
++/// Core program lifecycle implementation. A companion crate will replace
++/// this object once the remaining recovery/receive code moves out.
++pub(crate) struct SapioExtension;
++
++#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
++#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
++impl WalletExtension for SapioExtension {
++	async fn ensure_recovery(&self, wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> Result<()> {
++		wallet.ensure_program_recoveries(vtxos).await
++	}
++
++	async fn prepare_recovery(&self, wallet: &Wallet, vtxos: &[Vtxo<Full>]) -> Result<()> {
++		wallet.prepare_program_recoveries(vtxos).await
++	}
++
++	async fn prepare_receive(
++		&self,
++		wallet: &Wallet,
++		address: &Address,
++		vtxos: &[Vtxo<Full>],
++	) -> Result<()> {
++		wallet.prepare_program_receives(address, vtxos).await
++	}
++
++	async fn quarantine_receive(
++		&self,
++		wallet: &Wallet,
++		vtxo: &Vtxo<Full>,
++		raw: &[u8],
++		reason: &str,
++	) -> Result<()> {
++		wallet.quarantine_program_receive(vtxo, raw, reason).await
++	}
++
++	async fn is_program_key(&self, wallet: &Wallet, public: &PublicKey) -> Result<bool> {
++		Ok(wallet.inner.db.get_program_key(public).await?.is_some())
++	}
++
++	async fn program_key(
++		&self,
++		wallet: &Wallet,
++		public: &PublicKey,
++	) -> Result<Option<SerdeProgramKey>> {
++		wallet.inner.db.get_program_key(public).await
++	}
++}
++
+ /// Complete policy and recovery construction for newly issued program keys.
+ /// Obtain `root` from independently verified attestation of the expected image.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+diff --git a/sdk/src/vtxo/mod.rs b/sdk/src/vtxo/mod.rs
+index f3ab0a913..5ab32a332 100644
+--- a/sdk/src/vtxo/mod.rs
++++ b/sdk/src/vtxo/mod.rs
+@@ -348,7 +348,7 @@ impl Wallet {
+ 		let vtxos = vtxos.into_iter().map(|v| (v, state)).collect::<Vec<_>>();
+ 		if state.kind() == VtxoStateKind::Spendable {
+ 			for (vtxo, _) in &vtxos {
+-				self.ensure_program_recoveries(std::slice::from_ref(*vtxo)).await?;
++				self.extension_ensure_recovery(std::slice::from_ref(*vtxo)).await?;
+ 			}
+ 		}
+ 		if let Err(e) = self.inner.db.store_vtxos(&vtxos).await {

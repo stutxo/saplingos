@@ -439,7 +439,7 @@ impl Wallet {
 				// A row from an earlier, failed recovery attempt is forced along.
 				self.store_vtxos([vtxo], &VtxoState::Exited).await?;
 				self.mark_vtxos_as_exited(&[vtxo.id()]).await?;
-				if self.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_none() {
+				if !self.extension_is_program_key(&vtxo.user_pubkey()).await? {
 					self.exit_mgr()
 						.start_exit_for_vtxos_including_non_standard(&[vtxo.to_bare()]).await?;
 				}
@@ -693,9 +693,9 @@ impl Wallet {
 	) -> anyhow::Result<()> {
 		let id = vtxo.id();
 
-		if let Err(e) = self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await {
+		if let Err(e) = self.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await {
 			warn!("Recovery vtxo {id} has no usable saved program recovery: {e:#}");
-			self.quarantine_program_receive(
+			self.extension_quarantine_receive(
 				&vtxo, &vtxo.serialize(), "program deposit has no verified complete recovery",
 			).await?;
 			report.push_failed(id, Some(vtxo.amount()));
@@ -1038,6 +1038,7 @@ mod test {
 				onchain: None,
 				program_transport: tokio::sync::OnceCell::new(),
 				external_vtxo_signers: parking_lot::RwLock::new(std::collections::HashMap::new()),
+				extension: None,
 				daemon: parking_lot::Mutex::new(None),
 				last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 				round_secret_nonces: RoundSecretNonces::new(),

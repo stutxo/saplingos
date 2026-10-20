@@ -275,7 +275,7 @@ impl Wallet {
 		let inputs = self.inner.db.get_full_vtxos(&input_ids).await
 			.context("failed to hydrate arkoor input vtxos")?;
 
-		self.ensure_program_recoveries(&inputs).await?;
+		self.extension_ensure_recovery(&inputs).await?;
 		// Pre-register the input chains so the post-cosign register call
 		// for the outputs finds a signed chain anchor:
 		// register_vtxo_transactions validates a vtxo against its anchor's
@@ -310,12 +310,12 @@ impl Wallet {
 		let builder = ArkoorPackageBuilder::new_with_checkpoints(inputs, outputs)
 			.context("Failed to construct arkoor package")?;
 		let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
-		self.prepare_program_recoveries(&candidates).await.map_err(ArkoorCreateError::ProgramGuard)?;
+		self.extension_prepare_recovery(&candidates).await.map_err(ArkoorCreateError::ProgramGuard)?;
 		if let Some(address) = recipient {
 			let destination_candidates = candidates.iter()
 				.filter(|v| *v.policy() == arkoor_dest.policy)
 				.cloned().collect::<Vec<_>>();
-			self.prepare_program_receives(address, &destination_candidates).await
+			self.extension_prepare_receive(address, &destination_candidates).await
 				.map_err(ArkoorCreateError::ProgramGuard)?;
 		}
 		let (prepared, attestations) = self.prepare_arkoor_signatures(&builder).await

@@ -429,7 +429,7 @@ pub(crate) async fn request_lightning_send_htlcs(
 	let full_inputs = wallet.inner.db.get_full_vtxos(&send.input_vtxo_ids).await
 		.context("failed to hydrate lightning-send input vtxos")?;
 
-	wallet.ensure_program_recoveries(&full_inputs).await?;
+	wallet.extension_ensure_recovery(&full_inputs).await?;
 	// Ensure inputs are fully registered server-side before the cosign.
 	wallet.register_vtxo_transactions_with_server(&full_inputs).await
 		.context("failed to register lightning-send input vtxo transactions with server")?;
@@ -459,7 +459,7 @@ pub(crate) async fn request_lightning_send_htlcs(
 	)
 		.context("Failed to construct arkoor package")?;
 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
-	wallet.prepare_program_recoveries(&candidates).await?;
+	wallet.extension_prepare_recovery(&candidates).await?;
 	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
 		part.iter().map(|signature| signature.public_nonce()).collect()
@@ -553,7 +553,7 @@ async fn record_lightning_send_outputs(
 	if htlcs.vtxos.is_empty() {
 		return Ok(());
 	}
-	wallet.ensure_program_recoveries(&htlcs.vtxos).await?;
+	wallet.extension_ensure_recovery(&htlcs.vtxos).await?;
 	wallet.mark_vtxos_as_spent(&send.input_vtxo_ids).await?;
 	wallet.store_locked_vtxos(
 		htlcs.vtxos.iter().filter(is_send_htlc as for<'a, 'b> fn(&'a &'b Vtxo<Full>) -> bool),
@@ -588,7 +588,7 @@ pub(crate) async fn initiate_lightning_send_payment(
 	// Legacy checkpoints have only the HTLC IDs.
 	if htlcs.vtxos.is_empty() {
 		let outputs = wallet.inner.db.get_full_vtxos(&htlcs.vtxo_ids).await?;
-		wallet.ensure_program_recoveries(&outputs).await?;
+		wallet.extension_ensure_recovery(&outputs).await?;
 		wallet.register_vtxo_transactions_with_server(&outputs).await?;
 	} else {
 		wallet.register_vtxo_transactions_with_server(&htlcs.vtxos).await?;
@@ -750,7 +750,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
 			.with_context(|| format!("htlc vtxo with id {} not found", id))?;
 		htlc_vtxos.push(vtxo);
 	}
-	wallet.ensure_program_recoveries(&htlc_vtxos).await?;
+	wallet.extension_ensure_recovery(&htlc_vtxos).await?;
 
 	let revocation_claim_policy = VtxoPolicy::new_pubkey(revocation.key);
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
@@ -759,7 +759,7 @@ pub(crate) async fn revoke_lightning_send_htlcs(
 	)
 		.context("Failed to construct arkoor package")?;
 	let candidates = builder.build_unsigned_vtxos().collect::<Vec<_>>();
-	wallet.prepare_program_recoveries(&candidates).await?;
+	wallet.extension_prepare_recovery(&candidates).await?;
 	let (prepared, attestations) = wallet.prepare_arkoor_signatures(&builder).await?;
 	let builder = builder.with_external_nonces(prepared.iter().map(|part| {
 		part.iter().map(|signature| signature.public_nonce()).collect()
@@ -808,7 +808,7 @@ async fn finish_lightning_send_revocation(
 			return Ok(());
 		}
 	}
-	wallet.ensure_program_recoveries(vtxos).await?;
+	wallet.extension_ensure_recovery(vtxos).await?;
 	wallet.register_vtxo_transactions_with_server(vtxos).await?;
 
 	// The revoked VTXOs were issued by the server: never `sum`, which panics

@@ -348,7 +348,7 @@ impl Wallet {
 		let vtxos = vtxos.into_iter().map(|v| (v, state)).collect::<Vec<_>>();
 		if state.kind() == VtxoStateKind::Spendable {
 			for (vtxo, _) in &vtxos {
-				self.ensure_program_recoveries(std::slice::from_ref(*vtxo)).await?;
+				self.extension_ensure_recovery(std::slice::from_ref(*vtxo)).await?;
 			}
 		}
 		if let Err(e) = self.inner.db.store_vtxos(&vtxos).await {

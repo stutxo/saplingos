@@ -108,7 +108,7 @@ impl Board {
 		ensure!(vtxo.id() == self.vtxo_id, "board checkpoint VTXO id mismatch");
 		ensure!(vtxo.chain_anchor().txid == self.funding_txid()?,
 			"funding transaction does not match the completed board");
-		wallet.ensure_program_recoveries(std::slice::from_ref(vtxo)).await
+		wallet.extension_ensure_recovery(std::slice::from_ref(vtxo)).await
 	}
 
 	/// Finish funding and its initial network handoff under the original
@@ -462,7 +462,7 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	// I know this if is collapsible, but it reads better like this...
 	let exit_margin = wallet.config().vtxo_exit_margin;
 	if vtxo.expiry_height() <= current_height + exit_margin {
-		if wallet.inner.db.get_program_key(&vtxo.user_pubkey()).await?.is_some() {
+		if wallet.extension_is_program_key(&vtxo.user_pubkey()).await? {
 			// The normal driver already holds this board's action guard. Recovery
 			// tombstones it before chain I/O; no later registration may race the
 			// saved recovery, even if this first ancestor cannot be broadcast.
@@ -509,7 +509,7 @@ async fn run_register(wallet: &Wallet, board: &Board) -> anyhow::Result<()> {
 	// serialized bytes to the server.
 	let vtxo = wallet.get_full_vtxo(board.vtxo_id).await
 		.with_context(|| format!("board vtxo doesn't exist: {}", board.vtxo_id))?;
-	wallet.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await?;
+	wallet.extension_ensure_recovery(std::slice::from_ref(&vtxo)).await?;
 
 	srv.client.register_board_vtxo(protos::BoardVtxoRequest {
 		board_vtxo: vtxo.serialize(),

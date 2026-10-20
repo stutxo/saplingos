@@ -154,7 +154,7 @@ impl Wallet {
 		keypair: &VtxoSigningKey,
 		args: &ImportVtxoArgs,
 	) -> Result<VtxoState, ImportVtxoError> {
-		self.ensure_program_recoveries(std::slice::from_ref(vtxo)).await?;
+		self.extension_ensure_recovery(std::slice::from_ref(vtxo)).await?;
 		if args.skip_status_check {
 			return Ok(VtxoState::Spendable);
 		}
