@@ -467,4 +467,149 @@ mod test {
 			server, exit_delta, min_expiry.saturating_sub(BlockDelta::new(1)), server, exit_delta, min_expiry,
 		).is_err(), "expiry one block below the minimum must be rejected");
 	}
+
+	use ark::ProtocolEncoding;
+	use ark::tree::signed::{HashlockVersion, VtxoLeafSpec, VtxoTreeSpec};
+	use bitcoin::Amount;
+	use bitcoin::hashes::{sha256, Hash};
+	use bitcoin::secp256k1::PublicKey;
+
+	fn hostile_leaf(
+		pk: PublicKey,
+		amount: Amount,
+		cosign_pubkey: Option<PublicKey>,
+	) -> VtxoLeafSpec {
+		VtxoLeafSpec {
+			vtxo: ark::VtxoRequest {
+				amount,
+				policy: ark::VtxoPolicy::new_pubkey(pk),
+			},
+			cosign_pubkey,
+			unlock_hash: sha256::Hash::hash(&amount.to_sat().to_le_bytes()),
+		}
+	}
+
+	fn hostile_spec(
+		server: PublicKey,
+		vtxos: Vec<VtxoLeafSpec>,
+		globals: Vec<PublicKey>,
+	) -> VtxoTreeSpec {
+		VtxoTreeSpec {
+			vtxos,
+			expiry_height: BlockHeight::new(100_000),
+			server_pubkey: server,
+			exit_delta: BlockDelta::new(2016),
+			global_cosign_pubkeys: globals,
+			hashlock_version: HashlockVersion::V1,
+		}
+	}
+
+	/// A server-supplied [VtxoTreeSpec] is decoded straight from the wire in
+	/// the round flow; tree shapes that can never be cosigned must be
+	/// rejected with decoding errors instead of panicking the wallet while
+	/// building the tree.
+	#[test]
+	fn vtxo_tree_spec_rejects_missing_cosign_pubkeys() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let server = Keypair::new(&secp, &mut rng).public_key();
+		let cosigner = Keypair::new(&secp, &mut rng).public_key();
+
+		// no cosign pubkeys at all: such a tree can never be signed or spent
+		let spec = hostile_spec(server,
+			vec![hostile_leaf(server, Amount::from_sat(100_000), None),
+				hostile_leaf(server, Amount::from_sat(50_000), None)],
+			vec![],
+		).serialize();
+		let err = VtxoTreeSpec::deserialize(&spec)
+			.expect_err("tree without any cosign pubkey must be rejected");
+		assert!(err.to_string().contains("at least one cosign pubkey"),
+			"unexpected error: {err}");
+
+		// without global cosigners, an internal node whose leaves all lack
+		// a cosign pubkey can never be signed either
+		let mut vtxos = vec![hostile_leaf(server, Amount::from_sat(5_000), Some(cosigner))];
+		vtxos.extend((0..7).map(|i| hostile_leaf(server, Amount::from_sat(5_000 + i), None)));
+		let spec = hostile_spec(server, vtxos.clone(), vec![]).serialize();
+		let err = VtxoTreeSpec::deserialize(&spec)
+			.expect_err("tree with an internal node without cosign pubkeys must be rejected");
+		assert!(err.to_string().contains("internal node without cosign pubkeys"),
+			"unexpected error: {err}");
+
+		// control: a global cosigner rescues the same leaves
+		let spec = hostile_spec(server, vtxos, vec![cosigner]);
+		assert_eq!(VtxoTreeSpec::deserialize(&spec.serialize()).unwrap(), spec);
+	}
+
+	/// Attackers control the leaf amounts of the trees we sign; amounts must
+	/// be bounded so tree building cannot overflow its value sums.
+	#[test]
+	fn vtxo_tree_spec_rejects_invalid_leaf_amounts() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let server = Keypair::new(&secp, &mut rng).public_key();
+		let cosigner = Keypair::new(&secp, &mut rng).public_key();
+
+		// zero and above-money-supply leaf amounts
+		for amount in [Amount::ZERO, Amount::MAX_MONEY + Amount::from_sat(1), Amount::from_sat(u64::MAX)] {
+			let spec = hostile_spec(server, vec![hostile_leaf(server, amount, None)], vec![cosigner]).serialize();
+			let err = VtxoTreeSpec::deserialize(&spec)
+				.expect_err("tree with out-of-range leaf amount must be rejected");
+			assert!(err.to_string().contains("leaf amount out of range"),
+				"unexpected error: {err}");
+		}
+
+		// a total exceeding the money supply used to overflow the panicking
+		// leaf-amount sum while building the unsigned tree
+		let spec = hostile_spec(server, vec![
+			hostile_leaf(server, Amount::MAX_MONEY, Some(cosigner)),
+			hostile_leaf(server, Amount::MAX_MONEY, None),
+		], vec![cosigner]).serialize();
+		let err = VtxoTreeSpec::deserialize(&spec)
+			.expect_err("tree with excessive total value must be rejected");
+		assert!(err.to_string().contains("total value exceeds maximum money"),
+			"unexpected error: {err}");
+
+		// control: the decoded valid spec builds an unsigned tree fine
+		let good = hostile_spec(server, vec![
+			hostile_leaf(server, Amount::from_int_btc(10_500_000), Some(cosigner)),
+			hostile_leaf(server, Amount::from_int_btc(10_500_000), None),
+		], vec![cosigner]);
+		let decoded = VtxoTreeSpec::deserialize(&good.serialize()).unwrap();
+		assert_eq!(decoded, good);
+		decoded.into_unsigned_tree(bitcoin::OutPoint::null());
+	}
+
+	/// The aggregate cosign nonces arrive from the server; their count must
+	/// be bound to the tree before they are indexed by internal node.
+	#[test]
+	fn cosign_branch_rejects_truncated_agg_nonces() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let server_key = Keypair::new(&secp, &mut rng);
+		let cosign_key = Keypair::new(&secp, &mut rng);
+
+		let spec = hostile_spec(server_key.public_key(),
+			vec![hostile_leaf(server_key.public_key(), Amount::from_sat(100_000), Some(cosign_key.public_key())),
+				hostile_leaf(server_key.public_key(), Amount::from_sat(50_000), Some(cosign_key.public_key()))],
+			vec![server_key.public_key()],
+		);
+		assert_eq!(spec.nb_internal_nodes(), 1);
+		let unsigned = spec.into_unsigned_tree(bitcoin::OutPoint::null());
+
+		// an empty aggregate nonce list is an ordinary error, not a panic
+		let err = unsigned.cosign_branch(&[], 0, &cosign_key, vec![])
+			.expect_err("truncated aggregate nonce list must be rejected");
+		assert!(matches!(
+			err, ark::error::CosignBranchError::InvalidNonceCount { expected: 1, provided: 0 },
+		), "unexpected error: {err}");
+
+		// control: the right number of nonces signs fine
+		let (sec_nonce, pub_nonce) = ark::musig::nonce_pair(&cosign_key);
+		let (_gsec, gpub_nonce) = ark::musig::nonce_pair(&server_key);
+		let agg_nonce = ark::musig::nonce_agg(&[&pub_nonce, &gpub_nonce]);
+		let sigs = unsigned.cosign_branch(&[agg_nonce], 0, &cosign_key, vec![sec_nonce])
+			.expect("cosigning with the correct nonce count");
+		assert_eq!(sigs.len(), 1);
+	}
 }

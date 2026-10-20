@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::{Context, ensure};
 use bitcoin::Amount;
 use bitcoin_ext::BlockHeight;
 use log::{debug, warn};
@@ -23,7 +24,9 @@ use crate::vtxo::{VtxoState, VtxoStateKind};
 /// The different balances of a Sapling wallet.
 ///
 /// Each field counts different VTXOs, so the fields never overlap. See
-/// [Wallet::balance] for how the fields are computed.
+/// [Wallet::balance] for how the fields are computed; it bounds every field
+/// to the money supply, so the plain additions in [Balance::total] and
+/// [Balance::pending] cannot overflow for a balance it produced.
 ///
 /// Show [Balance::spendable] as what a user can pay with and [Balance::total]
 /// as what a user owns, or use [Balance::summary] for exactly those numbers.
@@ -160,7 +163,16 @@ impl Wallet {
 			pending_lightning_send: Amount::ZERO,
 			claimable_lightning_receive: Amount::ZERO,
 			pending_exit: Amount::ZERO,
-			pending_program_recovery: self.pending_program_recovery_balance().await?,
+			pending_program_recovery: {
+				// Already erroring on `u64` overflow; bound it to the money
+				// supply too, so the Balance field invariant holds (see
+				// [add_balance_amount]).
+				let amount = self.pending_program_recovery_balance().await?;
+				ensure!(amount <= Amount::MAX_MONEY,
+					"pending program recovery balance {} exceeds the money supply: \
+					forged or corrupt recovery records", amount);
+				amount
+			},
 			pending_board: Amount::ZERO,
 			pending_arkoor_send: Amount::ZERO,
 			pending_offboard: Amount::ZERO,
@@ -169,11 +181,13 @@ impl Wallet {
 		for vtxo in vtxos.values().filter(|v| v.state == VtxoState::Spendable) {
 			// Without a tip only the depth can be judged; a tip of zero
 			// expires nothing.
-			if vtxo.needs_refresh(tip.unwrap_or(BlockHeight::ZERO), max_exit_depth) {
-				balance.needs_refresh += vtxo.amount();
+			let needs_refresh = vtxo.needs_refresh(tip.unwrap_or(BlockHeight::ZERO), max_exit_depth);
+			let (field, name) = if needs_refresh {
+				(&mut balance.needs_refresh, "needs-refresh")
 			} else {
-				balance.spendable += vtxo.amount();
-			}
+				(&mut balance.spendable, "spendable")
+			};
+			add_balance_amount(field, vtxo.amount(), name, vtxo.id())?;
 		}
 
 		let mut counted = HashSet::with_capacity(vtxos.len());
@@ -186,7 +200,9 @@ impl Wallet {
 				let Some(vtxo) = vtxos.get(&input.id()) else { continue };
 				let held = matches!(&vtxo.state, VtxoState::Locked { holder: h } if *h == holder);
 				if held && counted.insert(vtxo.id()) {
-					balance.pending_in_round += vtxo.amount();
+					add_balance_amount(
+						&mut balance.pending_in_round, vtxo.amount(), "pending-in-round", vtxo.id(),
+					)?;
 				}
 			}
 		}
@@ -197,19 +213,24 @@ impl Wallet {
 			}
 			match &action {
 				WalletActionCheckpoint::LightningSend(a) => {
-					balance.pending_lightning_send += held_by(a, &vtxos, &mut counted);
+					add_balance_amount(&mut balance.pending_lightning_send,
+						held_by(a, &vtxos, &mut counted)?, "pending-lightning-send", action.id())?;
 				},
 				WalletActionCheckpoint::LightningReceive(a) => {
-					balance.claimable_lightning_receive += held_by(a, &vtxos, &mut counted);
+					add_balance_amount(&mut balance.claimable_lightning_receive,
+						held_by(a, &vtxos, &mut counted)?, "claimable-lightning-receive", action.id())?;
 				},
 				WalletActionCheckpoint::ArkoorSend(a) => {
-					balance.pending_arkoor_send += held_by(a, &vtxos, &mut counted);
+					add_balance_amount(&mut balance.pending_arkoor_send,
+						held_by(a, &vtxos, &mut counted)?, "pending-arkoor-send", action.id())?;
 				},
 				WalletActionCheckpoint::Board(a) => {
-					balance.pending_board += held_by(a, &vtxos, &mut counted);
+					add_balance_amount(&mut balance.pending_board,
+						held_by(a, &vtxos, &mut counted)?, "pending-board", action.id())?;
 				},
 				WalletActionCheckpoint::Offboard(a) => {
-					balance.pending_offboard += held_by(a, &vtxos, &mut counted);
+					add_balance_amount(&mut balance.pending_offboard,
+						held_by(a, &vtxos, &mut counted)?, "pending-offboard", action.id())?;
 				},
 			}
 		}
@@ -223,7 +244,9 @@ impl Wallet {
 				continue;
 			}
 			match vtxos.get(&exit.vtxo_id) {
-				Some(v) if v.state == VtxoState::Exited => balance.pending_exit += v.amount(),
+				Some(v) if v.state == VtxoState::Exited => add_balance_amount(
+					&mut balance.pending_exit, v.amount(), "pending-exit", v.id(),
+				)?,
 				Some(v) => warn!("Exit of VTXO {} has committed but the VTXO is {:?}",
 					exit.vtxo_id, v.state,
 				),
@@ -243,7 +266,7 @@ fn held_by<A: WalletAction>(
 	action: &A,
 	vtxos: &HashMap<VtxoId, WalletVtxo>,
 	counted: &mut HashSet<VtxoId>,
-) -> Amount {
+) -> anyhow::Result<Amount> {
 	let mut amount = Amount::ZERO;
 	for id in action.pending_balance_vtxo_ids() {
 		if !counted.insert(id) {
@@ -253,7 +276,9 @@ fn held_by<A: WalletAction>(
 		// A spent VTXO is not in the map: the action is done with it.
 		let Some(vtxo) = vtxos.get(&id) else { continue };
 		match vtxo.state {
-			VtxoState::Locked { .. } => amount += vtxo.amount(),
+			VtxoState::Locked { .. } => add_balance_amount(
+				&mut amount, vtxo.amount(), "held-by-action", id,
+			)?,
 			// An exit took it from the action; it counts in pending_exit.
 			VtxoState::Exited => {},
 			// Released by the action, or not locked by it yet.
@@ -261,5 +286,123 @@ fn held_by<A: WalletAction>(
 			VtxoState::Spent => {},
 		}
 	}
-	amount
+	Ok(amount)
+}
+
+/// Add `amount` to a balance field, erroring rather than panicking when the
+/// sum would overflow.
+///
+/// VTXO amounts come from the Ark server: round-tree leaves are bounded at
+/// decode, but nothing stops a malicious server or a forged mailbox package
+/// from recording VTXOs with amounts up to `u64::MAX`, and `Amount`'s `+=`
+/// panics on overflow (`checked_add(..).expect(..)`), in every build
+/// profile. Repeating such amounts would make [Wallet::balance] panic on
+/// every call and crash-loop the daemon, so accumulation here is checked and
+/// bounded by the money supply instead: a balance field past 21M BTC is
+/// necessarily corrupt, and erroring surfaces the corruption to the caller.
+/// Bounding every field also keeps the plain field additions in
+/// [Balance::total] and [Balance::pending] comfortably inside `u64`.
+fn add_balance_amount(
+	field: &mut Amount,
+	amount: Amount,
+	name: &'static str,
+	held_by: impl std::fmt::Display,
+) -> anyhow::Result<()> {
+	*field = field.checked_add(amount)
+		.filter(|sum| *sum <= Amount::MAX_MONEY)
+		.with_context(|| format!(
+			"{} balance of {} cannot absorb {} from {}: forged or corrupt wallet VTXOs",
+			name, field, amount, held_by,
+		))?;
+	Ok(())
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	use ark::test_util::dummy::DummyTestVtxoSpec;
+
+	use crate::actions::{Advance, AdvanceError};
+
+	/// A fake action that only reports the VTXOs it claims to hold.
+	struct HoldingAction {
+		ids: Vec<VtxoId>,
+	}
+
+	#[async_trait::async_trait]
+	impl WalletAction for HoldingAction {
+		fn id(&self) -> crate::actions::WalletActionId {
+			"holding-action".to_string()
+		}
+
+		fn pending_balance_vtxo_ids(&self) -> Vec<VtxoId> {
+			self.ids.clone()
+		}
+
+		async fn advance(self, _wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
+			unimplemented!()
+		}
+
+		async fn on_rejection(self, _wallet: &Wallet, _error: AdvanceError)
+			-> anyhow::Result<Advance<Self>>
+		{
+			unimplemented!()
+		}
+	}
+
+	/// The dummy spec funds `amount + fee`, so the resulting VTXO's amount is
+	/// just under `amount`; only identities matter here and `expiry_height`
+	/// makes them distinct.
+	fn locked_wallet_vtxo(amount: Amount, expiry_height: BlockHeight) -> WalletVtxo {
+		let (_funding, vtxo) = DummyTestVtxoSpec {
+			amount, expiry_height, ..Default::default()
+		}.build();
+		WalletVtxo {
+			exit_depth: vtxo.exit_depth(),
+			exit_tx_weight: vtxo.transactions().map(|t| t.tx.weight()).sum(),
+			state: VtxoState::Locked { holder: None },
+			vtxo: vtxo.to_bare(),
+			registered: true,
+		}
+	}
+
+	/// Summing maximum-value VTXOs into a balance field must error when the
+	/// money supply is exceeded, never panic: forged amounts of any size are
+	/// safe to accumulate.
+	#[test]
+	fn balance_field_addition_never_panics() {
+		let mut field = Amount::ZERO;
+		add_balance_amount(&mut field, Amount::MAX_MONEY, "test", "a").unwrap();
+		assert_eq!(field, Amount::MAX_MONEY);
+		// One sat beyond the money supply errors.
+		add_balance_amount(&mut field, Amount::ONE_SAT, "test", "b").unwrap_err();
+		// A nakedly overflowing addend errors too.
+		add_balance_amount(&mut field, Amount::MAX, "test", "c").unwrap_err();
+		assert_eq!(field, Amount::MAX_MONEY, "a rejected addend must not move the field");
+	}
+
+	/// An action holding repeated maximum-value locked VTXOs (a forged flood)
+	/// must make the balance computation error, not panic.
+	#[test]
+	fn held_by_of_max_money_vtxos_errors_without_panic() {
+		let vtxo_a = locked_wallet_vtxo(Amount::MAX_MONEY, BlockHeight::new(10_000));
+		let vtxo_b = locked_wallet_vtxo(Amount::MAX_MONEY, BlockHeight::new(10_001));
+		assert_ne!(vtxo_a.id(), vtxo_b.id());
+		let vtxos: HashMap<VtxoId, WalletVtxo> =
+			[(vtxo_a.id(), vtxo_a), (vtxo_b.id(), vtxo_b)].into_iter().collect();
+
+		// Let the supposedly-fake action claim both maximum-value vtxos.
+		// One fits the money supply, the second must surface an error.
+		let action = HoldingAction { ids: vtxos.keys().copied().collect() };
+		held_by(&action, &vtxos, &mut HashSet::new()).unwrap_err();
+
+		// A single maximum-value vtxo is counted fine.
+		let (id, vtxo) = vtxos.iter().next().unwrap();
+		let action = HoldingAction { ids: vec![*id] };
+		assert_eq!(
+			held_by(&action, &vtxos, &mut HashSet::new()).unwrap(),
+			vtxo.amount(),
+		);
+	}
 }

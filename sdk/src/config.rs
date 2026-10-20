@@ -182,11 +182,23 @@ pub struct Config {
 	/// and to prevent DNS leaks. We don't allow `socks5://` to be used to preserve privacy.
 	///
 	/// Example: `socks5h://127.0.0.1:9050` for a local Tor daemon.
+	///
+	/// Note: the bitcoind backend cannot route its RPC traffic through a SOCKS5
+	/// proxy (the upstream RPC clients have no proxy support). If a proxy is
+	/// configured together with a non-local bitcoind chain source, wallet
+	/// construction fails loudly instead of silently bypassing the proxy.
+	/// The Esplora backend honours this setting.
 	#[cfg(feature = "socks5-proxy")]
 	pub socks5_proxy: Option<String>,
 
 	/// A fallback fee rate to use in sat/kWu when we fail to retrieve a fee rate from the
 	/// configured bitcoind/esplora connection.
+	///
+	/// Values above the built-in sanity ceiling (1,000,000 sat/kWu = 4,000 sat/vB) are
+	/// clamped to it with a warning: once seeded or cached, these rates feed the same
+	/// fee-rate×weight arithmetic as untrusted backend estimates, and exit/recovery
+	/// signing sinks bail loudly on rates beyond the ceiling instead of panicking or
+	/// silently wrapping the computed fee.
 	///
 	/// Example for 1 sat/vB: --fallback-fee-rate 250
 	pub fallback_fee_rate: Option<FeeRate>,

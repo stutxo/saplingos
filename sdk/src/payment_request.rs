@@ -421,7 +421,18 @@ impl Wallet {
 			errors.push(PaymentMethodParsingError::NetworkMismatch);
 		}
 
-		let offer_amount = offer.amount().map(|a| a.to_bitcoin_amount().unwrap());
+		// BOLT12 offers may be denominated in a non-BTC currency. Those have
+		// no sat value, so flag the option instead of unwrapping.
+		let offer_amount = match offer.amount() {
+			Some(a) => match a.to_bitcoin_amount() {
+				Some(btc) => Some(btc),
+				None => {
+					errors.push(PaymentMethodParsingError::InvalidAmount);
+					None
+				},
+			},
+			None => None,
+		};
 		match (offer_amount, uri_amount) {
 			(Some(offer_amount), Some(amount)) => {
 				if offer_amount != amount {
@@ -434,6 +445,22 @@ impl Wallet {
 		AvailablePaymentMethod {
 			method: PaymentMethod::Offer(offer.clone()),
 			errors,
+		}
+	}
+
+	/// Build the [`PaymentRequest`] for a bare BOLT12 offer string.
+	///
+	/// Currency-denominated offers have no sat value: the request amount is
+	/// `None` and the option carries the [`PaymentMethodParsingError`] from
+	/// [`Wallet::details_for_offer`].
+	fn request_for_offer(offer: &Offer, network: Network) -> PaymentRequest {
+		let details = Self::details_for_offer(offer, network, None);
+
+		PaymentRequest {
+			label: None,
+			amount: offer.amount().and_then(|a| a.to_bitcoin_amount()),
+			message: offer.description().map(|d| d.to_string()),
+			options: vec![details],
 		}
 	}
 
@@ -611,14 +638,7 @@ impl Wallet {
 
 		// Bare BOLT12 offer
 		if let Ok(offer) = Offer::from_str(payment_str) {
-			let details = Self::details_for_offer(&offer, network, None);
-
-			return Ok(PaymentRequest {
-				label: None,
-				amount: offer.amount().map(|a| a.to_bitcoin_amount().unwrap()),
-				message: offer.description().map(|d| d.to_string()),
-				options: vec![details],
-			});
+			return Ok(Self::request_for_offer(&offer, network));
 		}
 
 		// Lightning address
@@ -893,6 +913,50 @@ mod test {
 
 		assert!(request(vec![ark_option(err.clone()), onchain_option(err)]).default_option().is_none());
 		assert!(request(vec![]).default_option().is_none());
+	}
+
+	/// Currency-denominated BOLT12 offers are legal wire content (lightning
+	/// 0.2.2 accepts them when parsing, even though its builder refuses to
+	/// create them). A wallet presented with one must not panic on
+	/// `to_bitcoin_amount().unwrap()`: regression test for the panics at the
+	/// former `offer.amount().map(|a| a.to_bitcoin_amount().unwrap())` sites.
+	#[test]
+	fn currency_offer_request_flags_invalid_amount_without_panicking() {
+		// USD-denominated offers crafted from raw TLVs (offer_currency "USD",
+		// offer_amount 10000, description, issuer_id); both panicked before.
+		let currency_offers = [
+			"lno1qcp4256ypqpzwyq2ramryvpqwejhy6txd9jhygrjv4c8ymmyw43hg6t0dcsx7enxv4epvggz0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq",
+			"lno1qcp4256ypqpzwyq2yfshgarpvd4k2u3dvdhkuarjdakxcetyyp3h2unjv4hxx7fqdanxvetjzcssy7d7vel0nh9m4326qc54e6rskpczn07dktww9rv4nu5ptvt0s9uc",
+		];
+
+		for offer_str in currency_offers {
+			let offer = Offer::from_str(offer_str).unwrap();
+			let req = Wallet::request_for_offer(&offer, Network::Bitcoin);
+
+			// No bitcoin amount can be reported for a fiat-denominated offer,
+			// and the option is flagged instead of aborting the parse.
+			assert!(req.amount.is_none(), "unexpected amount for {}", offer_str);
+			assert_eq!(req.options.len(), 1);
+			assert_eq!(req.options[0].errors, vec![PaymentMethodParsingError::InvalidAmount]);
+			assert!(req.default_option().is_none());
+		}
+	}
+
+	/// Control: a bitcoin-denominated offer is unaffected by the
+	/// currency-offer handling and reports its amount.
+	#[test]
+	fn bitcoin_offer_request_reports_amount_without_errors() {
+		// Same TLVs as the crafted currency payload above, minus the
+		// offer_currency field: a bitcoin-denominated offer with a
+		// 10_000 msat (10 sat) amount, verified against lightning 0.2.2.
+		let offer_str = "lno1pqpzwyq2ramryvpqwejhy6txd9jhygrjv4c8ymmyw43hg6t0dcsx7enxv4epvggz0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq";
+		let offer = Offer::from_str(offer_str).unwrap();
+		let req = Wallet::request_for_offer(&offer, Network::Bitcoin);
+
+		assert_eq!(req.amount, Some(Amount::from_sat(10)));
+		assert_eq!(req.options.len(), 1);
+		assert!(req.options[0].errors.is_empty());
+		assert!(req.default_option().is_some());
 	}
 
 	/// The upper-cased URI must parse back to an equal URI, which only holds

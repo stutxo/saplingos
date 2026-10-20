@@ -59,6 +59,54 @@ const VTXO_EXPIRY_HEIGHT_BUFFER: BlockDelta = BlockDelta::new(6);
 /// between a recovered wallet and a server claiming excessive fees.
 const MAX_RECOVERED_PARTICIPATION_FEE_PERCENT: u64 = 5;
 
+/// The fee a recovered delegated participation claims to pay, if its totals
+/// are sane enough to build a recovery on: both sides bounded by the money
+/// supply (larger totals are necessarily forged, and the bound keeps the
+/// percentage scaling below safely in-range), outputs never exceeding
+/// inputs, and fees within [MAX_RECOVERED_PARTICIPATION_FEE_PERCENT].
+///
+/// A recovered participation's totals are rebuilt from server data, so this
+/// is called before the participation is stored.
+fn sane_recovered_participation_fee(
+	total_in: Amount,
+	total_out: Amount,
+) -> anyhow::Result<Amount> {
+	anyhow::ensure!(total_in <= Amount::MAX_MONEY && total_out <= Amount::MAX_MONEY,
+		"value exceeds the money supply: {} in, {} out", total_in, total_out);
+	let fee = total_in.checked_sub(total_out).with_context(||
+		format!("outputs {} exceed inputs {}", total_out, total_in)
+	)?;
+	let in_scaled = total_in.checked_mul(MAX_RECOVERED_PARTICIPATION_FEE_PERCENT)
+		.context("input fee-margin scaling overflow")?;
+	let fee_scaled = fee.checked_mul(100)
+		.context("fee scaling overflow")?;
+	anyhow::ensure!(fee_scaled <= in_scaled,
+		"it pays {} in fees, more than {}% of its {} input value",
+		fee, MAX_RECOVERED_PARTICIPATION_FEE_PERCENT, total_in,
+	);
+	Ok(fee)
+}
+
+/// Sum the still-pending output balances of rounds, erroring rather than
+/// panicking when they overflow.
+///
+/// Round outputs are normally wallet-authored, but recovered delegated
+/// participations are rebuilt from server data, so a malicious server can
+/// have stored forged over-valued outputs: enough of them would panic a
+/// plain `+=`. No real wallet has more pending than the money supply, so
+/// exceeding [Amount::MAX_MONEY] is an error, never a wrap.
+fn sum_pending_round_balances<'a>(
+	states: impl IntoIterator<Item = &'a RoundState>,
+) -> anyhow::Result<Amount> {
+	states.into_iter().try_fold(Amount::ZERO, |sum, state| {
+		let pending = state.pending_balance()
+			.context("pending outputs of a round overflow: forged recovered participation")?;
+		sum.checked_add(pending)
+			.filter(|sum| *sum <= Amount::MAX_MONEY)
+			.context("pending round balance exceeds the money supply: forged recovered participations")
+	})
+}
+
 
 /// Struct to communicate your specific participation for an Ark round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -907,9 +955,12 @@ impl RoundState {
 	/// The balance pending in this round
 	///
 	/// This becomes zero once the new round VTXOs are unlocked.
-	pub fn pending_balance(&self) -> Amount {
+	///
+	/// `None` on overflow: a recovered participation's outputs are rebuilt
+	/// from server data, whose amounts are untrusted.
+	pub fn pending_balance(&self) -> Option<Amount> {
 		if self.done {
-			return Amount::ZERO;
+			return Some(Amount::ZERO);
 		}
 
 		match self.flow {
@@ -919,10 +970,10 @@ impl RoundState {
 				| RoundFlowState::InteractiveOngoing { .. }
 				| RoundFlowState::Finished { .. }
 			=> {
-				self.participation.outputs.iter().map(|o| o.amount).sum()
+				self.participation.total_out()
 			},
 			RoundFlowState::Failed { .. } | RoundFlowState::Canceled => {
-				Amount::ZERO
+				Some(Amount::ZERO)
 			},
 		}
 	}
@@ -2346,19 +2397,8 @@ impl Wallet {
 			error!("Not recovering round participation {}: value overflow", unlock_hash);
 			return Ok(());
 		};
-		let fee = total_in.checked_sub(total_out).unwrap_or(Amount::ZERO);
-		let (Some(in_scaled), Some(fee_scaled)) = (
-			total_in.checked_mul(MAX_RECOVERED_PARTICIPATION_FEE_PERCENT),
-			fee.checked_mul(100),
-		) else {
-			error!("Not recovering round participation {}: value overflow", unlock_hash);
-			return Ok(());
-		};
-		if fee_scaled > in_scaled {
-			error!("Not recovering round participation {}: it pays {} in fees, \
-				more than {}% of its {} input value",
-				unlock_hash, fee, MAX_RECOVERED_PARTICIPATION_FEE_PERCENT, total_in,
-			);
+		if let Err(e) = sane_recovered_participation_fee(total_in, total_out) {
+			error!("Not recovering round participation {}: {:#}", unlock_hash, e);
 			return Ok(());
 		}
 		let state = RoundState::new_delegated(participation, unlock_hash, None, None);
@@ -2435,14 +2475,14 @@ impl Wallet {
 	/// the server has issued the round. Use [Wallet::balance] for the amount
 	/// locked.
 	pub async fn pending_round_balance(&self) -> anyhow::Result<Amount> {
-		let mut ret = Amount::ZERO;
+		let mut states = Vec::new();
 		for round in self.pending_round_states().await? {
 			if self.inner.db.has_program_recovery_reservation(
 				&crate::persist::models::recovery_round_key(round.id()),
 			).await? { continue; }
-			ret += round.state().pending_balance();
+			states.push(round);
 		}
-		Ok(ret)
+		sum_pending_round_balances(states.iter().map(|s| s.state()))
 	}
 
 	/// Returns all VTXOs that are locked in a pending round
@@ -2814,6 +2854,74 @@ mod test {
 
 	fn round_request(amount: u64, policy: &VtxoPolicy) -> VtxoRequest {
 		VtxoRequest { amount: Amount::from_sat(amount), policy: policy.clone() }
+	}
+
+	/// A recovered participation built from forged server data — outputs
+	/// exceeding inputs, or totals past the money supply — must fail the
+	/// pre-store fee guard instead of being adopted as a zero-fee round.
+	#[test]
+	fn recovered_participation_totals_are_supply_checked() {
+		let sane_in = Amount::from_sat(100_000);
+		// Fees within the 5% bound pass, the boundary included.
+		assert_eq!(
+			sane_recovered_participation_fee(sane_in, Amount::from_sat(96_000)).unwrap(),
+			Amount::from_sat(4_000),
+		);
+		sane_recovered_participation_fee(sane_in, Amount::from_sat(95_000)).unwrap();
+		// A single sat over the fee bound is refused.
+		sane_recovered_participation_fee(sane_in, Amount::from_sat(94_999)).unwrap_err();
+		// Outputs exceeding the inputs are an error, not a free round.
+		sane_recovered_participation_fee(sane_in, sane_in + Amount::ONE_SAT).unwrap_err();
+		// Totals past the money supply are necessarily forged.
+		sane_recovered_participation_fee(
+			Amount::MAX_MONEY + Amount::ONE_SAT, Amount::ZERO,
+		).unwrap_err();
+		sane_recovered_participation_fee(
+			Amount::MAX_MONEY, Amount::MAX_MONEY,
+		).unwrap();
+		sane_recovered_participation_fee(
+			Amount::MAX_MONEY, Amount::MAX_MONEY + Amount::ONE_SAT,
+		).unwrap_err();
+	}
+
+	/// Pending-round balances over recovered (server-rebuilt) participations
+	/// with forged maximum-value outputs error instead of panicking.
+	#[test]
+	fn pending_round_balance_over_forged_recovered_states_errors() {
+		let preimage: UnlockPreimage = rand::random();
+		let state_with = |outputs: Vec<VtxoRequest>| RoundState::new_delegated(
+			RoundParticipation {
+				inputs: vec![],
+				outputs,
+				unblinded_mailbox_id: None,
+			},
+			UnlockHash::hash(&preimage), None, None,
+		);
+		let huge = || VtxoRequest {
+			amount: Amount::MAX_MONEY,
+			policy: VtxoPolicy::new_pubkey(pubkey()),
+		};
+
+		// One maximum-value round is still reportable.
+		let a = state_with(vec![huge()]);
+		assert_eq!(sum_pending_round_balances([&a]).unwrap(), Amount::MAX_MONEY);
+
+		// Two exceed the money supply: error, not a panicking `+=`.
+		let b = state_with(vec![huge()]);
+		sum_pending_round_balances([&a, &b]).unwrap_err();
+
+		// Outputs that overflow entirely surface as an error too.
+		let c = state_with(vec![
+			VtxoRequest { amount: Amount::MAX, policy: VtxoPolicy::new_pubkey(pubkey()) },
+			VtxoRequest { amount: Amount::MAX, policy: VtxoPolicy::new_pubkey(pubkey()) },
+		]);
+		assert!(c.pending_balance().is_none());
+		sum_pending_round_balances([&c]).unwrap_err();
+
+		// Failed and canceled rounds contribute nothing, forged or not.
+		let mut d = state_with(vec![huge()]);
+		d.flow = RoundFlowState::Canceled;
+		assert_eq!(sum_pending_round_balances([&d]).unwrap(), Amount::ZERO);
 	}
 
 	fn round_participation_fixture(
