@@ -10,6 +10,22 @@
 //! Note that recovery is a trusted process. The server can withhold VTXOs
 //! or may falsely represent spendable VTXOs as spent. Prefer to maintain
 //! back-ups and use recovery from the mnemonic as a last resort.
+//!
+//! Mailbox content is server-controlled input, so the work it can force is
+//! bounded: a run pays per-candidate processing work for at most
+//! [`MAX_RECOVERY_CANDIDATES_PER_RUN`] unknown candidates, and the BIP32
+//! gap-limit key scan is batched per mailbox page instead of running per
+//! candidate. Candidates an earlier run already stored are classified without
+//! spending budget — terminal states are mirrored into the report, while rows
+//! that were never a decision (e.g. provisional `Spendable` after a failed
+//! status request) are re-checked in full — so successive runs keep making
+//! progress even when the mailbox re-reads from checkpoint 0 in the same
+//! order. A flooded mailbox degrades a run to an incomplete [`RecoveryReport`]
+//! (overflow counted; only a bounded id sample is recorded, as a manual
+//! `recover_vtxos` handle) rather than stalling the wallet — and the
+//! incomplete verdict is persisted
+//! ([`crate::WalletProperties::recovery_incomplete`]), so the scan resumes
+//! automatically on every later wallet open until it completes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,7 +43,67 @@ use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 use crate::Wallet;
 use crate::mailbox::MAX_MAILBOX_REQUEST_BURST;
+use crate::sapio::VtxoSigningKey;
 use crate::vtxo::{ServerStatusAdoption, VtxoState};
+
+/// Maximum number of distinct mailbox VTXO candidates a single recovery run
+/// processes.
+///
+/// Classifying a candidate costs its owner-controlled body fetch, chain
+/// validation, key-space scan share and spend-status request — all work the
+/// server can multiply at tens of bytes per fabricated candidate. Capping the
+/// count turns a mailbox flood into an incomplete report (overflow is counted
+/// in [`RecoveryReport::budget_overflow`]) instead of an unbounded, synchronous
+/// CPU and network burn during wallet open. Candidates an earlier run already
+/// decided are accounted from the wallet's own records and do not consume this
+/// budget, so successive runs keep making progress on the unprocessed tail.
+/// The value is far above any plausible genuine wallet history.
+const MAX_RECOVERY_CANDIDATES_PER_RUN: usize = 10_000;
+
+/// How many overflow ids the report keeps as a sample. Unbounded recording of
+/// a flood's ids is what the budget exists to prevent, but a small sample
+/// gives operators a manual handle: [`Wallet::recover_vtxos`] accepts ids.
+const RECOVERY_OVERFLOW_SAMPLE_SIZE: usize = 32;
+
+/// Bookkeeping for the per-run candidate cap: how many distinct candidates
+/// this run may still process. Overflow ids get no per-candidate bookkeeping
+/// at all — a flood must not translate into unbounded memory either.
+struct RecoveryCandidateBudget {
+	remaining: usize,
+}
+
+impl RecoveryCandidateBudget {
+	fn new(cap: usize) -> Self {
+		Self { remaining: cap }
+	}
+
+	fn is_exhausted(&self) -> bool {
+		self.remaining == 0
+	}
+
+	/// Spend one slot on a candidate about to be processed. Callers must gate
+	/// on [`Self::is_exhausted`] first.
+	fn consume(&mut self) {
+		debug_assert!(!self.is_exhausted(), "budget gated by is_exhausted");
+		self.remaining = self.remaining.saturating_sub(1);
+	}
+}
+
+/// What the wallet's records conclude about a mailbox candidate id; see
+/// [`Wallet::classify_stored_candidate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateRecord {
+	/// No stored row: an unknown, adversarial candidate that spends budget.
+	Unknown,
+	/// Stored in a terminal state (`Spent`/`Exited`); mirrored into the report
+	/// with no new work and no budget spend.
+	Decided,
+	/// Stored but not finally decided — a provisional `Spendable` row from a
+	/// failed spend-status request, or `Locked` in an in-flight operation.
+	/// Owned (only ownership-confirmed VTXOs are ever stored), so re-checked in
+	/// full without spending budget.
+	NeedsRecheck,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct RecoveryReportEntry(HashMap<VtxoId, Option<Amount>>);
@@ -45,8 +121,23 @@ impl RecoveryReportEntry {
 		self.0.keys().cloned()
 	}
 
+	/// The sum of all known recovered amounts. The provenance of these
+	/// amounts is the server (`sum::<Amount>` would panic on overflow), so
+	/// amounts that push the total past the money supply are skipped with a
+	/// warning: a larger total is necessarily corrupt and the report is
+	/// best-effort bookkeeping.
 	pub fn total_amount(&self) -> Amount {
-		self.0.values().filter_map(|a| *a).sum()
+		let mut total = Amount::ZERO;
+		for amount in self.0.values().filter_map(|a| *a) {
+			match total.checked_add(amount).filter(|a| *a <= Amount::MAX_MONEY) {
+				Some(sum) => total = sum,
+				None => warn!(
+					"Recovered VTXO amounts exceed the money supply; \
+					skipping {} in the report total", amount,
+				),
+			}
+		}
+		total
 	}
 
 	fn insert(&mut self, vtxo_id: VtxoId, amount: Option<Amount>) {
@@ -85,16 +176,25 @@ pub struct RecoveryReport {
 	foreign: RecoveryReportEntry,
 	/// VTXOs that have been fully exited on-chain.
 	exited: RecoveryReportEntry,
+	/// Count of mailbox candidates never processed because the run hit its
+	/// candidate budget. Their ids are deliberately not recorded beyond a
+	/// bounded sample — a flooded mailbox can deliver millions — but a nonzero
+	/// value means funds may be missing just like `failed`/`foreign` do.
+	budget_overflow: usize,
+	/// The first [`RECOVERY_OVERFLOW_SAMPLE_SIZE`] overflow ids, so operators
+	/// have a manual handle for [`Wallet::recover_vtxos`] on them.
+	budget_overflow_sample: Vec<VtxoId>,
 }
 
 impl RecoveryReport {
 	/// Whether the scan accounted for every VTXO in the mailbox.
 	///
-	/// A `failed` VTXO or `foreign` id both mean funds may be missing, so neither
-	/// may be present. `failed` is retryable; a `foreign` id instead needs a wider
-	/// gap limit to be matched.
+	/// A `failed` VTXO, a `foreign` id or any budget overflow all mean funds may
+	/// be missing, so none may be present. `failed` is retryable; a `foreign` id
+	/// instead needs a wider gap limit to be matched, and budget overflow needs
+	/// further runs once this one has decided its candidates.
 	pub fn is_complete(&self) -> bool {
-		self.failed.is_empty() && self.foreign.is_empty()
+		self.failed.is_empty() && self.foreign.is_empty() && self.budget_overflow == 0
 	}
 
 	pub fn recovered(&self) -> &RecoveryReportEntry {
@@ -136,6 +236,33 @@ impl RecoveryReport {
 		&self.exited
 	}
 
+	/// How many mailbox candidates were left unprocessed because the run hit
+	/// its candidate budget. See the `budget_overflow` field for why only a
+	/// sample of their ids is kept.
+	pub fn budget_overflow(&self) -> usize {
+		self.budget_overflow
+	}
+
+	/// The first few unprocessed overflow ids: a manual
+	/// [`Wallet::recover_vtxos`] handle for operators, deliberately capped at
+	/// [`RECOVERY_OVERFLOW_SAMPLE_SIZE`] regardless of flood size.
+	pub fn budget_overflow_sample(&self) -> &[VtxoId] {
+		&self.budget_overflow_sample
+	}
+
+	fn overflow_sample_full(&self) -> bool {
+		self.budget_overflow_sample.len() >= RECOVERY_OVERFLOW_SAMPLE_SIZE
+	}
+
+	fn push_budget_overflow(&mut self, id: Option<VtxoId>) {
+		self.budget_overflow += 1;
+		if let Some(id) = id {
+			if !self.overflow_sample_full() {
+				self.budget_overflow_sample.push(id);
+			}
+		}
+	}
+
 	pub fn push_exited<G>(&mut self, vtxo: &Vtxo<G>) {
 		self.failed.remove(vtxo.id());
 		self.exited.insert(vtxo.id(), Some(vtxo.amount()));
@@ -149,8 +276,10 @@ impl RecoveryReport {
 /// the callback staying silent: not running and failing are both stated.
 #[derive(Debug)]
 pub enum RecoveryStatus {
-	/// No scan was attempted: the wallet already existed, or the caller set
-	/// [`crate::OpenWalletArgs::skip_recovery`].
+	/// No scan was attempted: a previous recovery already completed, or the
+	/// caller set [`crate::OpenWalletArgs::skip_recovery`]. A wallet whose last
+	/// run ended incomplete re-runs the scan on open (see
+	/// [`crate::WalletProperties::recovery_incomplete`]).
 	NotRun,
 	/// The scan errored before it could produce a report. Nothing is known about
 	/// the mailbox's VTXOs, so funds may be missing until a retry succeeds.
@@ -164,7 +293,16 @@ impl Wallet {
 	/// Page a mailbox from checkpoint 0 and recover every VTXO it references.
 	///
 	/// Ids already in `seen` are skipped, so a VTXO both mailboxes know about is
-	/// handled once.
+	/// handled once. Each fetched page is recovered as a batch: fresh candidates
+	/// are resolved to full bodies first, then validated and put through a
+	/// single gap-limit key scan covering the whole page (see
+	/// [`Wallet::recover_candidates`]), so a page of fabricated candidates pays
+	/// one scan window, not one per candidate. `budget` caps how many unknown
+	/// candidates the whole run processes, gated per id so a single oversized
+	/// message cannot overrun it; candidates already stored are classified per
+	/// [`Wallet::classify_stored_candidate`] without spending budget, and once
+	/// the budget is exhausted overflow is only counted in the report — no
+	/// per-id bookkeeping at all.
 	///
 	/// The paging cursor is never persisted: the server allocates checkpoints
 	/// globally across all mailboxes, so storing it would make the next regular
@@ -176,6 +314,7 @@ impl Wallet {
 		keypair: &Keypair,
 		gap_limit: u32,
 		seen: &mut HashSet<VtxoId>,
+		budget: &mut RecoveryCandidateBudget,
 	) -> anyhow::Result<()> {
 		let (mut srv, _) = self.require_server().await?;
 
@@ -198,33 +337,20 @@ impl Wallet {
 				resp.messages.len());
 
 			let prev_checkpoint = checkpoint;
+
+			// Resolve this page's fresh candidates to full VTXO bodies first, so
+			// the key scan below runs once for the whole page.
+			let mut page: Vec<Vtxo<Full>> = Vec::new();
 			for msg in &resp.messages {
 				checkpoint = checkpoint.max(msg.checkpoint);
 
 				// A message references its vtxos either by id or by full body.
 				match &msg.message {
 					Some(Message::RecoveryVtxoIds(m)) => {
-						for raw in &m.vtxo_ids {
-							let Ok(id) = VtxoId::from_bytes(raw.clone()) else {
-								warn!("Ignoring undecodable recovery vtxo id: {raw:?}");
-								continue;
-							};
-							if seen.insert(id) {
-								self.recover_candidate(report, id, None, gap_limit).await?;
-							}
-						}
+						self.intake_id_refs(report, &m.vtxo_ids, seen, budget, &mut page).await?;
 					},
 					Some(Message::Arkoor(m)) => {
-						for raw in &m.vtxos {
-							let Ok(vtxo) = Vtxo::<Full>::from_bytes(raw.clone()) else {
-								warn!("Ignoring undecodable arkoor vtxo: {raw:?}");
-								continue;
-							};
-							if seen.insert(vtxo.id()) {
-								let id = vtxo.id();
-								self.recover_candidate(report, id, Some(vtxo), gap_limit).await?;
-							}
-						}
+						self.intake_vtxo_bodies(report, &m.vtxos, seen, budget, &mut page).await?;
 					},
 					Some(Message::RoundParticipationCompleted(_)) |
 					Some(Message::IncomingLightningPayment(_)) |
@@ -234,6 +360,8 @@ impl Wallet {
 					},
 				}
 			}
+
+			self.recover_candidates(report, page, gap_limit).await?;
 
 			if !resp.have_more {
 				break;
@@ -298,45 +426,217 @@ impl Wallet {
 		}
 	}
 
-	/// Recover a single VTXO: check we own it, ask the server for its status, and
-	/// store it in the matching state.
+	/// Intake the id references of one mailbox message into the page batch.
 	///
-	/// `vtxo` is the body when the mailbox message carried one; otherwise it is
-	/// fetched from the server.
-	async fn recover_candidate(
+	/// The budget is gated per id, before any decode or other work, so a single
+	/// message carrying more ids than the remaining budget can neither overrun
+	/// the cap nor trip its assertion. Anything past the cap is counted in
+	/// [`RecoveryReport::budget_overflow`] with no per-id records at all — not
+	/// even `seen` — so a flood cannot fill memory. Ids already stored by an
+	/// earlier run are classified per [`Wallet::classify_stored_candidate`];
+	/// only unknown candidates spend budget.
+	async fn intake_id_refs(
 		&self,
 		report: &mut RecoveryReport,
-		id: VtxoId,
-		vtxo: Option<Vtxo<Full>>,
-		gap_limit: u32,
+		refs: &[Vec<u8>],
+		seen: &mut HashSet<VtxoId>,
+		budget: &mut RecoveryCandidateBudget,
+		page: &mut Vec<Vtxo<Full>>,
 	) -> anyhow::Result<()> {
-		let vtxo = match vtxo {
-			Some(vtxo) => vtxo,
-			None => match self.fetch_vtxo(id).await {
-				Ok(vtxo) => vtxo,
+		for raw in refs {
+			if budget.is_exhausted() {
+				// The gate runs before any other work; ids are decoded only
+				// while the bounded operator sample still has room.
+				let sample = if report.overflow_sample_full() {
+					None
+				} else {
+					VtxoId::from_bytes(raw.clone()).ok()
+				};
+				report.push_budget_overflow(sample);
+				continue;
+			}
+			let Ok(id) = VtxoId::from_bytes(raw.clone()) else {
+				warn!("Ignoring undecodable recovery vtxo id: {raw:?}");
+				continue;
+			};
+			if !seen.insert(id) {
+				continue;
+			}
+			match self.classify_stored_candidate(report, id).await? {
+				CandidateRecord::Decided => continue,
+				// Only unknown candidates spend adversarial budget; stored
+				// (hence ours) ones being re-checked do not.
+				CandidateRecord::NeedsRecheck => {},
+				CandidateRecord::Unknown => budget.consume(),
+			}
+			match self.fetch_vtxo(id).await {
+				Ok(vtxo) => page.push(vtxo),
 				Err(e) => {
 					warn!("Could not fetch recovery vtxo {id}: {:#}", e);
 					report.push_failed(id, None);
-					return Ok(());
 				},
-			},
-		};
+			}
+		}
+		Ok(())
+	}
 
-		// Native gap scanning persists revealed keys. Program positions require
-		// their independently backed-up descriptors and signed recovery records.
-		let keypairs = self.find_vtxo_signing_keys([vtxo.user_pubkey()], gap_limit).await?;
-		let Some(keypair) = keypairs.get(&vtxo.user_pubkey()) else {
-			report.push_foreign(&vtxo);
-			return Ok(());
-		};
+	/// Intake the full VTXO bodies of one arkoor mailbox message into the page
+	/// batch. Budget semantics are identical to [`Wallet::intake_id_refs`].
+	async fn intake_vtxo_bodies(
+		&self,
+		report: &mut RecoveryReport,
+		raws: &[Vec<u8>],
+		seen: &mut HashSet<VtxoId>,
+		budget: &mut RecoveryCandidateBudget,
+		page: &mut Vec<Vtxo<Full>>,
+	) -> anyhow::Result<()> {
+		for raw in raws {
+			if budget.is_exhausted() {
+				// The gate runs before any other work; bodies are decoded only
+				// while the bounded operator sample still has room.
+				let sample = if report.overflow_sample_full() {
+					None
+				} else {
+					Vtxo::<Full>::from_bytes(raw.clone()).ok().map(|v| v.id())
+				};
+				report.push_budget_overflow(sample);
+				continue;
+			}
+			let Ok(vtxo) = Vtxo::<Full>::from_bytes(raw.clone()) else {
+				warn!("Ignoring undecodable arkoor vtxo: {raw:?}");
+				continue;
+			};
+			let id = vtxo.id();
+			if !seen.insert(id) {
+				continue;
+			}
+			match self.classify_stored_candidate(report, id).await? {
+				CandidateRecord::Decided => continue,
+				CandidateRecord::NeedsRecheck => {},
+				CandidateRecord::Unknown => budget.consume(),
+			}
+			page.push(vtxo);
+		}
+		Ok(())
+	}
 
-		// A validation error (anchor not yet visible, or invalid) is a
-		// non-decision, so it's a failure, not a clean skip.
-		if let Err(e) = self.validate_vtxo(&vtxo).await {
-			warn!("Could not validate recovery vtxo {id}: {:#}", e);
-			report.push_failed(id, Some(vtxo.amount()));
+	/// Classify a mailbox candidate against the wallet's own records, mirroring
+	/// terminal decisions into `report`.
+	///
+	/// Mirroring decided VTXOs from stored state avoids re-paying
+	/// attacker-rationed work (fetch, chain check, scan window) for no new
+	/// decision on every re-run — the mailbox is always re-read from
+	/// checkpoint 0 in the same server-chosen order, so without this fast path
+	/// everything past the budget would be deferred by every run forever.
+	///
+	/// Crucially, only terminal states count as decided: a row stored as
+	/// `Spendable` is not necessarily a decision — [`Wallet::store_candidate`]
+	/// stores a provisional `Spendable` row precisely when the spend-status
+	/// request failed, explicitly a non-decision. Such rows (and `Locked`
+	/// in-flight ones) are re-checked in full instead of being mirrored, so a
+	/// healthy run always re-queries their real spend status. The re-check is
+	/// cheap (their key is already revealed, so no scan window is paid) and
+	/// spends no budget, since only ownership-confirmed VTXOs are ever stored
+	/// and an attacker cannot inflate this class; if a flood has exhausted the
+	/// budget anyway, intake counts re-checks as overflow like anything else.
+	async fn classify_stored_candidate(
+		&self,
+		report: &mut RecoveryReport,
+		id: VtxoId,
+	) -> anyhow::Result<CandidateRecord> {
+		let Some(entry) = self.inner.db.get_wallet_vtxo(id).await? else {
+			return Ok(CandidateRecord::Unknown);
+		};
+		Ok(match &entry.state {
+			VtxoState::Spent => { report.push_skipped(&entry.vtxo); CandidateRecord::Decided },
+			VtxoState::Exited => { report.push_exited(&entry.vtxo); CandidateRecord::Decided },
+			VtxoState::Spendable | VtxoState::Locked { .. } => CandidateRecord::NeedsRecheck,
+		})
+	}
+
+	/// Recover a batch of freshly seen VTXO candidates.
+	///
+	/// Ordering matters because the candidates are untrusted, server-controlled
+	/// input: chain validation runs before the ownership key scan so fabricated
+	/// garbage is rejected by a cheap chain lookup, and the scan itself runs
+	/// once for the whole batch — one gap-limit window covers every candidate,
+	/// so foreign candidates share the scan cost instead of each re-deriving
+	/// `gap_limit` keys. A failure tied to a single candidate is recorded
+	/// against that candidate alone and never aborts the rest of the batch.
+	async fn recover_candidates(
+		&self,
+		report: &mut RecoveryReport,
+		candidates: Vec<Vtxo<Full>>,
+		gap_limit: u32,
+	) -> anyhow::Result<()> {
+		let valid = self.validate_candidates(report, candidates).await;
+		self.scan_candidates(report, valid, gap_limit).await
+	}
+
+	/// Validate each candidate against its chain anchor. Running this before the
+	/// ownership key scan means fabricated garbage is rejected by a cheap chain
+	/// lookup instead of paying derivation cost. A validation error (anchor not
+	/// yet visible, or invalid) is a non-decision, so it's a failure for that
+	/// candidate alone, not a clean skip and never an abort of the batch.
+	async fn validate_candidates(
+		&self,
+		report: &mut RecoveryReport,
+		candidates: Vec<Vtxo<Full>>,
+	) -> Vec<Vtxo<Full>> {
+		let mut valid = Vec::with_capacity(candidates.len());
+		for vtxo in candidates {
+			if let Err(e) = self.validate_vtxo(&vtxo).await {
+				warn!("Could not validate recovery vtxo {}: {:#}", vtxo.id(), e);
+				report.push_failed(vtxo.id(), Some(vtxo.amount()));
+			} else {
+				valid.push(vtxo);
+			}
+		}
+		valid
+	}
+
+	/// Batch the ownership scan over already-validated candidates: one
+	/// gap-limit window covers the whole batch, so a candidate whose key we
+	/// cannot derive is foreign for the price of this single scan instead of
+	/// each re-deriving `gap_limit` keys. Native gap scanning persists revealed
+	/// keys. Program positions require their independently backed-up
+	/// descriptors and signed recovery records. Owned candidates go on to
+	/// [`Wallet::store_candidate`]; a failure there is recorded against that
+	/// candidate alone where possible.
+	async fn scan_candidates(
+		&self,
+		report: &mut RecoveryReport,
+		candidates: Vec<Vtxo<Full>>,
+		gap_limit: u32,
+	) -> anyhow::Result<()> {
+		if candidates.is_empty() {
 			return Ok(());
 		}
+
+		let keypairs = self.find_vtxo_signing_keys(
+			candidates.iter().map(|v| v.user_pubkey()), gap_limit,
+		).await.context("error scanning the vtxo key space")?;
+
+		for vtxo in candidates {
+			match keypairs.get(&vtxo.user_pubkey()) {
+				None => report.push_foreign(&vtxo),
+				Some(keypair) => self.store_candidate(report, vtxo, keypair).await?,
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Store a VTXO whose ownership scan matched one of our keys: complete its
+	/// program recovery guard, then ask the chain and the server where it
+	/// belongs and record it in that state.
+	async fn store_candidate(
+		&self,
+		report: &mut RecoveryReport,
+		vtxo: Vtxo<Full>,
+		keypair: &VtxoSigningKey,
+	) -> anyhow::Result<()> {
+		let id = vtxo.id();
 
 		if let Err(e) = self.ensure_program_recoveries(std::slice::from_ref(&vtxo)).await {
 			warn!("Recovery vtxo {id} has no usable saved program recovery: {e:#}");
@@ -398,8 +698,10 @@ impl Wallet {
 
 	/// Recover the given VTXOs into this wallet's spendable set.
 	///
-	/// `gap_limit` overrides [`crate::Config::vtxo_key_gap_limit`] for the key
-	/// scan that decides which of `ids` this wallet owns.
+	/// Bodies are fetched first, then the whole set is validated and put through
+	/// a single batched key scan (see [`Wallet::recover_candidates`]). `gap_limit`
+	/// overrides [`crate::Config::vtxo_key_gap_limit`] for that scan, which
+	/// decides which of `ids` this wallet owns.
 	pub async fn recover_vtxos(
 		&self,
 		ids: impl IntoIterator<Item = VtxoId>,
@@ -407,10 +709,32 @@ impl Wallet {
 	) -> anyhow::Result<RecoveryReport> {
 		let mut report = RecoveryReport::default();
 		let gap_limit = gap_limit.unwrap_or(self.inner.config.vtxo_key_gap_limit);
+		let mut candidates = Vec::new();
 		for id in ids {
-			self.recover_candidate(&mut report, id, None, gap_limit).await?;
+			match self.fetch_vtxo(id).await {
+				Ok(vtxo) => candidates.push(vtxo),
+				Err(e) => {
+					warn!("Could not fetch recovery vtxo {id}: {:#}", e);
+					report.push_failed(id, None);
+				},
+			}
 		}
+		self.recover_candidates(&mut report, candidates, gap_limit).await?;
 		Ok(report)
+	}
+
+	/// Persist the verdict of a recovery run so the scan stays resumable across
+	/// opens: `complete` clears the marker, anything less sets it and every
+	/// later [`crate::Wallet::open`] re-runs the scan (candidates already
+	/// processed are served from the wallet's own records, so re-runs are
+	/// cheap and keep making progress on the unprocessed tail).
+	///
+	/// Best-effort: a failed write cannot strand funds — the worst case is the
+	/// next open re-running a scan that already completed.
+	pub(crate) async fn record_recovery_verdict(&self, complete: bool) {
+		if let Err(e) = self.inner.db.set_recovery_incomplete(!complete).await {
+			warn!("Could not persist the recovery-incomplete marker: {e:#}");
+		}
 	}
 
 	/// Rebuild the wallet's VTXO set from the seed-derived recovery mailbox and
@@ -418,20 +742,41 @@ impl Wallet {
 	///
 	/// Both mailboxes are read from checkpoint 0, and every VTXO they reference
 	/// is resolved against the chain and the server as it is seen and stored
-	/// accordingly. Returns a [`RecoveryReport`] (see it for why
-	/// recovered/skipped/failed matters).
+	/// accordingly. Mailbox content is untrusted, so the run processes at most
+	/// [`MAX_RECOVERY_CANDIDATES_PER_RUN`] unknown candidates; overflow is
+	/// counted in [`RecoveryReport::budget_overflow`], keeping the report
+	/// incomplete without recording more than a bounded sample of its ids.
+	/// Because candidates an earlier run already stored are classified from the
+	/// wallet's own records without spending budget
+	/// ([`Wallet::classify_stored_candidate`]), repeated runs keep spending
+	/// their budget on the unprocessed tail until everything is accounted for —
+	/// the caller (`Wallet::open`) persists the incomplete verdict and re-runs
+	/// the scan on every later open in the meantime, so mailboxes larger than
+	/// the cap do recover, just over multiple opens. Returns a
+	/// [`RecoveryReport`] (see it for why recovered/skipped/failed matters).
 	pub(crate) async fn recover_from_mailbox(&self) -> anyhow::Result<RecoveryReport> {
 		let mut report = RecoveryReport::default();
 		let gap_limit = self.inner.config.vtxo_key_gap_limit;
 		let mut seen = HashSet::new();
+		let mut budget = RecoveryCandidateBudget::new(MAX_RECOVERY_CANDIDATES_PER_RUN);
 
 		// The regular mailbox comes first: its arkoor messages carry full vtxos,
 		// so a duplicate in the recovery mailbox needs no fetch.
 		let keypair = self.mailbox_keypair();
-		self.scan_mailbox_for_recovery(&mut report, &keypair, gap_limit, &mut seen).await?;
+		self.scan_mailbox_for_recovery(&mut report, &keypair, gap_limit, &mut seen, &mut budget).await?;
 
 		let keypair = self.recovery_mailbox_keypair();
-		self.scan_mailbox_for_recovery(&mut report, &keypair, gap_limit, &mut seen).await?;
+		self.scan_mailbox_for_recovery(&mut report, &keypair, gap_limit, &mut seen, &mut budget).await?;
+
+		if report.budget_overflow() > 0 {
+			warn!(
+				"Recovery processed its maximum of {MAX_RECOVERY_CANDIDATES_PER_RUN} candidates \
+				this run; {} further candidate(s) were left unprocessed, so the run is \
+				incomplete — the wallet resumes the scan on every open until it completes. \
+				First unprocessed ids (recover_vtxos can process them manually): {:?}",
+				report.budget_overflow(), report.budget_overflow_sample(),
+			);
+		}
 
 		// Unmatched ids in our own seed-derived mailbox are suspicious: most
 		// likely an owned VTXO whose key sits beyond the gap limit (funds may be
@@ -440,8 +785,10 @@ impl Wallet {
 		if !report.foreign.is_empty() {
 			warn!(
 				"Recovery mailbox held {} vtxo(s) not derivable from this seed within the \
-				gap limit ({gap_limit}); if any are ours they were not recovered: {:?}",
-				report.foreign.len(), report.foreign,
+				gap limit ({gap_limit}); if any are ours they were not recovered. \
+				First offenders: {:?}",
+				report.foreign.len(),
+				report.foreign.ids().take(8).collect::<Vec<_>>(),
 			);
 		}
 
@@ -452,25 +799,35 @@ impl Wallet {
 			);
 		}
 
-		// We retry 3 times to recover the failed VTXOs.
+		// We retry 3 times to recover the failed VTXOs. Budget overflow is not
+		// in `failed` (its ids are never recorded), so retries stay capped.
 		for _ in 0..3 {
 			if report.failed.is_empty() {
 				break;
 			}
 
 			let ids = report.failed.ids().collect::<Vec<_>>();
+			let mut candidates = Vec::with_capacity(ids.len());
 			for id in ids {
-				self.recover_candidate(&mut report, id, None, gap_limit).await?;
+				match self.fetch_vtxo(id).await {
+					Ok(vtxo) => candidates.push(vtxo),
+					Err(e) => {
+						warn!("Could not fetch recovery vtxo {id}: {:#}", e);
+						report.push_failed(id, None);
+					},
+				}
 			}
+			self.recover_candidates(&mut report, candidates, gap_limit).await?;
 		}
 
 		if !report.failed.is_empty() {
 			warn!(
 				"Recovery incomplete: recovered {} spendable vtxos, but {} could not be \
 				checked due to errors; funds may be missing — retry recovery to recover \
-				them ({} skipped). Failed vtxos: {:?}",
+				them ({} skipped). First failed vtxos: {:?}",
 				report.recovered.len(), report.failed.len(),
-				report.skipped.len(), report.failed,
+				report.skipped.len(),
+				report.failed.ids().take(8).collect::<Vec<_>>(),
 			);
 		}
 
@@ -483,6 +840,7 @@ mod test {
 	use super::*;
 	use bitcoin::Amount;
 	use bitcoin::hashes::Hash;
+	use crate::WalletProperties;
 
 	fn dummy_id(vout: u32) -> VtxoId {
 		bitcoin::OutPoint::new(bitcoin::Txid::all_zeros(), vout).into()
@@ -499,6 +857,8 @@ mod test {
 			foreign: RecoveryReportEntry(HashMap::new()),
 			failed: RecoveryReportEntry(HashMap::new()),
 			exited: RecoveryReportEntry(HashMap::new()),
+			budget_overflow: 0,
+			budget_overflow_sample: Vec::new(),
 		};
 		assert!(clean.is_complete(),
 			"recovered and skipped VTXOs are clean decisions, not failures");
@@ -513,6 +873,322 @@ mod test {
 			foreign: RecoveryReportEntry(HashMap::from([(dummy_id(2), Some(Amount::from_sat(1000)))])),
 			..Default::default()
 		}.is_complete(), "a foreign id is likely an owned VTXO beyond the gap limit, so recovery is incomplete");
+	}
+
+	/// The per-run candidate cap processes exactly `cap` distinct candidates;
+	/// past it, intake counts overflow in the report without recording any ids,
+	/// and the overflow alone keeps the report incomplete.
+	#[test]
+	fn recovery_candidate_budget_caps_processing_and_counts_overflow() {
+		let mut budget = RecoveryCandidateBudget::new(2);
+		assert!(!budget.is_exhausted());
+		budget.consume();
+		budget.consume();
+		assert!(budget.is_exhausted(), "the cap stays shut once hit");
+
+		let mut report = RecoveryReport::default();
+		report.push_budget_overflow(Some(dummy_id(0)));
+		report.push_budget_overflow(Some(dummy_id(1)));
+		report.push_budget_overflow(None);
+		assert_eq!(report.budget_overflow(), 3);
+		assert!(!report.is_complete(), "overflow alone means funds may be missing");
+		assert!(report.failed().is_empty(),
+			"overflow is counted, never recorded per id — a flood must not fill memory");
+		assert_eq!(report.budget_overflow_sample(), &[dummy_id(0), dummy_id(1)],
+			"only a bounded sample of overflow ids is kept, as an operator handle");
+
+		// The sample never outgrows its cap no matter how large the flood.
+		for vout in 0..(RECOVERY_OVERFLOW_SAMPLE_SIZE as u32 + 8) {
+			report.push_budget_overflow(Some(dummy_id(vout)));
+		}
+		assert_eq!(report.budget_overflow_sample().len(), RECOVERY_OVERFLOW_SAMPLE_SIZE);
+	}
+
+	/// The resume decision: a freshly created wallet always scans; after that,
+	/// only the persisted incomplete marker keeps the scan running on open.
+	#[test]
+	fn recovery_resumes_while_incomplete_marker_is_set() {
+		let fresh = WalletProperties {
+			network: bitcoin::Network::Regtest,
+			fingerprint: Default::default(),
+			server_pubkey: None,
+			server_mailbox_pubkey: None,
+			recovery_incomplete: false,
+		};
+		assert!(crate::should_run_recovery(true, &fresh),
+			"first open after seed creation always scans, marker or not");
+		assert!(!crate::should_run_recovery(false, &fresh),
+			"a completed past run is not re-scanned");
+
+		let marked = WalletProperties { recovery_incomplete: true, ..fresh.clone() };
+		assert!(crate::should_run_recovery(false, &marked),
+			"an incomplete past run resumes on reopen");
+		assert!(crate::should_run_recovery(true, &marked),
+			"the marker is irrelevant on a first open");
+	}
+
+	/// Wallet-backed tests for the batched ownership scan. The chain source is
+	/// deliberately unroutable ([`ChainSource::offline_for_test`]), so these
+	/// exercise [`Wallet::scan_candidates`] directly: validation is the stage
+	/// before it and only needs the chain, not the seed.
+	#[cfg(feature = "sqlite")]
+	mod scan_batching {
+		use std::collections::HashSet;
+		use std::sync::Arc;
+
+		use bitcoin::Network;
+		use bitcoin::secp256k1::Keypair;
+
+		use ark::{ProtocolEncoding, Vtxo};
+		use ark::test_util::dummy::DummyTestVtxoSpec;
+		use ark::vtxo::Full;
+
+		use super::super::{CandidateRecord, RecoveryCandidateBudget, RecoveryReport};
+		use crate::{Config, Wallet, WalletInner, WalletProperties, WalletSeed, SECP};
+		use crate::chain::ChainSource;
+		use crate::exit::Exit;
+		use crate::lock_manager::memory::MemoryLockManager;
+		use crate::movement::manager::MovementManager;
+		use crate::notification::NotificationDispatch;
+		use crate::persist::WalletPersister;
+		use crate::persist::adaptor::StorageAdaptorWrapper;
+		use crate::round::RoundSecretNonces;
+		use crate::vtxo::VtxoState;
+
+		/// A wallet against an in-memory database with a chain source and
+		/// server that are both unreachable. Enough to run the ownership scan
+		/// and report classification; the owned-candidate store path dies at
+		/// the spend-status request, which lands the VTXO in `failed`.
+		async fn offline_wallet(seed_byte: u8) -> Wallet {
+			let network = Network::Regtest;
+			let seed = WalletSeed::new_from_seed(network, &[seed_byte; 64]);
+			let db: Arc<dyn WalletPersister> = Arc::new(StorageAdaptorWrapper::new_memory());
+			let chain = Arc::new(ChainSource::offline_for_test(network));
+			let notifications = NotificationDispatch::new();
+			let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
+			let exit = Exit::new(db.clone(), chain.clone(), movements.clone()).await.unwrap();
+			Wallet { inner: Arc::new(WalletInner {
+				config: Config::network_default(network),
+				db,
+				lock_manager: Box::new(MemoryLockManager::new()),
+				seed,
+				exit,
+				movements,
+				notifications,
+				server: tokio::sync::OnceCell::new(),
+				chain,
+				onchain: None,
+				program_transport: tokio::sync::OnceCell::new(),
+				daemon: parking_lot::Mutex::new(None),
+				last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+				round_secret_nonces: RoundSecretNonces::new(),
+			})}
+		}
+
+		/// A fabricated mailbox candidate: structurally valid, but its user key
+		/// is a fixed, seed-unrelated scalar, so it can never derive from the
+		/// wallet's seed and each index yields a distinct candidate id.
+		fn fabricated_candidate(n: u32) -> Vtxo<Full> {
+			let mut sec = [0x11u8; 32];
+			sec[28..32].copy_from_slice(&n.to_be_bytes());
+			let user_keypair = Keypair::from_seckey_slice(&SECP, &sec).unwrap();
+			DummyTestVtxoSpec { user_keypair, ..Default::default() }.build().1
+		}
+
+		/// A page of fabricated candidates must cost a single gap-limit scan
+		/// window, not one scan per candidate: the derivation count stays at
+		/// gap_limit + 1 no matter how many candidates the page carries, and
+		/// every one of them is classified foreign.
+		#[tokio::test]
+		async fn foreign_candidates_share_one_scan_window() {
+			let wallet = offline_wallet(1).await;
+			let mut report = RecoveryReport::default();
+			const GAP_LIMIT: u32 = 4;
+
+			let n_foreign = 50;
+			let candidates = (0..n_foreign as u32).map(fabricated_candidate).collect::<Vec<_>>();
+
+			let before = wallet.inner.seed.vtxo_key_derivation_count();
+			wallet.scan_candidates(&mut report, candidates, GAP_LIMIT).await.unwrap();
+			let derivations = wallet.inner.seed.vtxo_key_derivation_count() - before;
+
+			assert_eq!(derivations, GAP_LIMIT as usize + 1,
+				"a page of foreign candidates must cost one gap window, not one scan each");
+			assert_eq!(report.foreign().len(), n_foreign,
+				"every unowned candidate is foreign, at shared scan cost");
+			assert!(report.recovered().is_empty() && report.failed().is_empty());
+			assert!(!report.is_complete());
+		}
+
+		/// In a mixed batch the owned candidate is still found: its key is
+		/// revealed (from the database on the next lookup) while the fabricated
+		/// candidates are foreign — and a bad candidate never aborts the good
+		/// one's classification.
+		#[tokio::test]
+		async fn mixed_batch_finds_owned_key_and_isolates_foreign() {
+			let wallet = offline_wallet(2).await;
+			let mut report = RecoveryReport::default();
+			const GAP_LIMIT: u32 = 1;
+
+			// The owned candidate sits at derivation index 0, unseen so far: with
+			// a gap limit of 1 the single window scans indices 0..=2 either way.
+			let owned_keypair = wallet.inner.seed.derive_vtxo_keypair(0);
+			let owned = DummyTestVtxoSpec {
+				user_keypair: owned_keypair, ..Default::default()
+			}.build().1;
+
+			let mut candidates = vec![fabricated_candidate(0), fabricated_candidate(1)];
+			let foreign_ids = candidates.iter().map(|v| v.id()).collect::<Vec<_>>();
+			let owned_id = owned.id();
+			candidates.push(owned);
+			candidates.push(fabricated_candidate(2));
+
+			let before = wallet.inner.seed.vtxo_key_derivation_count();
+			wallet.scan_candidates(&mut report, candidates, GAP_LIMIT).await.unwrap();
+			let derivations = wallet.inner.seed.vtxo_key_derivation_count() - before;
+
+			// One window covering the whole batch, extended once by its only
+			// match: indices 0 (match), 1 and 2.
+			assert_eq!(derivations, 3,
+				"the whole batch pays one gap window extended by its only match");
+			for id in &foreign_ids {
+				assert!(report.foreign().ids().any(|f| &f == id), "fabricated candidate is foreign");
+			}
+			assert!(!report.foreign().ids().any(|f| f == owned_id),
+				"the owned candidate must never be classified foreign");
+			assert_eq!(
+				wallet.inner.db.get_public_key_idx(&owned_keypair.public_key()).await.unwrap(),
+				Some(0),
+				"the owned key is revealed by the shared scan, so the wallet owns the VTXO",
+			);
+			// With no reachable server the spend-status request fails, so the
+			// owned VTXO lands in failed (a non-decision) rather than recovered.
+			assert!(report.failed().ids().any(|f| f == owned_id));
+		}
+
+		/// Candidates an earlier run already stored with a terminal state are
+		/// mirrored from the wallet's own records — no fetch, validation or key
+		/// scan — so repeated runs spend the candidate budget only on the
+		/// unprocessed tail and a flooded mailbox's tail is eventually reached.
+		#[tokio::test]
+		async fn decided_candidates_are_accounted_from_wallet_records() {
+			let wallet = offline_wallet(3).await;
+
+			let spent = fabricated_candidate(11);
+			wallet.store_vtxos([&spent], &VtxoState::Spent).await.unwrap();
+			let exited = fabricated_candidate(12);
+			wallet.store_vtxos([&exited], &VtxoState::Exited).await.unwrap();
+			let unknown = fabricated_candidate(13);
+
+			let mut report = RecoveryReport::default();
+			assert_eq!(
+				wallet.classify_stored_candidate(&mut report, spent.id()).await.unwrap(),
+				CandidateRecord::Decided,
+			);
+			assert_eq!(
+				wallet.classify_stored_candidate(&mut report, exited.id()).await.unwrap(),
+				CandidateRecord::Decided,
+			);
+			assert_eq!(
+				wallet.classify_stored_candidate(&mut report, unknown.id()).await.unwrap(),
+				CandidateRecord::Unknown,
+				"an id the wallet never stored is an unknown candidate",
+			);
+
+			assert!(report.skipped().ids().any(|i| i == spent.id()));
+			assert!(report.exited().ids().any(|i| i == exited.id()));
+			assert_eq!(wallet.inner.seed.vtxo_key_derivation_count(), 0,
+				"decided accounting performs no key scan at all");
+		}
+
+		/// A VTXO stored as `Spendable` may be a provisional row from a failed
+		/// spend-status request — explicitly a non-decision. It must be
+		/// re-checked, never mirrored as recovered: intake re-queries it
+		/// (offline that surfaces as `failed`, preserving honest incomplete)
+		/// without touching the candidate budget.
+		#[tokio::test]
+		async fn provisional_spendable_rows_are_rechecked_not_mirrored() {
+			let wallet = offline_wallet(5).await;
+
+			// A previous run stored this VTXO provisionally after its
+			// spend-status request failed.
+			let provisional = fabricated_candidate(20);
+			wallet.store_vtxos([&provisional], &VtxoState::Spendable).await.unwrap();
+
+			let mut report = RecoveryReport::default();
+			assert_eq!(
+				wallet.classify_stored_candidate(&mut report, provisional.id()).await.unwrap(),
+				CandidateRecord::NeedsRecheck,
+				"a stored Spendable row is not a final decision",
+			);
+			assert!(report.recovered().is_empty(),
+				"must not be mirrored as recovered without a fresh status query");
+
+			// Through intake the candidate is re-queried rather than mirrored:
+			// offline the fetch fails, so it lands in failed... and crucially
+			// the re-check is uncapped, leaving the whole budget untouched.
+			let mut seen = HashSet::new();
+			let mut budget = RecoveryCandidateBudget::new(10);
+			let mut page = Vec::new();
+			wallet.intake_id_refs(&mut report, std::slice::from_ref(&provisional.id().to_bytes().to_vec()),
+				&mut seen, &mut budget, &mut page).await.unwrap();
+			assert_eq!(budget.remaining, 10, "re-checking stored candidates costs no budget");
+			assert!(report.recovered().is_empty());
+			assert!(report.failed().ids().any(|i| i == provisional.id()),
+				"the re-query happened (and its offline failure is a non-decision)");
+		}
+
+		/// One mailbox message may carry more candidates than the remaining
+		/// budget. The per-id budget gate must hold in every build profile
+		/// (before it, `consume` tripped its debug_assert in dev or overran the
+		/// cap in release): the first `remaining` candidates are processed, the
+		/// rest are overflow-counted with no per-id bookkeeping.
+		#[tokio::test]
+		async fn oversized_message_respects_budget_and_counts_overflow() {
+			let wallet = offline_wallet(4).await;
+			let mut report = RecoveryReport::default();
+			let mut seen = HashSet::new();
+			let mut budget = RecoveryCandidateBudget::new(2);
+
+			let vtxos = (0..5).map(fabricated_candidate).collect::<Vec<_>>();
+			let bodies = vtxos.iter().map(|v| v.serialize()).collect::<Vec<_>>();
+			let mut page = Vec::new();
+			wallet.intake_vtxo_bodies(&mut report, &bodies, &mut seen, &mut budget, &mut page).await.unwrap();
+
+			assert!(budget.is_exhausted());
+			assert_eq!(page.len(), 2, "only the remaining budget is processed");
+			assert_eq!(report.budget_overflow(), 3, "the excess is counted, not processed");
+			assert_eq!(seen.len(), 2, "overflow ids get no per-id records");
+			assert_eq!(report.budget_overflow_sample(),
+				&vtxos[2..].iter().map(|v| v.id()).collect::<Vec<_>>()[..],
+				"a bounded id sample leaves operators a manual recover_vtxos handle");
+		}
+
+		/// The run verdict is persisted as the wallet's recovery-incomplete
+		/// marker, which is what makes an incomplete scan resume on the next
+		/// open (see [`crate::should_run_recovery`]): an incomplete run sets
+		/// it, a complete run clears it.
+		#[tokio::test]
+		async fn recovery_verdict_controls_open_resume_marker() {
+			let wallet = offline_wallet(6).await;
+			wallet.inner.db.init_wallet(&WalletProperties {
+				network: Network::Regtest,
+				fingerprint: Default::default(),
+				server_pubkey: None,
+				server_mailbox_pubkey: None,
+				recovery_incomplete: false,
+			}).await.unwrap();
+
+			let marker = async || wallet.inner.db.read_properties().await
+				.unwrap().unwrap().recovery_incomplete;
+
+			assert!(!marker().await, "a fresh wallet has no resumption pending");
+			wallet.record_recovery_verdict(false).await;
+			assert!(marker().await,
+				"an incomplete run sets the marker so the next open resumes");
+			wallet.record_recovery_verdict(true).await;
+			assert!(!marker().await, "a complete run clears the marker");
+		}
 	}
 }
 

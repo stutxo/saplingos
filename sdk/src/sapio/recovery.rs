@@ -881,12 +881,23 @@ impl Wallet {
 
 	/// Persist disclosure links before sending any forfeit share. The signed
 	/// replacement witness itself is authenticated against its native ancestry.
+	///
+	/// Every replacement output, native leaf or program-bound, must be locked
+	/// under the same unlock hash the input forfeits commit to. The server
+	/// earns the forfeit claim only by revealing that hash's preimage, and
+	/// the same preimage is the only way to unlock the replacement. This is
+	/// the last check before any forfeit share escapes, so it is enforced
+	/// even for native outputs that carry no program recovery record.
 	pub(crate) async fn preserve_hark_unlocks(
 		&self, outputs: &[Vtxo<Full>], inputs: &[Vtxo<Full>], hash: sha256::Hash,
 	) -> anyhow::Result<()> {
 		let disclosures = recovery_disclosures(inputs, hash)?;
 		let mut records = Vec::new();
 		for vtxo in outputs {
+			ensure!(vtxo.unlock_hash() == Some(hash),
+				"replacement VTXO {} is not locked under the forfeit unlock hash",
+				vtxo.id(),
+			);
 			let Some(mut record) = self.inner.db.get_program_recovery(vtxo.point()).await? else { continue; };
 			retain_unlock_witness(vtxo, &mut record);
 			let unlock = record.unlocks.iter_mut().find(|unlock| unlock.ancestor == vtxo.point().txid)
@@ -1261,6 +1272,9 @@ pub async fn recover_program_bundle(bundle: &ProgramRecoveryBundle, chain: &Chai
 {
 	bundle.verify()?;
 	ensure!(bundle.network == chain.network(), "recovery bundle network mismatch");
+	// Backend rates are clamped at ingestion, but a caller override reaches the pinned
+	// ext CPFP builders unchecked; bail loudly rather than overflow their u64 fee math.
+	let fee_rate = crate::exit::validate_exit_fee_rate(fee_rate)?;
 	chain.require_version().await?;
 	fee_wallet.sync(chain).await.context("failed to sync program recovery fee wallet")?;
 	let tip = chain.tip().await?.to_u32();
@@ -1283,7 +1297,23 @@ async fn broadcast_with_fees(tx: &Transaction, chain: &ChainSource,
 	let fees = if let Some((child, _)) = spending.get(&anchor) {
 		let info = chain.mempool_ancestor_info(*child).await?;
 		if info.effective_fee_rate().is_some_and(|rate| rate >= fee_rate) { return Ok(funded_state); }
-		MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee: info.total_fee }
+		// The ancestor report is unverified data from the configured chain backend: the fee
+		// and weight fields are both server-supplied, so an adversarial backend could demand
+		// up to the fee wallet's entire confirmed balance as the RBF floor. Bound the floor
+		// to a share of the value being recovered, and skip rather than sign when the claim
+		// exceeds it — the existing child stays in the mempool and recovery can be retried.
+		let recovered = tx.output.iter().try_fold(Amount::ZERO, |acc, o| acc.checked_add(o.value))
+			.context("recovery claim output values overflow")?;
+		let Some(current_package_fee) = crate::onchain::cap_backend_package_fee(recovered, info.total_fee)
+		else {
+			log::warn!(
+				"Chain backend reports a {} package fee for the recovery child of {} rescuing at most {}; \
+				skipping the fee bump this round instead of signing over an implausible fee",
+				info.total_fee, tx.compute_txid(), recovered,
+			);
+			return Ok(funded_state);
+		};
+		MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
 	} else {
 		MakeCpfpFees::Effective(fee_rate)
 	};

@@ -32,6 +32,7 @@ use crate::persist::adaptor::{
 ///		fingerprint: Fingerprint::default(),
 ///		server_pubkey: None,
 ///		server_mailbox_pubkey: None,
+///		recovery_incomplete: false,
 ///	};
 ///
 /// storage.init_wallet(&properties).await?;

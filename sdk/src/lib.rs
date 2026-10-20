@@ -64,7 +64,7 @@ pub use self::vtxo::WalletVtxo;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -282,6 +282,14 @@ pub struct OffchainBalance {
 	pub pending_exit: Amount,
 }
 
+/// Whether opening a wallet with these properties should run the seed
+/// recovery scan: always for a wallet created in this open, and afterwards
+/// while [`WalletProperties::recovery_incomplete`] from a previous,
+/// incomplete run is set.
+pub(crate) fn should_run_recovery(created_now: bool, properties: &WalletProperties) -> bool {
+	created_now || properties.recovery_incomplete
+}
+
 /// Read-only properties of the Sapling wallet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletProperties {
@@ -311,6 +319,19 @@ pub struct WalletProperties {
 	/// successful handshake. If the key changes, the wallet refuses to
 	/// connect until the user resolves the rotation.
 	pub server_mailbox_pubkey: Option<PublicKey>,
+
+	/// Whether the last seed-recovery mailbox scan ended incomplete.
+	///
+	/// Set when a recovery run finishes with unaccounted-for candidates
+	/// ([`crate::RecoveryReport::is_complete`] false) or errors out; cleared by
+	/// the first run that completes. While set, every wallet open re-runs the
+	/// scan: it re-reads the mailbox from checkpoint 0, but candidates previous
+	/// runs already processed are served from the wallet's own records, so each
+	/// run's candidate budget goes to the still-unprocessed tail. `false` also
+	/// for wallets created before this was tracked (they auto-recover on their
+	/// first open regardless).
+	#[serde(default)]
+	pub recovery_incomplete: bool,
 }
 
 /// Struct representing an extended private key derived from a
@@ -321,6 +342,9 @@ pub struct WalletProperties {
 pub struct WalletSeed {
 	master: bip32::Xpriv,
 	vtxo: bip32::Xpriv,
+	/// Counts VTXO key derivations so tests can assert recovery's scan budget.
+	#[cfg(test)]
+	vtxo_key_derivations: std::sync::atomic::AtomicUsize,
 }
 
 impl WalletSeed {
@@ -336,7 +360,12 @@ impl WalletSeed {
 		let vtxo = master.derive_priv(&SECP, &vtxo_path)
 			.expect("vtxo path is valid");
 
-		Self { master, vtxo }
+		Self {
+			master,
+			vtxo,
+			#[cfg(test)]
+			vtxo_key_derivations: std::sync::atomic::AtomicUsize::new(0),
+		}
 	}
 
 	/// Create a new [WalletSeed] from a given BIP-39 [Mnemonic]
@@ -349,7 +378,16 @@ impl WalletSeed {
 	}
 
 	fn derive_vtxo_keypair(&self, idx: u32) -> Keypair {
+		#[cfg(test)]
+		self.vtxo_key_derivations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		self.vtxo.derive_priv(&SECP, &[idx.into()]).unwrap().to_keypair(&SECP)
+	}
+
+	/// Number of VTXO key derivations performed so far, for tests asserting
+	/// how much key-space scanning a code path performs.
+	#[cfg(test)]
+	pub(crate) fn vtxo_key_derivation_count(&self) -> usize {
+		self.vtxo_key_derivations.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
 	fn to_mailbox_keypair(&self) -> Keypair {
@@ -601,6 +639,24 @@ struct WalletInner {
 #[derive(Clone)]
 pub struct Wallet {
 	inner: Arc<WalletInner>,
+}
+
+/// Create a fresh datadir and harden it owner-only (`0700`; no-op on
+/// non-unix platforms via [crate::fs_perms::harden]).
+///
+/// [Wallet::open] runs this before instantiating the platform-default lock
+/// manager: those managers lay down their pid lock file at construction, so
+/// creating and hardening here is the only point where a fresh datadir is
+/// guaranteed to be `0700` before anything lands in it.
+#[cfg(not(target_arch = "wasm32"))]
+async fn create_and_harden_datadir(datadir: &Path) -> anyhow::Result<()> {
+	tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
+		"failed to create datadir at {}", datadir.display(),
+	))?;
+	crate::fs_perms::harden(datadir, 0o700).with_context(|| format!(
+		"failed to harden datadir at {}", datadir.display(),
+	))?;
+	Ok(())
 }
 
 impl Wallet {
@@ -924,6 +980,7 @@ impl Wallet {
 			fingerprint: wallet_fingerprint,
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
+			recovery_incomplete: false,
 		};
 
 		// write the config to db
@@ -954,6 +1011,19 @@ impl Wallet {
 		}
 
 		let fingerprint = seed.fingerprint();
+
+		// Create and harden the datadir before the lock manager is
+		// instantiated: platform-default lock managers create the datadir
+		// and their pid lock file at construction, so this is the only
+		// point where a fresh datadir can be made owner-only before any
+		// file lands in it.
+		if let Some(ref datadir) = args.datadir {
+			#[cfg(not(target_arch = "wasm32"))]
+			if !datadir.exists() && args.create_if_not_exists {
+				create_and_harden_datadir(datadir).await?;
+			}
+		}
+
 		let lock_manager = if let Some(lm) = args.lock_manager {
 			lm
 		} else {
@@ -964,14 +1034,6 @@ impl Wallet {
 		let db = if let Some(db) = args.persister {
 			db
 		} else {
-			if let Some(ref datadir) = args.datadir {
-				#[cfg(not(target_arch = "wasm32"))]
-				if !datadir.exists() && args.create_if_not_exists {
-					tokio::fs::create_dir_all(datadir).await.with_context(|| format!(
-						"failed to create datadir at {}", datadir.display(),
-					))?;
-				}
-			}
 			crate::persist::platform_default(args.datadir.as_ref(), Some(fingerprint)).await
 				.context("failed to instantiate platform default persister")?
 		};
@@ -1048,7 +1110,14 @@ impl Wallet {
 		ret.inner.exit.load().await
 			.context("error loading exit system after opening wallet")?;
 
-		let recovery = if !created_now {
+		// A wallet restored from its seed needs a recovery scan on first open.
+		// So does any wallet whose last scan ended incomplete: the persisted
+		// `recovery_incomplete` marker makes the scan resumable across opens.
+		// Each run re-reads the mailbox from checkpoint 0, but candidates
+		// previous runs already processed are served from the wallet's own
+		// records, so successive runs spend the per-run candidate budget on the
+		// unprocessed tail until everything is accounted for.
+		let recovery = if !should_run_recovery(created_now, &properties) {
 			RecoveryStatus::NotRun
 		} else if args.skip_recovery {
 			info!("Seed-based wallet recovery explicitly skipped");
@@ -1059,10 +1128,16 @@ impl Wallet {
 			// funds may be missing — surface it loudly. Partial failures are
 			// logged inside the recovery call.
 			match ret.recover_from_mailbox().await {
-				Ok(report) => RecoveryStatus::Completed(report),
+				Ok(report) => {
+					// Persist the verdict so an incomplete run is resumed on the
+					// next open and a complete one stops re-running.
+					ret.record_recovery_verdict(report.is_complete()).await;
+					RecoveryStatus::Completed(report)
+				},
 				Err(e) => {
 					error!("VTXO recovery from the recovery mailbox failed; funds may be \
 						missing from this wallet until recovery succeeds: {:#}", e);
+					ret.record_recovery_verdict(false).await;
 					RecoveryStatus::Failed(e)
 				},
 			}
@@ -1854,7 +1929,11 @@ impl Wallet {
 					self.inner.db.get_full_vtxo(id).await?
 						.with_context(|| format!("vtxo with id {} not found", id))?
 				};
-				amount += vtxo.amount();
+				// The VTXO amounts were issued by the server: checked, never
+				// the panicking `+=`.
+				amount = amount.checked_add(vtxo.amount())
+					.filter(|a| *a <= Amount::MAX_MONEY)
+					.context("refresh input amounts exceed the money supply")?;
 				vtxos.push(vtxo);
 			}
 			(vtxos, amount)
@@ -2340,6 +2419,29 @@ mod tests {
 		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
 		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
 		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+	}
+
+	/// A datadir created on the [Wallet::open] path must be owner-only
+	/// before the lock manager lays down its LOCK file: manager
+	/// instantiation is when the pid lock file is created, so hardening
+	/// must happen first and the manager must not loosen the directory.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn datadir_created_owner_only_before_lock_manager() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let parent = tempfile::tempdir().unwrap();
+		let datadir = parent.path().join("wallet");
+
+		super::create_and_harden_datadir(&datadir).await.unwrap();
+
+		// Lock manager construction creates the LOCK file inside the
+		// already-protected directory and leaves the dir mode untouched.
+		let _locks = crate::lock_manager::platform_default(Some(&datadir), None).unwrap();
+
+		let mode = std::fs::metadata(&datadir).unwrap().permissions().mode();
+		assert_eq!(mode & 0o777, 0o700,
+			"fresh datadir must be owner-only, got {:o}", mode & 0o777);
 	}
 
 }

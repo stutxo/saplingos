@@ -126,8 +126,28 @@ pub struct ExitClaimInProgressState {
 	pub tip_height: BlockHeight,
 	pub claimable_since: BlockRef,
 	pub claim_txid: Txid,
+	/// The block the claim transaction was last seen confirmed in, once it has confirmed.
+	///
+	/// The exit only finishes (as `Claimed`) once this block is buried under
+	/// `SPEND_CONFIRMATIONS` blocks; until then a shallow reorg can still remove the claim,
+	/// in which case the exit falls back to `Claimable` to detect the spend again. Recording
+	/// the block also lets progression detect a reorg that re-confirmed the claim somewhere
+	/// else: the confirming block changed, so the depth count restarts.
+	///
+	/// `None` until the claim confirms, and for states persisted by versions that finished
+	/// the exit at the claim's first confirmation — serde defaults keep those rows loading.
+	#[serde(default)]
+	pub claim_block: Option<BlockRef>,
 }
 
+/// Terminal state: the claim transaction is buried under `SPEND_CONFIRMATIONS` blocks, deep
+/// enough that a reorg is not expected to undo it; the movement was finalized at that point
+/// and the exit is no longer tracked.
+///
+/// Exits stored as `Claimed` by versions before the depth gate existed may be shallower, but
+/// are deliberately still treated as final: their movement was already finished as
+/// `Successful` and their VTXO marked `Exited`, so there is no consistent state to regress
+/// them to. Reorg safety has to come from the gate before entry, not from undoing `Claimed`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExitClaimedState {
 	pub tip_height: BlockHeight,
@@ -215,5 +235,41 @@ impl Into<ExitState> for ExitVtxoSweptState {
 impl Into<ExitState> for ExitCanceledState {
 	fn into(self) -> ExitState {
 		ExitState::Canceled(self)
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	/// States persisted by versions that finished the exit at the claim's first
+	/// confirmation have no `claim_block`; they must still deserialize, as unconfirmed.
+	#[test]
+	fn claim_in_progress_without_claim_block_still_deserializes() {
+		let old = r#"{"type":"claim-in-progress","tip_height":134,
+			"claimable_since":"134:6585896bdda6f08d924bf45cc2b16418af56703b3c50930e4dccbc1728d3800a",
+			"claim_txid":"599347c35870bd36f7acb22b81f9ffa8b911d9b5e94834858aebd3ec09339f4c"}"#;
+		let ExitState::ClaimInProgress(state) = serde_json::from_str::<ExitState>(old).unwrap()
+		else {
+			panic!("old claim-in-progress blob must deserialize as ClaimInProgress");
+		};
+		assert_eq!(state.claim_block, None);
+	}
+
+	#[test]
+	fn claim_block_roundtrips_through_serde() {
+		let claimable_since = "134:6585896bdda6f08d924bf45cc2b16418af56703b3c50930e4dccbc1728d3800a"
+			.parse().unwrap();
+		let claim_block = "136:3cdd30fc942301a74666c481beb82050ccd182050aee3c92d2197e8cad427b8f"
+			.parse().unwrap();
+		let state = ExitClaimInProgressState {
+			tip_height: BlockHeight::new(136),
+			claimable_since,
+			claim_txid: "599347c35870bd36f7acb22b81f9ffa8b911d9b5e94834858aebd3ec09339f4c"
+				.parse().unwrap(),
+			claim_block: Some(claim_block),
+		};
+		let json = serde_json::to_string(&state).unwrap();
+		assert_eq!(serde_json::from_str::<ExitClaimInProgressState>(&json).unwrap(), state);
 	}
 }

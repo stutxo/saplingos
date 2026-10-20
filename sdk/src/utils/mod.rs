@@ -3,6 +3,8 @@ pub(crate) mod serde;
 
 use std::time::Duration;
 
+use anyhow::Context;
+use bitcoin::Amount;
 use log::trace;
 
 use ark::VtxoId;
@@ -113,6 +115,30 @@ where
 	wasm_bindgen_futures::spawn_local(fut)
 }
 
+/// Sum amounts of untrusted provenance (Ark server issued, mailbox received)
+/// without panicking, erroring when the sum would exceed the money supply.
+///
+/// `bitcoin::Amount`'s `Add` and `Sum` implementations panic on overflow
+/// (`checked_add(..).expect(..)`), and server-provided VTXO amounts are not
+/// universally bounded — a forged mailbox package can claim any `u64` value.
+/// Enough such amounts would turn every naive summation into a crash,
+/// crash-looping the daemon. An error is surfaced instead: no amount of
+/// forged data makes the wallet hold more than 21M BTC, so a sum past
+/// [Amount::MAX_MONEY] is necessarily corrupt.
+///
+/// The bound also keeps derived sums of a bounded number of `MAX_MONEY`
+/// results — like [crate::Balance::total] adding the balance fields —
+/// comfortably inside `u64`.
+pub(crate) fn checked_sum_amounts(
+	amounts: impl IntoIterator<Item = Amount>,
+) -> anyhow::Result<Amount> {
+	amounts.into_iter().try_fold(Amount::ZERO, |sum, amount| {
+		sum.checked_add(amount)
+			.filter(|sum| *sum <= Amount::MAX_MONEY)
+			.context("untrusted amounts exceed the 21M BTC money supply: forged or corrupt VTXOs")
+	})
+}
+
 /// Extract the input VTXO ids the server flagged as the reason it rejected a
 /// refresh round, by reading the `identifiers` metadata of a [tonic::Status] in
 /// the error chain.
@@ -138,6 +164,23 @@ mod test {
 
 	const VTXO_A: &str = "0000000000000000000000000000000000000000000000000000000000000001:0";
 	const VTXO_B: &str = "0000000000000000000000000000000000000000000000000000000000000002:1";
+
+	/// Repeated maximum-value amounts must error, never panic, however many
+	/// are summed: this is the forged-VTXO regression.
+	#[test]
+	fn checked_sum_amounts_over_max_money_errors() {
+		assert_eq!(checked_sum_amounts([Amount::MAX_MONEY]).unwrap(), Amount::MAX_MONEY);
+		assert_eq!(checked_sum_amounts([Amount::MAX_MONEY / 2, Amount::MAX_MONEY / 2]).unwrap(),
+			Amount::MAX_MONEY);
+
+		// One sat beyond the money supply errors.
+		checked_sum_amounts([Amount::MAX_MONEY, Amount::ONE_SAT]).unwrap_err();
+		// So do any number of repeated maximum-value amounts.
+		checked_sum_amounts([Amount::MAX_MONEY; 2]).unwrap_err();
+		checked_sum_amounts(std::iter::repeat(Amount::MAX_MONEY).take(9)).unwrap_err();
+		// And raw `u64` overflow errors too.
+		checked_sum_amounts([Amount::MAX, Amount::ONE_SAT]).unwrap_err();
+	}
 
 	#[test]
 	fn url_defaults_to_https() {

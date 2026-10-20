@@ -414,16 +414,23 @@ impl TryFrom<protos::RoundEvent> for ark::rounds::RoundEvent {
 				})
 			},
 			protos::round_event::Event::VtxoProposal(m) => {
+				let vtxos_spec = VtxoTreeSpec::deserialize(&m.vtxos_spec)
+					.map_err(|_| "invalid vtxos_spec")?;
+				let cosign_agg_nonces = m.vtxos_agg_nonces.into_iter().map(|n| {
+					musig::AggregatedNonce::from_bytes(&n)
+				}).collect::<Result<Vec<_>, _>>()?;
+				// the nonces are indexed by the tree's internal nodes when
+				// signing, so their number has to match the tree exactly
+				if cosign_agg_nonces.len() != vtxos_spec.nb_internal_nodes() {
+					return Err("invalid number of vtxo aggregate cosign nonces for tree".into());
+				}
 				ark::rounds::RoundEvent::VtxoProposal(ark::rounds::VtxoProposal {
 					round_seq: m.round_seq.into(),
 					attempt_seq: m.attempt_seq as usize,
 					unsigned_round_tx: bitcoin::consensus::deserialize(&m.unsigned_round_tx)
 						.map_err(|_| "invalid unsigned_round_tx")?,
-					vtxos_spec: VtxoTreeSpec::deserialize(&m.vtxos_spec)
-						.map_err(|_| "invalid vtxos_spec")?,
-					cosign_agg_nonces: m.vtxos_agg_nonces.into_iter().map(|n| {
-						musig::AggregatedNonce::from_bytes(&n)
-					}).collect::<Result<_, _>>()?,
+					vtxos_spec,
+					cosign_agg_nonces,
 				})
 			},
 			protos::round_event::Event::Finished(m) => {
@@ -770,6 +777,54 @@ mod test {
 	use std::str::FromStr;
 	use bitcoin::hex::FromHex;
 	use super::*;
+
+	#[test]
+	fn vtxo_proposal_rejects_mismatched_agg_nonce_count() {
+		// a 2-leaf VtxoTreeSpec (1 internal node) with both cosign pubkeys
+		// set, encoded with VtxoTreeSpec::serialize
+		let spec_hex = "02a0860100020646a2aa63736e90fe9bf24d217ed697674b1ab837efcbb8efd22bb5a28dd05ce00701020646a2aa63736e90fe9bf24d217ed697674b1ab837efcbb8efd22bb5a28dd05c0200020646a2aa63736e90fe9bf24d217ed697674b1ab837efcbb8efd22bb5a28dd05ca08601000000000002fbdcab5515f9a2e4d6ae82cdd02cba1213fde3d7aebcb13a73606b434903f2e3184c0ede118ec8cd31f699524bae48a81ed01ded5f8d08f2f4ff4286b33b027000020646a2aa63736e90fe9bf24d217ed697674b1ab837efcbb8efd22bb5a28dd05c50c300000000000002fbdcab5515f9a2e4d6ae82cdd02cba1213fde3d7aebcb13a73606b434903f2e3f871b58abef998adc7c9e9531fc027fab3b0f59e35b780da8ae2881d13f9ac2f";
+		let spec = VtxoTreeSpec::deserialize_hex(spec_hex).unwrap();
+		assert_eq!(spec.nb_internal_nodes(), 1);
+
+		let unsigned_round_tx = bitcoin::consensus::serialize(&bitcoin::Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![],
+			output: vec![],
+		});
+		let proposal = |agg_nonces| protos::RoundEvent {
+			event: Some(protos::round_event::Event::VtxoProposal(protos::VtxoProposal {
+				round_seq: 0,
+				attempt_seq: 0,
+				vtxos_spec: spec.serialize(),
+				unsigned_round_tx: unsigned_round_tx.clone(),
+				vtxos_agg_nonces: agg_nonces,
+			})),
+		};
+
+		// the tree has one internal node, but the server omitted the nonce
+		let err = ark::rounds::RoundEvent::try_from(proposal(vec![]))
+			.expect_err("truncated aggregate nonce list must be rejected");
+		assert!(err.to_string().contains("invalid number of vtxo aggregate cosign nonces"),
+			"unexpected error: {err}");
+
+		// two nonces for one internal node is just as wrong
+		let kp = bitcoin::key::Keypair::from_seckey_slice(&ark::SECP, &[42u8; 32]).unwrap();
+		let (_sec1, pub1) = musig::nonce_pair(&kp);
+		let (_sec2, pub2) = musig::nonce_pair(&kp);
+		let agg = musig::AggregatedNonce::new(&[&pub1, &pub2]);
+		assert!(ark::rounds::RoundEvent::try_from(
+			proposal(vec![agg.serialize().to_vec(), agg.serialize().to_vec()]),
+		).is_err(), "excess aggregate nonces must be rejected");
+
+		// control: exactly one nonce converts fine
+		let event = ark::rounds::RoundEvent::try_from(proposal(vec![agg.serialize().to_vec()]))
+			.expect("proposal with the correct nonce count");
+		match event {
+			ark::rounds::RoundEvent::VtxoProposal(p) => assert_eq!(p.cosign_agg_nonces.len(), 1),
+			e => panic!("unexpected event: {e:?}"),
+		}
+	}
 
 	#[test]
 	fn test_preimage_bytes() {

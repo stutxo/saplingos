@@ -25,7 +25,7 @@ use ark::vtxo::policy::signing::VtxoSigner;
 use ark::VtxoId;
 
 use crate::Wallet;
-use crate::exit::{Exit, ExitError};
+use crate::exit::{Exit, ExitError, checked_fee_at_rate, validate_exit_fee_rate};
 use crate::sapio::recovery::{verify_program_recovery, verify_program_recovery_template};
 
 /// The default safety margin applied to the exit-broadcast fee estimate.
@@ -112,6 +112,10 @@ impl Exit {
 				wallet.chain().fee_rates().await.regular,
 			),
 		};
+		// Chain-backend rates are clamped at ingestion, but overrides are not; keep the
+		// `bark-bitcoin-ext` package-fee multiplication below out of u64 overflow range.
+		let broadcast_fee_rate = validate_exit_fee_rate(broadcast_fee_rate)?;
+		let claim_fee_rate = validate_exit_fee_rate(claim_fee_rate)?;
 
 		// Resolve each VTXO into the exit transactions that still need broadcasting (already-
 		// confirmed ones cost nothing) plus the full VTXOs we'll drain.
@@ -193,7 +197,9 @@ impl Exit {
 				if wallet.chain().tx_confirmed(record.claim.compute_txid()).await
 					.map_err(|e| ExitError::InternalError { error: e.to_string() })?.is_none()
 				{
-					let fee = fee_rate * (record.claim.weight() + canonical_cpfp_child_weight());
+					let fee = checked_fee_at_rate(
+						fee_rate, record.claim.weight() + canonical_cpfp_child_weight(),
+					)?;
 					program_fee = program_fee.checked_add(fee)
 						.filter(|fee| *fee <= Amount::MAX_MONEY)
 						.ok_or_else(|| ExitError::InternalError { error: "program claim fee overflow".into() })?;
@@ -202,7 +208,13 @@ impl Exit {
 			}
 			let clause = wallet.find_signable_clause(vtxo).await
 				.ok_or(ExitError::ClaimMissingSignableClause { vtxo: vtxo.id() })?;
-			output_amount += vtxo.amount();
+			// The exited VTXO amounts were issued by the server: checked, like
+			// the fee sums below, never the panicking `Add`.
+			output_amount = output_amount.checked_add(vtxo.amount())
+				.filter(|sum| *sum <= Amount::MAX_MONEY)
+				.ok_or_else(|| ExitError::InternalError {
+					error: "claim output amount exceeds the money supply".into(),
+				})?;
 			witness_bytes += clause.witness_size(vtxo) as u64;
 			tx_ins.push(TxIn {
 				previous_output: vtxo.point(),
@@ -233,7 +245,7 @@ impl Exit {
 		// The empty transaction witnesses omit the two-byte marker/flag. Clause sizes
 		// already include each witness's item count and compact-size prefixes.
 		let weight = tx.weight() + Weight::from_wu(2 + witness_bytes);
-		(fee_rate * weight).checked_add(program_fee)
+		checked_fee_at_rate(fee_rate, weight)?.checked_add(program_fee)
 			.filter(|fee| *fee <= Amount::MAX_MONEY)
 			.ok_or_else(|| ExitError::InternalError { error: "claim fee overflow".into() })
 	}
@@ -274,5 +286,20 @@ mod test {
 		let w = canonical_cpfp_child_weight();
 		assert!(w > Weight::from_vb_unchecked(90), "child weight too small: {}", w);
 		assert!(w < Weight::from_vb_unchecked(200), "child weight too large: {}", w);
+	}
+
+	#[test]
+	fn ceiling_rate_keeps_pinned_package_fee_multiplication_in_range() {
+		// estimate.rs must bound every fee rate *before* handing it to the pinned
+		// `bark-bitcoin-ext` helpers (which we cannot change and which multiply plainly).
+		// At the ingestion ceiling even a block-sized parent stays representable, proving
+		// the validated-rate requirement makes `package_fee` panic-/wrap-free downstream.
+		use crate::onchain::MakeCpfpFees;
+		let ceiling = crate::chain::MAX_PLAUSIBLE_FEE_RATE;
+		let parent_weight = Weight::from_wu(4_000_000);
+		let fees = MakeCpfpFees::Effective(ceiling);
+		let fee = fees.package_fee(parent_weight, canonical_cpfp_child_weight());
+		let package_weight = parent_weight + canonical_cpfp_child_weight();
+		assert_eq!(fee, ceiling.checked_mul_by_weight(package_weight).unwrap());
 	}
 }

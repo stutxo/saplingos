@@ -50,18 +50,53 @@ pub struct SqliteClient {
 	connection_string: PathBuf,
 }
 
+/// Pre-create a missing db file owner-only.
+///
+/// The db holds wallet state (movements, vtxos, unrevealed lightning
+/// preimages) and SQLite applies `0666 & ~umask` to files it creates itself,
+/// so the file must exist with restricted mode before SQLite ever opens it.
+/// A pre-existing file is left untouched: [crate::fs_perms::warn_if_loose]
+/// nudges rather than overriding a deliberate setup. Rollback-journal
+/// sidecars (this codebase never enables WAL) inherit the db file's mode.
+#[cfg(unix)]
+fn create_owner_only_if_missing(path: &Path) -> anyhow::Result<()> {
+	use std::os::unix::fs::OpenOptionsExt;
+
+	// In-memory and URI connection strings are not filesystem paths here.
+	let Some(name) = path.as_os_str().to_str() else {
+		return Ok(());
+	};
+	if name == ":memory:" || name.starts_with("file:") || path.exists() {
+		return Ok(());
+	}
+
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create_new(true).mode(0o600);
+	match options.open(path) {
+		Ok(_) => Ok(()),
+		// Another process won the creation race; SQLite opens the file.
+		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+		Err(e) => Err(e),
+	}.with_context(|| format!("failed to create database {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_if_missing(_path: &Path) -> anyhow::Result<()> {
+	Ok(())
+}
+
 impl SqliteClient {
 	/// Open a new [SqliteClient] with the given file path
 	pub fn open(db_file: impl AsRef<Path>) -> anyhow::Result<SqliteClient> {
 		let path = db_file.as_ref().to_path_buf();
 
 		debug!("Opening database at {}", path.display());
+		create_owner_only_if_missing(&path)?;
 		let mut conn = rusqlite::Connection::open(&path)
 			.with_context(|| format!("Error connecting to database {}", path.display()))?;
 
-		// The db holds wallet state. New wallets are hardened at creation; for
-		// older or externally-created dbs we only warn rather than chmod on
-		// every open, which would override a deliberate setup.
+		// Defense in depth for older or externally-created dbs: warn rather
+		// than chmod on every open, which would override a deliberate setup.
 		crate::fs_perms::warn_if_loose(&path, 0o600);
 
 		let migrations = migrations::MigrationContext::new();
@@ -115,6 +150,12 @@ impl WalletPersister for SqliteClient {
 	async fn set_server_mailbox_pubkey(&self, server_mailbox_pubkey: PublicKey) -> anyhow::Result<()> {
 		let conn = self.connect()?;
 		query::set_server_mailbox_pubkey(&conn, &server_mailbox_pubkey)?;
+		Ok(())
+	}
+
+	async fn set_recovery_incomplete(&self, incomplete: bool) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		query::set_recovery_incomplete(&conn, incomplete)?;
 		Ok(())
 	}
 
@@ -765,10 +806,13 @@ mod test {
 		db.store_vtxo_key(0, ordinary_key).await.unwrap();
 		// Removing the additive program tables and their version markers
 		// reconstructs the schema immediately before program persistence.
+		// The recovery_incomplete column is additive too, so it must go for
+		// its migration to replay cleanly.
 		db.connect().unwrap().execute_batch(
 			"DROP TABLE bark_program_key;
 			DROP TABLE bark_program_recovery;
 			DROP TABLE bark_program_recovery_reservation;
+			ALTER TABLE bark_properties DROP COLUMN recovery_incomplete;
 			DELETE FROM migrations WHERE value >= 43;"
 		).unwrap();
 		drop(db);
@@ -907,7 +951,8 @@ mod test {
 		// migrate forward before taking over. The new table is purely additive.
 		db.connect().unwrap().execute_batch(
 			"DROP TABLE bark_program_recovery_reservation;
-			DELETE FROM migrations WHERE value = 44;"
+			ALTER TABLE bark_properties DROP COLUMN recovery_incomplete;
+			DELETE FROM migrations WHERE value >= 44;"
 		).unwrap();
 		drop(db);
 		let db = SqliteClient::open(&path).unwrap();
@@ -1080,5 +1125,55 @@ mod test {
 		assert!(db.get_wallet_vtxo(successor.id()).await.unwrap().is_none());
 		db.store_vtxos(&[(successor, &VtxoState::Exited)]).await.unwrap();
 		assert_eq!(db.get_wallet_vtxo(successor.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+	}
+
+	/// A freshly created wallet db must be owner-only even under the
+	/// widespread default umask 022, under which SQLite alone would apply
+	/// 0644.
+	#[cfg(unix)]
+	#[test]
+	fn fresh_db_file_is_owner_only() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("wallet.sqlite");
+
+		// umask is process-global state shared with parallel tests; change
+		// it only around the creation.
+		let previous = unsafe { libc::umask(0o022) };
+		let db = SqliteClient::open(&path).unwrap();
+		unsafe { libc::umask(previous) };
+
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+		assert_eq!(mode & 0o777, 0o600,
+			"fresh wallet db must be owner-only, got {:o}", mode & 0o777);
+
+		// The pre-created file must behave like a normal database.
+		let one: i64 = db.connect().unwrap()
+			.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+		assert_eq!(one, 1);
+	}
+
+	/// A pre-existing loose db keeps working and keeps its mode:
+	/// [crate::fs_perms::warn_if_loose] only nudges and must never silently
+	/// re-chmod a deliberate setup.
+	#[cfg(unix)]
+	#[test]
+	fn existing_world_readable_db_still_opens_and_keeps_its_mode() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let directory = tempfile::tempdir().unwrap();
+		let path = directory.path().join("wallet.sqlite");
+		std::fs::write(&path, b"").unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+		let db = SqliteClient::open(&path).unwrap();
+		let one: i64 = db.connect().unwrap()
+			.query_row("SELECT 1", [], |r| r.get(0)).unwrap();
+		assert_eq!(one, 1);
+
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+		assert_eq!(mode & 0o777, 0o644,
+			"opening must not override an existing file's mode, got {:o}", mode & 0o777);
 	}
 }

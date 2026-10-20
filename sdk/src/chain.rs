@@ -47,6 +47,42 @@ const TIP_CACHE_TTL: Duration = Duration::from_secs(1);
 /// than this buys nothing while costing one HTTP round trip per sync tick.
 const FEE_RATES_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Sanity ceiling for fee rates accepted from a configured chain backend:
+/// 1,000,000 sat/kwu, i.e. 4,000 sat/vB — far above any historically observed
+/// block-space rate, so clamping can only ever misfire on data that lies.
+///
+/// Chain backends (esplora servers, bitcoind RPC endpoints) are remote principals whose
+/// responses cannot be verified, yet their estimates flow into `FeeRate * Weight` u64
+/// arithmetic across the exit/claim/CPFP paths — including inside the pinned
+/// `bark-bitcoin-ext` helpers, which we cannot change. An esplora `/fee-estimates`
+/// response can carry up to ~2^64 sat/kwu (bitcoind `estimatesmartfee` up to
+/// [Amount::MAX_MONEY] sat/kvB); values above ~2^54 sat/kwu already overflow the product
+/// at ordinary transaction weights, panicking under this workspace's `overflow-checks =
+/// true` or silently wrapping the computed fee to near zero under a stock release
+/// profile. Rates above this ceiling do not describe a market, so they are clamped at
+/// ingestion.
+pub(crate) const MAX_PLAUSIBLE_FEE_RATE: FeeRate = FeeRate::from_sat_per_kwu(1_000_000);
+
+/// Clamps a chain-backend fee estimate to [MAX_PLAUSIBLE_FEE_RATE], logging the lie.
+fn clamp_backend_fee_rate(rate: FeeRate) -> FeeRate {
+	if rate > MAX_PLAUSIBLE_FEE_RATE {
+		warn!("Chain backend fee estimate {} exceeds the sanity ceiling of {}; clamping",
+			rate, MAX_PLAUSIBLE_FEE_RATE);
+		MAX_PLAUSIBLE_FEE_RATE
+	} else {
+		rate
+	}
+}
+
+/// Initial fee tiers used until the first successful backend fetch. Operator-configured
+/// fallbacks are clamped to the same ceiling as backend data: once seeded they feed the
+/// exact same exit/claim/CPFP multiplications, so an absurd configured rate would be just
+/// as able to panic or wrap the pinned fee builders' u64 arithmetic.
+fn clamped_fee_tiers(fallback_fee: Option<FeeRate>) -> FeeRates {
+	let fee = clamp_backend_fee_rate(fallback_fee.unwrap_or(FeeRate::BROADCAST_MIN));
+	FeeRates { fast: fee, regular: fee, slow: fee }
+}
+
 #[cfg(feature = "bitcoind-rpc")]
 const MIN_BITCOIND_VERSION: usize = 290000;
 
@@ -62,6 +98,8 @@ const MIN_BITCOIND_VERSION: usize = 290000;
 /// Notes:
 /// - For [ChainSourceSpec::Bitcoind], authentication must be provided (cookie file or user/pass)
 ///   and the node must run with `txindex=1`.
+/// - [ChainSourceSpec::Bitcoind] does not support the SOCKS5 proxy option; [ChainSource::new]
+///   fails closed when a proxy is supplied rather than silently bypassing it.
 #[derive(Clone, Debug)]
 pub enum ChainSourceSpec {
 	Bitcoind {
@@ -155,8 +193,10 @@ impl ChainSourceClient {
 /// };
 /// let network = Network::Bitcoin;
 /// let fallback_fee = FeeRate::from_sat_per_vb(5);
+/// // The bitcoind backend has no proxy support and fails closed when one is
+/// // supplied; only the Esplora backend honours `socks5-proxy`.
 /// #[cfg(feature = "socks5-proxy")]
-/// let socks5 = Some("socks5h://127.0.0.1:9050");
+/// let socks5 = None;
 ///
 /// let instance = ChainSource::new(
 ///     spec, network, fallback_fee,
@@ -273,15 +313,23 @@ impl ChainSource {
 		let (inner, zmq_endpoint) = match spec {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceSpec::Bitcoind { url, auth, zmq } => {
+				// Neither the sync companion (`bitcoincore_rpc`) nor
+				// `bitcoind-async-client` can route through a SOCKS5 proxy, so
+				// we fail closed: silently bypassing a configured proxy would
+				// deanonymize the operator. The Esplora backend does honour
+				// `socks5-proxy`.
+				#[cfg(feature = "socks5-proxy")]
+				if proxy.is_some() {
+					bail!(
+						"the bitcoind backend does not support SOCKS5 proxies; refusing to \
+						 start with a proxy configured rather than silently bypassing it"
+					);
+				}
 				// `bdk_bitcoind_rpc::Emitter` is sync-only upstream, so we keep
 				// a sync companion to drive it inside `spawn_blocking`. The async
 				// client is used everywhere else. `BitcoinRpcClient` (rather
 				// than the bare `bitcoincore_rpc::Client`) is required so the
 				// `spawn_blocking` closure can take an owned, `Clone` value.
-				//
-				// The sync companion currently does not honour `socks5-proxy`;
-				// SOCKS5 is supported on the Esplora backend, where it is the
-				// realistic Tor-via-bitcoind use case.
 				let sync = BitcoinRpcClient::new(&url, auth.clone())
 					.context("failed to create sync bitcoind rpc client")?;
 				let async_auth = match auth {
@@ -320,8 +368,7 @@ impl ChainSource {
 
 		inner.check_network(network).await?;
 
-		let fee = fallback_fee.unwrap_or(FeeRate::BROADCAST_MIN);
-		let fee_rates = RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee });
+		let fee_rates = RwLock::new(clamped_fee_tiers(fallback_fee));
 
 		Ok(Self {
 			inner,
@@ -334,7 +381,9 @@ impl ChainSource {
 	}
 
 	async fn fetch_fee_rates(&self) -> anyhow::Result<FeeRates> {
-		match self.inner() {
+		// Backend responses are unverified — clamp absurd estimates at the ingestion
+		// boundary so downstream `FeeRate * Weight` arithmetic cannot panic or wrap.
+		let rates: FeeRates = match self.inner() {
 			#[cfg(feature = "bitcoind-rpc")]
 			ChainSourceClient::Bitcoind { rpc, .. } => {
 				let get_fee_rate = async |target: u16| -> anyhow::Result<FeeRate> {
@@ -352,16 +401,20 @@ impl ChainSource {
 						Err(anyhow!("No rate returned from estimate_smart_fee for a {} confirmation target", target))
 					}
 				};
-				Ok(FeeRates {
+				// A missing rate for any tier (routine on fresh or low-traffic
+				// nodes) propagates and lets `update_fee_rates` apply the
+				// configured fallback; panicking here would crash-loop the
+				// daemon sync task and bypass the fallback contract.
+				Ok::<FeeRates, anyhow::Error>(FeeRates {
 					fast: get_fee_rate(FEE_RATE_TARGET_CONF_FAST).await?,
-					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR).await.expect("should exist"),
-					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW).await.expect("should exist"),
+					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR).await?,
+					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW).await?,
 				})
 			},
 			ChainSourceClient::Esplora(client) => {
 				// The API should return rates for targets 1-25, 144 and 1008
 				let estimates = client.get_fee_estimates().await?;
-				let get_fee_rate = |target| {
+				let get_fee_rate = |target: u16| -> anyhow::Result<FeeRate> {
 					let fee = estimates.get(&target).with_context(||
 						format!("No rate returned from get_fee_estimates for a {} confirmation target", target)
 					)?;
@@ -369,13 +422,18 @@ impl ChainSource {
 						format!("Invalid rate returned from get_fee_estimates {} for a {} confirmation target", fee, target)
 					)
 				};
-				Ok(FeeRates {
+				Ok::<FeeRates, anyhow::Error>(FeeRates {
 					fast: get_fee_rate(FEE_RATE_TARGET_CONF_FAST)?,
 					regular: get_fee_rate(FEE_RATE_TARGET_CONF_REGULAR)?,
 					slow: get_fee_rate(FEE_RATE_TARGET_CONF_SLOW)?,
 				})
 			}
-		}
+		}?;
+		Ok(FeeRates {
+			fast: clamp_backend_fee_rate(rates.fast),
+			regular: clamp_backend_fee_rate(rates.regular),
+			slow: clamp_backend_fee_rate(rates.slow),
+		})
 	}
 
 	/// The ZMQ endpoint of the bitcoind backend, if one was configured.
@@ -498,9 +556,7 @@ impl ChainSource {
 				let entry: rpc::json::GetMempoolEntryResult = rpc.call_raw(
 					"getmempoolentry", &[serde_json::to_value(txid).expect("serializable")],
 				).await?;
-				let (fee, weight) = parse_mempool_entry_package(&entry)?;
-				result.total_fee = fee;
-				result.total_weight = weight;
+				result = ancestor_info_from_mempool_entry(txid, entry)?;
 			},
 			ChainSourceClient::Esplora(client) => {
 				// We should first verify the transaction is in the mempool to maintain the same
@@ -537,10 +593,13 @@ impl ChainSource {
 					set = next_set;
 				}
 				// Calculate the total weight and fee of the unconfirmed ancestry
-				for info in info_map.into_values().filter(|info| !info.status.confirmed) {
-					result.total_fee += info.fee();
-					result.total_weight += info.weight();
-				}
+				let (fee, weight) = checked_ancestor_sums(
+					info_map.into_values()
+						.filter(|info| !info.status.confirmed)
+						.map(|info| (info.fee(), info.weight())),
+				)?;
+				result.total_fee = fee;
+				result.total_weight = weight;
 			},
 		}
 		// Now calculate the effective fee rate of the package
@@ -635,18 +694,28 @@ impl ChainSource {
 
 					if let Some(output_status) = output_status {
 						if output_status.spent {
+							// The backend is untrusted: a `spent` record that
+							// lacks the fields needed to conclude must be an
+							// error, not a panic.
+							let missing = |field| anyhow!(
+								"esplora outspend for {}:{} claims spent but carries no {}",
+								outpoint.txid, outpoint.vout, field,
+							);
 							let tx_status = {
-								let status = output_status.status.expect("Status should be valid if an outpoint is spent");
+								let status = output_status.status
+									.ok_or_else(|| missing("status"))?;
 								if status.confirmed {
 									TxStatus::Confirmed(BlockRef {
-										height: status.block_height.expect("Confirmed transaction missing block_height").into(),
-										hash: status.block_hash.expect("Confirmed transaction missing block_hash"),
+										height: status.block_height
+											.ok_or_else(|| missing("block_height"))?.into(),
+										hash: status.block_hash
+											.ok_or_else(|| missing("block_hash"))?,
 									})
 								} else {
 									TxStatus::Mempool
 								}
 							};
-							let txid = output_status.txid.expect("Txid should be valid if an outpoint is spent");
+							let txid = output_status.txid.ok_or_else(|| missing("txid"))?;
 							res.add(outpoint, txid, tx_status);
 						}
 					}
@@ -829,11 +898,13 @@ impl ChainSource {
 			(Ok(fee_rates), _) => (fee_rates, false),
 			(Err(e), None) => return Err(e),
 			(Err(e), Some(fallback)) => {
+				// A configured fallback bypasses fetch_fee_rates — clamp it here too.
+				let fallback = clamp_backend_fee_rate(fallback);
 				warn!("Error getting fee rates, falling back to {} sat/kvB: {}",
 					fallback.to_btc_per_kvb(), e,
 				);
 				(FeeRates { fast: fallback, regular: fallback, slow: fallback }, true)
-			}
+			},
 		};
 
 		*self.fee_rates.write().await = fee_rates;
@@ -856,6 +927,24 @@ impl TipSource for ChainSource {
 }
 
 // ----- bitcoind-rpc feature-gated helpers ---------------------------------
+
+/// Map a bitcoind `getmempoolentry` result onto [MempoolAncestorInfo].
+///
+/// Bitcoin Core reports `ancestorsize`/`ancestorfees` INCLUDING the
+/// transaction itself — exactly [MempoolAncestorInfo]'s "transaction and all
+/// of its unconfirmed ancestors" semantics — so the transaction's own weight
+/// must not be added on top of `ancestor_size`. Doing so double-counts it and
+/// understates the package fee rate, triggering spurious CPFP RBF bumps.
+#[cfg(feature = "bitcoind-rpc")]
+fn ancestor_info_from_mempool_entry(
+	txid: Txid, entry: rpc::json::GetMempoolEntryResult,
+) -> anyhow::Result<MempoolAncestorInfo> {
+	let mut result = MempoolAncestorInfo::new(txid);
+	result.total_fee = entry.fees.ancestor;
+	result.total_weight = Weight::from_vb(entry.ancestor_size).ok_or_else(||
+		anyhow!("invalid ancestorsize {} from getmempoolentry", entry.ancestor_size))?;
+	Ok(result)
+}
 
 /// Inspect upstream `bitcoind-async-client` JSON-RPC errors for the
 /// "transaction not found" code. Mirrors the sync-side `BitcoinRpcErrorExt`
@@ -914,28 +1003,25 @@ pub struct FeeRates {
 	pub slow: FeeRate,
 }
 
-/// Map a `getmempoolentry` response onto the package's total fee and
-/// weight.
+/// Sum the fees and weights of an unconfirmed mempool ancestry as reported
+/// by an Esplora server, erroring rather than panicking when the reported
+/// values cannot represent reality.
 ///
-/// The node response is untrusted input: doctored entries with
-/// near-`u64::MAX` weight values must produce an error here instead of
-/// panicking on (or wrapping) the overflowing sum of the transaction's
-/// weight and its ancestors'.
-#[cfg(feature = "bitcoind-rpc")]
-fn parse_mempool_entry_package(
-	entry: &rpc::json::GetMempoolEntryResult,
+/// The Esplora server's answers are trusted by the caller, but `Amount`'s
+/// (and `Weight`'s) `Add` panic on overflow, so hostile or corrupt fee
+/// reports would crash the wallet. Fees past the money supply are
+/// necessarily corrupt and error instead.
+fn checked_ancestor_sums(
+	ancestry: impl IntoIterator<Item = (Amount, Weight)>,
 ) -> anyhow::Result<(Amount, Weight)> {
-	let missing = || anyhow!("missing weight parameter from getmempoolentry");
-	let tx_weight = Weight::from_wu(entry.weight.ok_or_else(missing)?);
-	let ancestors = Weight::from_vb(entry.ancestor_size)
-		.ok_or_else(|| anyhow!(
-			"ancestor vsize {} from getmempoolentry does not fit in a weight",
-			entry.ancestor_size,
-		))?;
-	let total_weight = tx_weight.to_wu().checked_add(ancestors.to_wu())
-		.map(Weight::from_wu)
-		.ok_or_else(|| anyhow!("package weight from getmempoolentry overflows u64"))?;
-	Ok((entry.fees.ancestor, total_weight))
+	ancestry.into_iter().try_fold((Amount::ZERO, Weight::ZERO), |(fee, weight), (f, w)| {
+		let fee = fee.checked_add(f)
+			.filter(|f| *f <= Amount::MAX_MONEY)
+			.context("mempool ancestor fees exceed the money supply")?;
+		let weight = weight.checked_add(w)
+			.context("mempool ancestor weight overflow")?;
+		Ok((fee, weight))
+	})
 }
 
 /// Contains the fee information for an unconfirmed transaction found in the mempool.
@@ -1091,61 +1177,186 @@ mod test {
 	use super::*;
 	use std::str::FromStr;
 
-	/// `getmempoolentry` responses are untrusted node input: a response
-	/// carrying near-`u64::MAX` weight values must produce an error from
-	/// the package mapping, not a panic or a wrapped total.
-	#[cfg(feature = "bitcoind-rpc")]
-	mod bitcoind_mempool_entry {
-		use bitcoin::hashes::Hash as _;
+	/// Hostile Esplora fee reports must error, never panic the wallet.
+	#[test]
+	fn esplora_ancestor_fee_overflow_errors() {
+		let wu = Weight::from_wu(1000);
+		assert_eq!(
+			checked_ancestor_sums([
+				(Amount::MAX_MONEY, wu), (Amount::from_sat(500), wu),
+			]).unwrap_err().to_string(),
+			"mempool ancestor fees exceed the money supply",
+		);
+		// Raw u64 overflow errors as well.
+		checked_ancestor_sums([
+			(Amount::MAX, wu), (Amount::ONE_SAT, wu),
+		]).unwrap_err();
+		// Weight overflow errors too.
+		checked_ancestor_sums([
+			(Amount::ONE_SAT, Weight::MAX), (Amount::ONE_SAT, Weight::from_wu(1)),
+		]).unwrap_err();
+		// Reporting within bounds is accepted verbatim.
+		assert_eq!(
+			checked_ancestor_sums([
+				(Amount::from_sat(250), Weight::from_wu(900)),
+				(Amount::from_sat(251), Weight::from_wu(100)),
+			]).unwrap(),
+			(Amount::from_sat(501), Weight::from_wu(1000)),
+		);
+	}
 
-		use super::*;
+	#[test]
+	fn clamp_backend_fee_rate_caps_esplora_max_payload() {
+		// The largest value an esplora `/fee-estimates` payload can smuggle past
+		// `FeeRateExt::from_sat_per_vb_decimal_checked_ceil` (e.g. `{"1": 7.2e13}` sat/vB)
+		// is 2^54 sat/kwu — a value whose plain u64 product with ordinary weights overflows.
+		let absurd = FeeRate::from_sat_per_kwu(1 << 54);
+		assert!(absurd > MAX_PLAUSIBLE_FEE_RATE);
+		// Sanity: the raw hunter reproduction value does explode the naive multiplication.
+		assert!(absurd.checked_mul_by_weight(Weight::from_wu(2_048)).is_none());
+		assert_eq!(clamp_backend_fee_rate(absurd), MAX_PLAUSIBLE_FEE_RATE);
+	}
 
-		fn entry(weight: Option<u64>, ancestor_size: u64) -> rpc::json::GetMempoolEntryResult {
-			rpc::json::GetMempoolEntryResult {
-				vsize: 200,
-				weight,
-				time: 0,
-				height: 0,
-				descendant_count: 1,
-				descendant_size: 200,
-				ancestor_count: 2,
-				ancestor_size,
-				wtxid: Txid::all_zeros(),
-				fees: rpc::json::GetMempoolEntryResultFees {
-					base: Amount::from_sat(500),
-					modified: Amount::from_sat(500),
-					ancestor: Amount::from_sat(1_000),
-					descendant: Amount::from_sat(1_000),
-				},
-				depends: Vec::new(),
-				spent_by: Vec::new(),
-				bip125_replaceable: false,
-				unbroadcast: None,
-			}
-		}
+	#[test]
+	fn clamp_backend_fee_rate_caps_bitcoind_max_payload() {
+		// `estimatesmartfee` can return up to MAX_MONEY sat per kvB.
+		let max = FeeRate::from_amount_per_kvb_ceil(Amount::MAX_MONEY);
+		assert!(max > MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(clamp_backend_fee_rate(max), MAX_PLAUSIBLE_FEE_RATE);
+	}
 
-		#[test]
-		fn sane_values_map_correctly() {
-			let entry = entry(Some(800), 400);
-			let (fee, weight) = parse_mempool_entry_package(&entry).unwrap();
-			assert_eq!(fee, Amount::from_sat(1_000));
-			// 400 vbytes of ancestors are 1600 wu.
-			assert_eq!(weight, Weight::from_wu(800 + 1600));
-		}
-
-		#[test]
-		fn extreme_values_error_instead_of_wrapping() {
-			// Tx weight near the ceiling plus 400 vb (1600 wu) of ancestors
-			// overflows the sum.
-			assert!(parse_mempool_entry_package(&entry(Some(u64::MAX - 100), 400)).is_err());
-			// An ancestor vsize that does not even fit as a weight errors as well.
-			assert!(parse_mempool_entry_package(&entry(Some(800), u64::MAX)).is_err());
-			// Missing weight keeps its dedicated error.
-			let err = parse_mempool_entry_package(&entry(None, 400)).unwrap_err();
-			assert!(err.to_string().contains("missing weight"), "{err:#}");
+	#[test]
+	fn clamp_backend_fee_rate_passes_through_sane_rates() {
+		for sat_per_kwu in [0, 250 /* 1 sat/vB */, 125_000 /* 500 sat/vB */] {
+			let rate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+			assert_eq!(clamp_backend_fee_rate(rate), rate);
 		}
 	}
 
+	#[test]
+	fn clamped_rate_stays_multipliable_at_realistic_weights() {
+		// A clamped rate must never overflow, even against a full 4M-WU block's worth
+		// of package weight; genuinely absurd weights are rejected by the checked
+		// multiplication at the sinks instead of panicking or wrapping.
+		let block = Weight::from_wu(4_000_000);
+		assert!(MAX_PLAUSIBLE_FEE_RATE.checked_mul_by_weight(block).is_some());
+		assert!(MAX_PLAUSIBLE_FEE_RATE.checked_mul_by_weight(Weight::MAX).is_none());
+	}
+
+	#[test]
+	fn clamped_fee_tiers_reject_absurd_configured_fallbacks() {
+		// A misconfigured operator fallback goes straight into the fee tiers without
+		// touching fetch_fee_rates, so it must be clamped at seeding too.
+		let absurd = FeeRate::from_sat_per_kwu(1 << 54);
+		let tiers = clamped_fee_tiers(Some(absurd));
+		assert_eq!(tiers, FeeRates {
+			fast: MAX_PLAUSIBLE_FEE_RATE,
+			regular: MAX_PLAUSIBLE_FEE_RATE,
+			slow: MAX_PLAUSIBLE_FEE_RATE,
+		});
+		let sane = FeeRate::from_sat_per_vb_unchecked(50);
+		assert_eq!(clamped_fee_tiers(Some(sane)), FeeRates { fast: sane, regular: sane, slow: sane });
+		assert_eq!(clamped_fee_tiers(None), FeeRates {
+			fast: FeeRate::BROADCAST_MIN,
+			regular: FeeRate::BROADCAST_MIN,
+			slow: FeeRate::BROADCAST_MIN,
+		});
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn update_fee_rates_clamps_absurd_configured_fallback() {
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		// The backend fails every fetch; the wallet must fall back without propagating
+		// an operator's absurd configured rate into exit fee math.
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let server = tokio::spawn(async move {
+			loop {
+				let (mut socket, _) = listener.accept().await.unwrap();
+				let mut lines = BufReader::new(&mut socket);
+				let mut line = String::new();
+				loop {
+					line.clear();
+					if lines.read_line(&mut line).await.unwrap() == 0
+						|| line == "\r\n"
+					{
+						break;
+					}
+				}
+				socket.write_all(
+					b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+				).await.unwrap();
+			}
+		});
+		let source = ChainSource {
+			inner: ChainSourceClient::Esplora(
+				esplora_client::Builder::new(&url).max_retries(0).timeout(5).build_async().unwrap(),
+			),
+			network: Network::Bitcoin,
+			zmq_endpoint: None,
+			fee_rates: RwLock::new(clamped_fee_tiers(None)),
+			fee_rates_fetched_at: RwLock::new(None),
+			tip_cache: RwLock::new(None),
+		};
+		source.update_fee_rates(Some(FeeRate::from_sat_per_kwu(1 << 54))).await.unwrap();
+		let rates = source.fee_rates().await;
+		assert_eq!(rates.fast, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.regular, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.slow, MAX_PLAUSIBLE_FEE_RATE);
+		server.abort();
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	#[tokio::test]
+	async fn fetch_fee_rates_clamps_absurd_esplora_estimates() {
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let server = tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			let mut lines = BufReader::new(&mut socket);
+			let mut line = String::new();
+			lines.read_line(&mut line).await.unwrap();
+			assert!(line.starts_with("GET /fee-estimates "), "unexpected request: {}", line);
+			loop {
+				line.clear();
+				assert_ne!(lines.read_line(&mut line).await.unwrap(), 0);
+				if line == "\r\n" { break; }
+			}
+			// The hunter payload: ~7.2e13 sat/vB, admitted by the ext parser as 2^54 sat/kwu.
+			let body = r#"{"1": 7.205759403792793e13, "3": 7.205759403792793e13, "6": 7.205759403792793e13}"#;
+			let response = format!(
+				"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+				body.len(), body,
+			);
+			socket.write_all(response.as_bytes()).await.unwrap();
+		});
+
+		let source = ChainSource {
+			inner: ChainSourceClient::Esplora(
+				esplora_client::Builder::new(&url).max_retries(0).timeout(5).build_async().unwrap(),
+			),
+			network: Network::Bitcoin,
+			zmq_endpoint: None,
+			fee_rates: RwLock::new(FeeRates {
+				fast: FeeRate::BROADCAST_MIN,
+				regular: FeeRate::BROADCAST_MIN,
+				slow: FeeRate::BROADCAST_MIN,
+			}),
+			fee_rates_fetched_at: RwLock::new(None),
+			tip_cache: RwLock::new(None),
+		};
+		let rates = source.fetch_fee_rates().await.unwrap();
+		assert_eq!(rates.fast, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.regular, MAX_PLAUSIBLE_FEE_RATE);
+		assert_eq!(rates.slow, MAX_PLAUSIBLE_FEE_RATE);
+		server.await.unwrap();
+	}
 	#[cfg(not(target_arch = "wasm32"))]
 	mod esplora_broadcast {
 		use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1289,6 +1500,291 @@ mod test {
 		}
 	}
 
+	#[cfg(not(target_arch = "wasm32"))]
+	mod esplora_outspend {
+		use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		use super::*;
+
+		/// Serve a single fixed `outspend` response body on loopback and query it
+		/// through the esplora branch of `txs_spending_inputs`.
+		async fn query_outspend(body: &str) -> (anyhow::Result<TxsSpendingInputsResult>, OutPoint) {
+			let outpoint = OutPoint::new(genesis_block(Network::Bitcoin).txdata[0].compute_txid(), 0);
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let url = format!("http://{}", listener.local_addr().unwrap());
+			let body = body.to_owned();
+			let server = tokio::spawn(async move {
+				let (socket, _) = listener.accept().await.unwrap();
+				let mut socket = BufReader::new(socket);
+				let mut line = String::new();
+				socket.read_line(&mut line).await.unwrap();
+				loop {
+					line.clear();
+					assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+					if line == "\r\n" {
+						break;
+					}
+				}
+				socket.write_all(format!(
+					"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+					 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+					body.len(), body,
+				).as_bytes()).await.unwrap();
+				socket.shutdown().await.unwrap();
+			});
+			let fee = FeeRate::BROADCAST_MIN;
+			let chain = ChainSource {
+				inner: ChainSourceClient::Esplora(
+					esplora_client::Builder::new(&url).max_retries(0).timeout(5)
+						.build_async().unwrap(),
+				),
+				network: Network::Bitcoin,
+				zmq_endpoint: None,
+				fee_rates: RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee }),
+				fee_rates_fetched_at: RwLock::new(None),
+				tip_cache: RwLock::new(None),
+			};
+			#[allow(deprecated)]
+			let result = chain.txs_spending_inputs(vec![outpoint], BlockHeight::new(0)).await;
+			server.await.unwrap();
+			(result, outpoint)
+		}
+
+		/// Spent records from a buggy or malicious esplora server that lack the
+		/// fields electrs normally serves must surface as typed errors, not
+		/// panics: daemon tasks stay alive to retry on the next iteration.
+		#[tokio::test]
+		async fn spent_record_missing_fields_is_error_not_panic() {
+			for (body, field) in [
+				(r#"{"spent": true}"#, "status"),
+				(r#"{"spent": true, "status": {"confirmed": true}}"#, "block_height"),
+				(
+					r#"{"spent": true, "status": {"confirmed": true, "block_height": 840000}}"#,
+					"block_hash",
+				),
+				(r#"{"spent": true, "status": {"confirmed": false}}"#, "txid"),
+			] {
+				let (result, outpoint) = query_outspend(body).await;
+				let err = result.err().unwrap_or_else(|| panic!("{} must fail", body));
+				let message = format!("{}", err);
+				assert!(
+					message.contains(&outpoint.txid.to_string())
+						&& message.contains(&format!("no {}", field)),
+					"unexpected error for {}: {}", body, message,
+				);
+			}
+		}
+
+		/// Well-formed spent records must still map, for both mempool and
+		/// confirmed spends.
+		#[tokio::test]
+		async fn well_formed_spent_records_still_map() {
+			let txid = Txid::from_str(
+				"1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+			let (result, outpoint) = query_outspend(&format!(
+				r#"{{"spent": true, "txid": "{}", "status": {{"confirmed": false}}}}"#, txid,
+			)).await;
+			let result = result.unwrap();
+			assert!(matches!(result.get(&outpoint), Some((t, TxStatus::Mempool)) if *t == txid));
+
+			let hash = BlockHash::from_str(
+				"0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+			let (result, outpoint) = query_outspend(&format!(
+				concat!(
+					r#"{{"spent": true, "txid": "{}", "status": {{"confirmed": true, "#,
+					r#""block_height": 840000, "block_hash": "{}"}}}}"#,
+				),
+				txid, hash,
+			)).await;
+			let result = result.unwrap();
+			assert!(matches!(
+				result.get(&outpoint),
+				Some((t, TxStatus::Confirmed(block)))
+					if *t == txid && block.hash == hash && block.height == BlockHeight::new(840000),
+			));
+		}
+	}
+
+	#[cfg(all(feature = "bitcoind-rpc", not(target_arch = "wasm32")))]
+	mod bitcoind_fee_rates {
+		use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+		use tokio::net::TcpListener;
+
+		use super::*;
+
+		/// Loopback JSON-RPC stub answering `estimatesmartfee`: targets in
+		/// `data_targets` get a real feerate, the others get bitcoind's routine
+		/// insufficient-data body (fresh/restarted nodes, low-traffic networks).
+		/// Runs `update_fee_rates` against it and returns the chain source.
+		async fn run_with_fixture(data_targets: &[u16], fallback: Option<FeeRate>) -> ChainSource {
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let url = format!("http://{}", listener.local_addr().unwrap());
+			let data_targets = data_targets.to_vec();
+			let server = tokio::spawn(async move {
+				loop {
+					let (socket, _) = listener.accept().await.unwrap();
+					let data_targets = data_targets.clone();
+					tokio::spawn(async move {
+						let mut socket = BufReader::new(socket);
+						let mut line = String::new();
+						socket.read_line(&mut line).await.unwrap();
+						let mut content_length = 0;
+						loop {
+							line.clear();
+							assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+							if line == "\r\n" {
+								break;
+							}
+							if let Some((name, value)) = line.split_once(':') {
+								if name.eq_ignore_ascii_case("content-length") {
+									content_length = value.trim().parse::<usize>().unwrap();
+								}
+							}
+						}
+						let mut request = vec![0; content_length];
+						socket.read_exact(&mut request).await.unwrap();
+						let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+						assert_eq!(request["method"], "estimatesmartfee");
+						let target = request["params"][0].as_u64().unwrap() as u16;
+						let result = if data_targets.contains(&target) {
+							serde_json::json!({"feerate": 0.00002, "blocks": target})
+						} else {
+							serde_json::json!({
+								"errors": ["Insufficient data or no feerate found which meets threshold 0.00001000 BTC/kvB"],
+								"blocks": target,
+							})
+						};
+						let response = serde_json::json!({
+							"result": result,
+							"error": null,
+							"id": request["id"],
+						}).to_string();
+						socket.write_all(format!(
+							"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+							 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+							response.len(), response,
+						).as_bytes()).await.unwrap();
+						socket.shutdown().await.unwrap();
+					});
+				}
+			});
+			let auth = rpc::Auth::UserPass("user".into(), "password".into());
+			let fee = FeeRate::BROADCAST_MIN;
+			let chain = ChainSource {
+				inner: ChainSourceClient::Bitcoind {
+					sync: BitcoinRpcClient::new(&url, auth).unwrap(),
+					rpc: BitcoindClient::new(
+						url,
+						bitcoind_async_client::Auth::UserPass("user".into(), "password".into()),
+						None, None, None,
+					).unwrap(),
+				},
+				network: Network::Regtest,
+				zmq_endpoint: None,
+				fee_rates: RwLock::new(FeeRates { fast: fee, regular: fee, slow: fee }),
+				fee_rates_fetched_at: RwLock::new(None),
+				tip_cache: RwLock::new(None),
+			};
+			chain.update_fee_rates(fallback).await.unwrap();
+			server.abort();
+			chain
+		}
+
+		/// Only the fast target has an estimate (fresh node state): the missing
+		/// regular/slow estimates must propagate as an error so the configured
+		/// fallback is applied to all tiers, not panic `update_fee_rates`.
+		#[tokio::test]
+		async fn partial_fee_estimates_apply_fallback_without_panicking() {
+			let fallback = FeeRate::from_sat_per_vb(10).unwrap();
+			let chain = run_with_fixture(&[FEE_RATE_TARGET_CONF_FAST], Some(fallback)).await;
+			assert_eq!(
+				chain.fee_rates().await,
+				FeeRates { fast: fallback, regular: fallback, slow: fallback },
+			);
+		}
+
+		/// Control: with estimates for all targets, the backend rates are adopted.
+		#[tokio::test]
+		async fn complete_fee_estimates_are_adopted() {
+			let chain = run_with_fixture(
+				&[FEE_RATE_TARGET_CONF_FAST, FEE_RATE_TARGET_CONF_REGULAR, FEE_RATE_TARGET_CONF_SLOW],
+				Some(FeeRate::from_sat_per_vb(10).unwrap()),
+			).await;
+			let estimate = FeeRate::from_amount_per_kvb_ceil(Amount::from_sat(2_000));
+			assert_eq!(
+				chain.fee_rates().await,
+				FeeRates { fast: estimate, regular: estimate, slow: estimate },
+			);
+		}
+	}
+
+	#[cfg(feature = "bitcoind-rpc")]
+	mod bitcoind_mempool_entry {
+		use super::*;
+
+		fn getmempoolentry(
+			own_weight_wu: u64, ancestor_size_vb: u64, ancestor_fee: Amount,
+		) -> rpc::json::GetMempoolEntryResult {
+			let wtxid = Txid::from_str(
+				"1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+			rpc::json::GetMempoolEntryResult {
+				vsize: own_weight_wu.div_ceil(4),
+				weight: Some(own_weight_wu),
+				time: 1_700_000_000,
+				height: 840_000,
+				descendant_count: 1,
+				descendant_size: own_weight_wu.div_ceil(4),
+				ancestor_count: 2,
+				ancestor_size: ancestor_size_vb,
+				wtxid,
+				fees: rpc::json::GetMempoolEntryResultFees {
+					base: Amount::from_sat(100),
+					modified: Amount::from_sat(100),
+					ancestor: ancestor_fee,
+					descendant: Amount::from_sat(100),
+				},
+				depends: vec![],
+				spent_by: vec![],
+				bip125_replaceable: false,
+				unbroadcast: Some(false),
+			}
+		}
+
+		/// Bitcoin Core's `ancestorsize`/`ancestorfees` already include the
+		/// transaction itself, so the total weight must come from `ancestorsize`
+		/// alone: adding the transaction's own `weight` again would double-count
+		/// it and understate the package fee rate used for CPFP RBF decisions.
+		#[test]
+		fn ancestor_mapping_uses_ancestor_size_including_self() {
+			// A package of 2000 vB total paying 1000 sat: the queried transaction
+			// itself weighs 2000 wu (500 vB), its ancestors the remaining 1500 vB.
+			let entry = getmempoolentry(2_000, 2_000, Amount::from_sat(1_000));
+			let txid = Txid::from_str(
+				"2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+			let info = ancestor_info_from_mempool_entry(txid, entry).unwrap();
+			assert_eq!(info.txid, txid);
+			// `fees.ancestor`, not the transaction's own fee, is the package fee.
+			assert_eq!(info.total_fee, Amount::from_sat(1_000));
+			// 2000 vB * 4, not 8000 + the transaction's own 2000 wu.
+			assert_eq!(info.total_weight, Weight::from_wu(8_000));
+			assert_eq!(info.effective_fee_rate(), Some(FeeRate::from_sat_per_kwu(125)));
+		}
+
+		/// The mapping result must be independent of the transaction's own
+		/// `weight` field, which `ancestorsize` already accounts for.
+		#[test]
+		fn ancestor_mapping_ignores_own_weight_field() {
+			let txid = Txid::from_str(
+				"2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+			let small = ancestor_info_from_mempool_entry(
+				txid, getmempoolentry(2_000, 2_000, Amount::from_sat(1_000))).unwrap();
+			let large = ancestor_info_from_mempool_entry(
+				txid, getmempoolentry(4_000, 2_000, Amount::from_sat(1_000))).unwrap();
+			assert_eq!(small, large);
+		}
+	}
+
 	#[test]
 	fn classify_package_errors_attributes_root_cause_in_package_order() {
 		let parent = Txid::from_str(
@@ -1343,5 +1839,23 @@ mod test {
 			(child, None),
 		].into_iter(), &order);
 		assert!(matches!(res, BroadcastError::Other(ref s) if s.contains("package-mempool-limits")));
+	}
+
+	/// The bitcoind RPC clients (sync companion and async client alike) cannot
+	/// route through a SOCKS5 proxy, so construction must fail closed instead of
+	/// silently bypassing a proxy the operator configured for privacy.
+	#[cfg(all(feature = "socks5-proxy", feature = "bitcoind-rpc"))]
+	#[tokio::test]
+	async fn bitcoind_backend_rejects_configured_proxy() {
+		let spec = ChainSourceSpec::Bitcoind {
+			url: "http://bitcoind.invalid:8332".into(),
+			auth: rpc::Auth::UserPass("user".into(), "password".into()),
+			zmq: None,
+		};
+		let result = ChainSource::new(
+			spec, Network::Regtest, None, Some("socks5h://127.0.0.1:9050"),
+		).await;
+		let err = result.err().expect("bitcoind with a proxy must fail closed");
+		assert!(err.to_string().contains("proxy"), "unexpected error: {}", err);
 	}
 }
