@@ -45,8 +45,23 @@ impl RecoveryReportEntry {
 		self.0.keys().cloned()
 	}
 
+	/// The sum of all known recovered amounts. The provenance of these
+	/// amounts is the server (`sum::<Amount>` would panic on overflow), so
+	/// amounts that push the total past the money supply are skipped with a
+	/// warning: a larger total is necessarily corrupt and the report is
+	/// best-effort bookkeeping.
 	pub fn total_amount(&self) -> Amount {
-		self.0.values().filter_map(|a| *a).sum()
+		let mut total = Amount::ZERO;
+		for amount in self.0.values().filter_map(|a| *a) {
+			match total.checked_add(amount).filter(|a| *a <= Amount::MAX_MONEY) {
+				Some(sum) => total = sum,
+				None => warn!(
+					"Recovered VTXO amounts exceed the money supply; \
+					skipping {} in the report total", amount,
+				),
+			}
+		}
+		total
 	}
 
 	fn insert(&mut self, vtxo_id: VtxoId, amount: Option<Amount>) {

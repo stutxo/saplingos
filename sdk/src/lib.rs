@@ -1877,7 +1877,11 @@ impl Wallet {
 					self.inner.db.get_full_vtxo(id).await?
 						.with_context(|| format!("vtxo with id {} not found", id))?
 				};
-				amount += vtxo.amount();
+				// The VTXO amounts were issued by the server: checked, never
+				// the panicking `+=`.
+				amount = amount.checked_add(vtxo.amount())
+					.filter(|a| *a <= Amount::MAX_MONEY)
+					.context("refresh input amounts exceed the money supply")?;
 				vtxos.push(vtxo);
 			}
 			(vtxos, amount)

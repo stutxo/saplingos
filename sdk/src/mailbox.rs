@@ -707,10 +707,14 @@ impl Wallet {
 
 		// TODO: Make sure we don't effectively skip the entire package if the movement fails to
 		//       be recorded due to bark getting killed after this point.
-		let balance = new_vtxos
-			.iter()
-			.map(|vtxo| vtxo.amount()).sum::<Amount>()
-			.to_signed()?;
+		//
+		// The amounts come from the Ark server or a mailbox peer: checked
+		// accumulation (never `sum::<Amount>`, which panics on overflow), so a
+		// forged package is rejected with an error instead of crashing. See
+		// [crate::utils::checked_sum_amounts].
+		let balance = crate::utils::checked_sum_amounts(
+			new_vtxos.iter().map(|vtxo| vtxo.amount()),
+		).context("ignoring corrupt arkoor package")?.to_signed()?;
 		self.store_spendable_vtxos(&new_vtxos).await?;
 
 		// Build received_on destinations from received VTXOs, aggregated by address
@@ -718,6 +722,8 @@ impl Wallet {
 		for vtxo in &new_vtxos {
 			if let Ok(Some(index)) = self.inner.db.get_public_key_idx(&vtxo.user_pubkey()).await {
 				if let Ok(address) = self.peek_address(index).await {
+					// Cannot overflow: per-address sums are subsets of the
+					// package total, which was bound-checked above.
 					*received_by_address.entry(address).or_default() += vtxo.amount();
 				}
 			}
@@ -1042,5 +1048,32 @@ mod test {
 		assert_eq!(vet_server_checkpoint(second, second).unwrap(), CheckpointVerdict::AlreadyCovered);
 		assert_eq!(vet_server_checkpoint(second, first).unwrap(), CheckpointVerdict::AlreadyCovered);
 		assert_eq!(vet_server_checkpoint(u64::MAX, u64::MAX).unwrap(), CheckpointVerdict::AlreadyCovered);
+	}
+
+	/// A forged package of repeated maximum-value VTXOs must be rejected with
+	/// an error, never crash the receive path: the amounts are untrusted.
+	#[test]
+	fn received_package_amounts_never_panic() {
+		use ark::test_util::dummy::DummyTestVtxoSpec;
+
+		// The dummy spec takes its fee out of `amount`, leaving a VTXO just
+		// under MAX_MONEY — large enough that any second one breaks the bound.
+		let (_funding, vtxo) = DummyTestVtxoSpec {
+			amount: Amount::MAX_MONEY, ..Default::default()
+		}.build();
+
+		// One huge VTXO is still accepted.
+		assert_eq!(
+			crate::utils::checked_sum_amounts([vtxo.amount()]).unwrap(),
+			vtxo.amount(),
+		);
+		assert!(vtxo.amount().to_signed().is_ok());
+
+		// Two exceed the money supply: error, not an overflowing panic.
+		crate::utils::checked_sum_amounts([vtxo.amount(), vtxo.amount()]).unwrap_err();
+		// Any number of maximum-value amounts behaves the same.
+		crate::utils::checked_sum_amounts(
+			std::iter::repeat(Amount::MAX_MONEY).take(9),
+		).unwrap_err();
 	}
 }

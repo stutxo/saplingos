@@ -157,7 +157,11 @@ impl Wallet {
 			let vtxo = vtxo.as_ref();
 			vtxo_ids.push(vtxo.id());
 			fee_info.push(VtxoFeeInfo::from_vtxo_and_tip(vtxo, current_height));
-			amount = amount + vtxo.amount();
+			// The VTXO amounts were issued by the server: checked, never the
+			// panicking `Add`. No real balance can exceed the money supply.
+			amount = amount.checked_add(vtxo.amount())
+				.filter(|a| *a <= Amount::MAX_MONEY)
+				.context("offboard input amounts exceed the money supply")?;
 		}
 
 		let fee = ark_info.fees.offboard.calculate(
@@ -199,7 +203,11 @@ impl Wallet {
 			let vtxo = vtxo.as_ref();
 			vtxo_ids.push(vtxo.id());
 			vtxo_fee_infos.push(VtxoFeeInfo::from_vtxo_and_tip(vtxo, current_height));
-			total_amount = total_amount + vtxo.amount();
+			// The VTXO amounts were issued by the server: checked, never the
+			// panicking `Add`. No real balance can exceed the money supply.
+			total_amount = total_amount.checked_add(vtxo.amount())
+				.filter(|a| *a <= Amount::MAX_MONEY)
+				.context("refresh input amounts exceed the money supply")?;
 		}
 
 		if let Some(max) = ark_info.max_vtxo_amount {
