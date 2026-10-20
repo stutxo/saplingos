@@ -87,9 +87,15 @@ The recipe compiles `testing/fixtures/sapio/output_value_floor.wat` using
 fixture exercises the real evaluator; it is not a signature or approval mock.
 Missing service binaries or artifacts fail explicitly.
 
+`contrib/sapio-e2e.sh` checks the required environment, then runs the suite in
+a bubblewrap network namespace when the host already owns the fixed ports and
+unprivileged `unshare` is unavailable. The standard integration fixture
+variables (`CAPTAIND_EXEC`, `WATCHMAND_EXEC`, `BITCOIND_EXEC`, `POSTGRES_BINS`,
+`LIGHTNINGD_EXEC`, and `LIGHTNINGD_PLUGIN_DIR`) are required as well.
+
 ```sh
-just int-sapio
-just int-sapio sapio_bip446_receive_exact_payout_and_offline_sdk_recovery
+./contrib/sapio-e2e.sh
+./contrib/sapio-e2e.sh sapio_bip446_receive_exact_payout_and_offline_sdk_recovery
 ```
 
 These scenarios cover commitment ordering, coordinated receiving, restart
